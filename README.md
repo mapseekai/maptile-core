@@ -141,7 +141,9 @@ Release 需要核心与 C++ 桥接的 `NDEBUG` 一致，并执行串行原生渲
 
 ## 许可与项目来源
 
-这是从 MapSeek 提取的独立项目。项目自有代码采用 [MIT 许可证](LICENSE)，第三方代码保留各自的版权和许可，详见[第三方声明](docs/third-party-notices.md)。
+这是从 MapSeek 提取的独立项目。项目自有代码采用 [MIT 许可证](LICENSE)，第三方代码保留各自的版权和许可。
+
+本项目的部分实现参考了 Martin 和 tileserver-rs 的源代码。涉及的模块及上游版权与许可见[第三方声明](docs/third-party-notices.md)。
 
 `publish = false` 防止意外发布到 crates.io；GitHub 公开仓库与 crates.io 发包是独立事项。
 
