@@ -229,12 +229,22 @@ impl GeoParquetSource {
         .map_err(MaptileError::backend)?
     }
 
-    fn from_opened(
+    pub(super) fn from_opened(
         cfg: GeoParquetSourceConfig,
         tiles: HashMap<(u8, u32, u32), Bytes>,
         geometry: Option<Arc<GeometrySource>>,
         content_version: crate::cache::ContentVersion,
     ) -> MaptileResult<Self> {
+        if cfg.minzoom > cfg.maxzoom || cfg.maxzoom > 30 {
+            return Err(MaptileError::Config(
+                "geometry source: zoom range must be ordered within 0..=30".into(),
+            ));
+        }
+        if cfg.bounds.is_some_and(|b| !valid_bounds(b)) {
+            return Err(MaptileError::Config(
+                "geometry source: bounds must be finite WGS84 bounds".into(),
+            ));
+        }
         let mut tj = tilejson::tilejson! { tiles: vec![] };
         tj.minzoom = Some(cfg.minzoom);
         tj.maxzoom = Some(cfg.maxzoom);

@@ -37,7 +37,7 @@ regex = "1.13"
 raster-style = "=0.4.0"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"], optional = true }
 deadpool-postgres = { version = "0.14", features = ["rt_tokio_1"] }
-duckdb = { version = "1.10505.0", features = ["bundled"], optional = true }
+duckdb = { version = "~1.10506.1", features = ["bundled"], optional = true }
 gdal = { version = "0.19", optional = true }
 gdal-sys = { version = "0.12", optional = true }
 geo-types = { version = "0.7", optional = true }
@@ -69,12 +69,15 @@ tokio = { version = "1.53.1", features = ["full"] }
 tracing = "0.1"
 url = { version = "2", optional = true }
 uuid = { version = "1", features = ["v4"], optional = true }
+tempfile = { version = "3", optional = true }
+zip = { version = "9.5.1", default-features = false, features = ["deflate-flate2"], optional = true }
 
 [features]
 default = []
 cloud = ["dep:object_store", "dep:url", "pmtiles/object-store"]
 duckdb = ["dep:duckdb"]
 geoparquet = ["dep:parquet", "dep:arrow-array", "dep:arrow-schema", "dep:duckdb", "duckdb/parquet", "dep:axum", "dep:reqwest", "dep:object_store", "dep:url", "dep:uuid"]
+local-vector = ["geoparquet", "dep:tempfile", "dep:zip"]
 metrics    = ["dep:prometheus"]
 mlt        = ["dep:mlt-core", "dep:geo-types"]
 raster = ["dep:gdal", "dep:gdal-sys", "agtiff"]
@@ -118,6 +121,10 @@ undocumented_unsafe_blocks = "warn"
 [[example]]
 name = "geoparquet_extensions"
 required-features = ["geoparquet"]
+
+[[example]]
+name = "local_vector"
+required-features = ["local-vector"]
 
 [[test]]
 name = "postgres_function"

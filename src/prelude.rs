@@ -79,6 +79,12 @@ pub use crate::sources::{DuckDbSource, DuckDbSourceConfig};
 #[cfg(feature = "geoparquet")]
 pub use crate::sources::{GeoParquetColumns, GeoParquetSource, GeoParquetSourceConfig};
 
+#[cfg(feature = "local-vector")]
+pub use crate::sources::{
+    FlatGeobufSource, FlatGeobufSourceConfig, ImportedGeoParquet, VectorImportFormat,
+    VectorImportOptions, import_to_geoparquet,
+};
+
 #[cfg(feature = "stac")]
 pub use crate::sources::{
     StacAsset, StacSource, StacSourceConfig, build_search_url, extract_assets_from_item_collection,

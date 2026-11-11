@@ -50,6 +50,7 @@ async fn main() -> MaptileResult<()> {
 | `raster` | GDAL 栅格/OutDB，并启用 agtiff |
 | `stac` | STAC 发现与 Raster Style 镶嵌，启用 agtiff |
 | `geoparquet` | Parquet/Arrow 归档及 DuckDB Spatial 按需几何瓦片，支持 HTTP/S3 范围读取，需预装匹配的 Spatial/HTTPFS 扩展 |
+| `local-vector` | 包含 `geoparquet`；本地 FlatGeobuf 直接生成 MVT，GeoJSON / ZIP Shapefile 一次导入为 GeoParquet |
 | `duckdb` | 内嵌 DuckDB 查询及配置几何列的动态瓦片 |
 | `mlt` | MVT 与 MLT 转换 |
 | `metrics` | Prometheus 缓存计数器 |
@@ -107,10 +108,13 @@ bash scripts/ci/maptile-render-cargo_test.sh
 cargo test --locked --features cloud,metrics,mlt
 cargo run --locked --features geoparquet --example geoparquet_extensions -- --check
 cargo test --locked --features geoparquet --lib
+cargo test --locked --features local-vector --lib
 cargo check --locked --all-targets --features raster,stac
 ```
 
 GeoParquet 需要预装匹配版本的官方签名 DuckDB 扩展，见[独立使用指南](docs/geoparquet.md)。PostgreSQL 测试需要专用 PostGIS 测试库及 `DATABASE_URL`；未设置时部分测试提前返回，不能视为真实数据库验证。
+
+本地矢量文件入口为 `FlatGeobufSource::open` 和 `import_to_geoparquet`，完整配置及安全边界见[本地矢量文件说明](docs/geoparquet.md#本地-flatgeobuf-与一次性导入)。
 
 ### 原生依赖
 

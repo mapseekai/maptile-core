@@ -66,6 +66,13 @@ pub(super) struct GeometrySource {
     pub fields: BTreeMap<String, String>,
 }
 
+#[derive(Clone, Copy)]
+enum InputKind {
+    GeoParquet,
+    #[cfg(feature = "local-vector")]
+    FlatGeobuf,
+}
+
 impl GeometrySource {
     pub fn open(cfg: &GeoParquetSourceConfig) -> MaptileResult<Self> {
         let path = single_file_path(&cfg.path)?;
@@ -74,14 +81,43 @@ impl GeometrySource {
             .to_str()
             .ok_or_else(|| config("path must be UTF-8"))?
             .to_owned();
-        Self::open_input(cfg, &location, Some((path, stamp)), None)
+        Self::open_input(
+            cfg,
+            &location,
+            Some((path, stamp)),
+            None,
+            InputKind::GeoParquet,
+        )
     }
 
     pub fn open_remote(
         cfg: &GeoParquetSourceConfig,
         remote: Arc<RemoteFile>,
     ) -> MaptileResult<Self> {
-        Self::open_input(cfg, &remote.url.clone(), None, Some(remote))
+        Self::open_input(
+            cfg,
+            &remote.url.clone(),
+            None,
+            Some(remote),
+            InputKind::GeoParquet,
+        )
+    }
+
+    #[cfg(feature = "local-vector")]
+    pub fn open_flatgeobuf(cfg: &GeoParquetSourceConfig) -> MaptileResult<Self> {
+        let path = single_file_path(&cfg.path)?;
+        let stamp = FileStamp::read(&path)?;
+        let location = path
+            .to_str()
+            .ok_or_else(|| config("path must be UTF-8"))?
+            .to_owned();
+        Self::open_input(
+            cfg,
+            &location,
+            Some((path, stamp)),
+            None,
+            InputKind::FlatGeobuf,
+        )
     }
 
     fn open_input(
@@ -89,6 +125,7 @@ impl GeometrySource {
         location: &str,
         local: Option<(PathBuf, FileStamp)>,
         remote: Option<Arc<RemoteFile>>,
+        input: InputKind,
     ) -> MaptileResult<Self> {
         cfg.query_options.validate()?;
         if cfg.extent == 0 || cfg.extent > 65_536 || cfg.buffer > cfg.extent {
@@ -97,23 +134,7 @@ impl GeometrySource {
         if cfg.layer_name.trim().is_empty() || cfg.layer_name.contains('\0') {
             return Err(config("layer_name must be nonempty and contain no NUL"));
         }
-        let geometry = cfg
-            .geometry_column
-            .as_deref()
-            .ok_or_else(|| config("remote sources require geometry_column"))?;
-        identifier(geometry)?;
-        let db_config = duckdb::Config::default()
-            .enable_autoload_extension(false)
-            .and_then(|c| c.with("allow_persistent_secrets", "false"))
-            .and_then(|c| c.threads(cfg.query_options.threads as i64))
-            .and_then(|c| c.max_memory(&format!("{}MB", cfg.query_options.memory_limit_mb)))
-            .and_then(|c| c.with("max_temp_directory_size", "0B"))
-            .map_err(MaptileError::backend)?;
-        let conn =
-            Connection::open_in_memory_with_flags(db_config).map_err(MaptileError::backend)?;
-        conn.execute_batch("LOAD parquet; LOAD spatial").map_err(|e| MaptileError::BackendMsg(format!(
-            "cannot load DuckDB spatial extension; preinstall the signed extension matching the embedded DuckDB version: {e}"
-        )))?;
+        let conn = spatial_connection(&cfg.query_options)?;
         if remote.is_some() {
             conn.execute_batch("LOAD httpfs").map_err(|e| MaptileError::BackendMsg(format!(
                 "cannot load DuckDB httpfs extension; run the explicit geoparquet_extensions preparation command: {e}"
@@ -128,18 +149,42 @@ impl GeometrySource {
         .map_err(MaptileError::backend)?;
         // These operations read footer/schema metadata, not feature rows. The
         // same path works for local files and bounded remote range requests.
-        let geo = conn
-            .prepare(&format!(
-                "SELECT value FROM parquet_kv_metadata({path_sql}) WHERE key = 'geo'::BLOB"
-            ))
-            .and_then(|mut statement| {
-                let mut rows = statement.query([])?;
-                rows.next()?.map(|row| row.get::<_, Vec<u8>>(0)).transpose()
-            })
-            .map_err(MaptileError::backend)?
-            .map(|value| serde_json::from_slice::<Value>(&value))
-            .transpose()
-            .map_err(|e| config(format!("invalid geo metadata: {e}")))?;
+        let geo = match input {
+            InputKind::GeoParquet => conn
+                .prepare(&format!(
+                    "SELECT value FROM parquet_kv_metadata({path_sql}) WHERE key = 'geo'::BLOB"
+                ))
+                .and_then(|mut statement| {
+                    let mut rows = statement.query([])?;
+                    rows.next()?.map(|row| row.get::<_, Vec<u8>>(0)).transpose()
+                })
+                .map_err(MaptileError::backend)?
+                .map(|value| serde_json::from_slice::<Value>(&value))
+                .transpose()
+                .map_err(|e| config(format!("invalid geo metadata: {e}")))?,
+            #[cfg(feature = "local-vector")]
+            InputKind::FlatGeobuf => None,
+        };
+        let (geometry, vector_srid, from) = match input {
+            InputKind::GeoParquet => (
+                cfg.geometry_column
+                    .clone()
+                    .ok_or_else(|| config("sources require geometry_column"))?,
+                None,
+                format!("read_parquet({path_sql})"),
+            ),
+            #[cfg(feature = "local-vector")]
+            InputKind::FlatGeobuf => {
+                let metadata =
+                    super::local_vector::vector_metadata(&conn, location, "FlatGeobuf", cfg.srid)?;
+                (
+                    metadata.geometry,
+                    Some(metadata.srid),
+                    format!("ST_Read({path_sql}, allowed_drivers := ['FlatGeobuf'])"),
+                )
+            }
+        };
+        let geometry = geometry.as_str();
         let column = geo
             .as_ref()
             .map(|geo| {
@@ -160,8 +205,7 @@ impl GeometrySource {
                 return Err(config("spherical GeoParquet edges are not supported"));
             }
         }
-        let srid = resolve_srid(cfg.srid, column)?;
-        let from = format!("read_parquet({path_sql})");
+        let srid = resolve_srid(vector_srid.or(cfg.srid), column)?;
         let covering = if matches!(srid, 4326 | 3857) {
             column.and_then(|c| covering_paths(c, &conn, &from))
         } else {
@@ -255,6 +299,11 @@ impl GeometrySource {
             &properties,
             covering.as_ref(),
             srid,
+            match input {
+                InputKind::GeoParquet => false,
+                #[cfg(feature = "local-vector")]
+                InputKind::FlatGeobuf => true,
+            },
         );
         conn.prepare(&sql).map_err(MaptileError::backend)?;
         let mut connections = Vec::with_capacity(cfg.query_options.pool_size);
@@ -516,13 +565,29 @@ impl Drop for CancelQuery {
     }
 }
 
+pub(super) fn spatial_connection(options: &GeoParquetQueryOptions) -> MaptileResult<Connection> {
+    options.validate()?;
+    let db_config = duckdb::Config::default()
+        .enable_autoload_extension(false)
+        .and_then(|c| c.with("allow_persistent_secrets", "false"))
+        .and_then(|c| c.threads(options.threads as i64))
+        .and_then(|c| c.max_memory(&format!("{}MB", options.memory_limit_mb)))
+        .and_then(|c| c.with("max_temp_directory_size", "0B"))
+        .map_err(MaptileError::backend)?;
+    let conn = Connection::open_in_memory_with_flags(db_config).map_err(MaptileError::backend)?;
+    conn.execute_batch("LOAD parquet; LOAD spatial").map_err(|e| MaptileError::BackendMsg(format!(
+        "cannot load DuckDB spatial extension; preinstall the signed extension matching the embedded DuckDB version: {e}"
+    )))?;
+    Ok(conn)
+}
+
 #[derive(Clone, PartialEq)]
-struct FileStamp {
+pub(super) struct FileStamp {
     len: u64,
     modified: SystemTime,
 }
 impl FileStamp {
-    fn read(path: &Path) -> MaptileResult<Self> {
+    pub(super) fn read(path: &Path) -> MaptileResult<Self> {
         let meta = std::fs::metadata(path).map_err(MaptileError::backend)?;
         Ok(Self {
             len: meta.len(),
@@ -540,7 +605,7 @@ fn check_stamp(local: &Option<(PathBuf, FileStamp)>) -> MaptileResult<()> {
     Ok(())
 }
 
-fn single_file_path(path: &Path) -> MaptileResult<PathBuf> {
+pub(super) fn validate_single_file_path(path: &Path) -> MaptileResult<()> {
     let text = path.to_str().ok_or_else(|| config("path must be UTF-8"))?;
     if text
         .chars()
@@ -551,6 +616,11 @@ fn single_file_path(path: &Path) -> MaptileResult<PathBuf> {
             "GeoParquet requires a local single file, not a URL or glob",
         ));
     }
+    Ok(())
+}
+
+pub(super) fn single_file_path(path: &Path) -> MaptileResult<PathBuf> {
+    validate_single_file_path(path)?;
     let path = path.canonicalize().map_err(MaptileError::backend)?;
     if !path.is_file() {
         return Err(config("GeoParquet input must be a regular file"));
@@ -679,6 +749,7 @@ fn build_sql(
     properties: &[String],
     covering: Option<&[String; 4]>,
     srid: i32,
+    flatgeobuf: bool,
 ) -> String {
     // Keep all tile expressions constant at plan time. A CROSS JOIN to a
     // one-row bounds CTE can disable Parquet predicate pushdown.
@@ -698,8 +769,8 @@ fn build_sql(
                 format!("ST_YMax({buffered})"),
             ]
         } else {
-            // Do not transform the polygon's corners through PROJ here: its
-            // antimeridian wrapping can invert an edge tile's buffered bbox.
+            // PROJ can wrap the buffered corners at the antimeridian. Analytic
+            // inverse bounds preserve world-edge and crossing geometries.
             [
                 format!("greatest(-180.0, ST_XMin({buffered}) / {RADIUS} * 180 / pi())"),
                 format!("degrees(atan(sinh(ST_YMin({buffered}) / {RADIUS})))"),
@@ -711,7 +782,13 @@ fn build_sql(
             filters.push(format!("{} {op} {}", paths[i], bounds[j]));
         }
     }
-    filters.push(format!("ST_Intersects({geom}, {buffered})"));
+    let intersects = format!("ST_Intersects({geom}, {buffered})");
+    // shortcut: Spatial 1.5.6 corrupts empty FGB index batches and prunes projected chords; scan until a verified extension upgrade.
+    filters.push(if flatgeobuf {
+        format!("coalesce({intersects}, false)")
+    } else {
+        intersects
+    });
     let properties = if properties.is_empty() {
         String::new()
     } else {
@@ -757,20 +834,20 @@ fn property_type(ty: &str) -> Option<(&'static str, &'static str)> {
         _ => None,
     }
 }
-fn unused_name(prefix: &str, columns: &BTreeMap<String, String>) -> String {
+pub(super) fn unused_name(prefix: &str, columns: &BTreeMap<String, String>) -> String {
     let mut name = prefix.to_owned();
     while columns.keys().any(|c| c.eq_ignore_ascii_case(&name)) {
         name.push('_');
     }
     name
 }
-fn identifier(name: &str) -> MaptileResult<String> {
+pub(super) fn identifier(name: &str) -> MaptileResult<String> {
     if name.is_empty() || name.contains('\0') {
         return Err(config("column names must be nonempty and contain no NUL"));
     }
     Ok(format!("\"{}\"", name.replace('"', "\"\"")))
 }
-fn literal(value: &str) -> String {
+pub(super) fn literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 fn config(message: impl Into<String>) -> MaptileError {
@@ -795,6 +872,54 @@ mod tests {
     use parquet::file::properties::WriterProperties;
 
     const TILE: TileCoord = TileCoord { z: 2, x: 2, y: 1 };
+
+    #[cfg(feature = "local-vector")]
+    #[tokio::test]
+    async fn flatgeobuf_scan_keeps_a_projected_chord_and_empty_tiles() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chord.fgb");
+        let conn = spatial_connection(&GeoParquetQueryOptions::default()).unwrap();
+        conn.execute_batch(&format!(
+            "COPY (SELECT 6::BIGINT AS id, ST_GeomFromText('LINESTRING(-170 -80,170 80)') AS geom) TO {} (FORMAT GDAL, DRIVER 'FlatGeobuf', SRS 'EPSG:4326', LAYER_CREATION_OPTIONS 'SPATIAL_INDEX=YES')",
+            literal(path.to_str().unwrap())
+        )).unwrap();
+        let cfg = GeoParquetSourceConfig {
+            path,
+            geometry_column: Some("geom".into()),
+            id_column: Some("id".into()),
+            properties: Some(vec![]),
+            ..Default::default()
+        };
+        let source = GeometrySource::open_flatgeobuf(&cfg).unwrap();
+        let plan: String = source.pool.state.lock().unwrap().connections[0]
+            .prepare(&format!("EXPLAIN {}", source.sql))
+            .unwrap()
+            .query_row(named_params! { "z": 4, "x": 9, "y": 6 }, |row| row.get(1))
+            .unwrap();
+        assert!(
+            plan.contains("ST_READ") && !plan.contains("Filter (MinX, MinY, MaxX"),
+            "{plan}"
+        );
+        let tile = source
+            .tile(TileCoord { z: 4, x: 9, y: 6 }, None)
+            .await
+            .unwrap();
+        let tile = mvt::decode(&tile).unwrap();
+        assert_eq!(tile.layers[0].features.len(), 1);
+        assert_eq!(tile.layers[0].features[0].id, Some(6));
+        let empty = source
+            .tile(TileCoord { z: 4, x: 0, y: 0 }, None)
+            .await
+            .unwrap();
+        assert!(
+            mvt::decode(&empty)
+                .unwrap()
+                .layers
+                .iter()
+                .all(|layer| layer.features.is_empty())
+        );
+        source.close().await.unwrap();
+    }
 
     #[tokio::test]
     async fn genuine_geoparquet_projects_filters_and_preserves_properties_and_ids() {

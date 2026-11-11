@@ -4,7 +4,7 @@
 
 ## 构建与扩展
 
-当前锁文件使用 `duckdb = 1.10505.0`，对应嵌入式 DuckDB 1.5.5，Parquet 随库编译。几何模式需要匹配该版本及平台的官方签名 Spatial 扩展，远程模式还需要 HTTPFS。
+当前锁文件使用 `duckdb = 1.10506.1`，对应嵌入式 DuckDB 1.5.6。Parquet 随库编译。几何模式需要匹配该版本及平台的官方签名 Spatial 扩展，远程模式还需要 HTTPFS。
 
 ```sh
 # 检查已有扩展，不下载。
@@ -14,6 +14,8 @@ cargo run --locked --features geoparquet --example geoparquet_extensions -- --in
 ```
 
 `--install` 只使用 DuckDB 官方 core 仓库，加载时校验签名。构造数据源仅执行 LOAD，不在请求中安装或升级扩展；缺失扩展会报错，不静默降级。不支持配置任意扩展来源或 SQL 模板。
+
+内置下载受网络限制时，可通过官方 HTTPS 地址下载对应版本和平台的签名扩展，再用同版本 DuckDB 从本地文件执行 `INSTALL`。 [手动安装说明](https://duckdb.org/docs/1.5/extensions/troubleshooting)
 
 ## 本地几何源
 
@@ -96,3 +98,78 @@ cargo test --locked --features geoparquet --lib repeated_tile_probe -- --ignored
 ```
 
 核心测试用合成 GeoParquet 验证投影、属性/ID、跨边界几何、covering、查询预算、HTTP Range、源管理和会话关闭。它们不能证明真实 AWS 端点、MapSeek 服务工厂、生产负载或跨平台行为；服务层 S3 集成测试留在 MapSeek。
+
+## 本地 FlatGeobuf 与一次性导入
+
+启用 `local-vector` feature（包含 `geoparquet`）后，从 `sources` 或 `prelude` 引入公开类型。读取使用 DuckDB Spatial 自带的 GDAL 驱动，需预装与嵌入式 DuckDB 匹配的官方签名 Spatial 扩展。
+
+```rust
+use maptile_core::sources::{FlatGeobufSource, FlatGeobufSourceConfig, TileCoord, TileSource};
+
+async fn read_flatgeobuf() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let source = tokio::task::spawn_blocking(|| FlatGeobufSource::open(FlatGeobufSourceConfig {
+        id: "places".into(),
+        path: "/data/places.fgb".into(),
+        layer_name: "places".into(),
+        id_column: Some("id".into()),
+        ..Default::default()
+    })).await??;
+    let result = source.get_tile(TileCoord { z: 2, x: 2, y: 1 }, None).await;
+    source.close().await?;
+    println!("{} bytes", result?.data.len());
+    Ok(())
+}
+```
+
+`FlatGeobufSource` 只读取一个本地常规文件，不接受 URL、glob、SQL 或驱动参数。几何列由驱动发现；CRS 必须有可信的 EPSG / OGC:CRS84 标识，否则需要 `srid` 显式覆盖。几何投影到 EPSG:3857 后，按含 buffer 的瓦片范围精确相交与裁剪，保留跨瓦片、世界边缘及投影后的线段。
+
+**当前锁定的 Spatial 1.5.6 对 FlatGeobuf 使用完整扫描。** 该版本的索引筛选可能漏掉投影后的长线，并在空命中时产生无效批次。有索引和无索引的文件均可直接切片，大文件的单瓦片查询可能超过预算。连接池、资源预算、文件变化检查、文件 lease、缓存版本及 close 语义与 GeoParquet 相同。
+
+GeoJSON 和 ZIP Shapefile 通过 `import_to_geoparquet` 一次性转换，瓦片查询只读取导入后的 GeoParquet：
+
+```rust
+use maptile_core::sources::{
+    GeoParquetSource, GeoParquetSourceConfig,
+    VectorImportFormat, VectorImportOptions, import_to_geoparquet,
+};
+
+async fn import_places() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let imported = import_to_geoparquet(
+        "/data/places.zip",
+        VectorImportFormat::ShapefileZip, // GeoJSON 使用 GeoJson
+        "/data/places.parquet",
+        VectorImportOptions::default(),
+    ).await?;
+    let source = tokio::task::spawn_blocking(move || GeoParquetSource::open(GeoParquetSourceConfig {
+        id: "places".into(),
+        path: imported.path,
+        geometry_column: Some(imported.geometry_column),
+        ..Default::default()
+    })).await??;
+    source.close().await?;
+    Ok(())
+}
+```
+
+导入将几何规范为 WGS84 WKB，移除 M 维度并保留 Z。输出保留驱动读到的属性和 GeoParquet 1.1 `covering.bbox`，NULL 几何对应 NULL bbox。返回值给出实际几何列名。若属性已经占用 `geometry`，几何列会追加下划线。驱动无法解析的字段或驱动列名冲突会报错，例如原属性 `wkb_geometry` 与 Spatial 生成的 WKB 列同名。正常 GeoJSON 使用 WGS84，Shapefile 通过 `.prj` 识别 CRS，未知 CRS 需要 `VectorImportOptions.srid`。提取后检查 `.shp/.shx` 文件头长度、索引记录数及 `.dbf` 记录体积。各条几何记录的解析由 GDAL 完成。
+
+ZIP 可含嵌套目录，但必须恰好包含一套同路径、同 stem 的 `.shp/.shx/.dbf`，可另含 `.prj/.cpg`；大小写不敏感。只提取这五类组件。拒绝路径逃逸、绝对路径、链接、特殊文件、重复组件、多个 Shapefile、加密和非 Stored/Deflate 压缩。支持普通单卷 ZIP，最多 128 个条目、1 MiB 中央目录，不支持 ZIP64 目录或尾部附加数据；在分配完整条目索引前检查。ZIP 元数据和实际解压字节均受限。
+
+默认导入预算为 512 MiB、30 秒、两个 DuckDB 线程及 256 MB 的 DuckDB 管理内存，禁止磁盘 spill。`max_bytes` 分别约束输入、ZIP 声明的总解压体积、实际提取字节及完成后的输出；输出大小在 COPY 完成后检查，因此它不是磁盘配额。`timeout_ms` 允许 1..=300000，`max_bytes` 允许 1..=8 GiB。应用仍需限制并行导入数量及磁盘使用。
+
+目标父目录必须由调用方控制。输入快照和输出位于该目录内的私有临时目录（Unix 权限 0700）；发布文件的权限遵循进程 umask。转换完整成功后才通过同文件系统的硬链接原子发布；目标必须不存在，文件系统需支持硬链接。失败或 future 被取消时不发布输出，阻塞任务退出后清理暂存文件。成功结果由调用方持有，之后可以删除原始 GeoJSON / ZIP。调用方负责授权输入、目标目录及本地文件的访问，保持直接服务的 FlatGeobuf 不变。
+
+以下示例分别读取三种格式的世界瓦片，并打印生成的 MVT 字节数。导入命令使用尚未创建的输出路径。
+
+```sh
+cargo run --locked --features local-vector --example local_vector -- fgb places.fgb
+cargo run --locked --features local-vector --example local_vector -- geojson places.geojson places-json.parquet
+cargo run --locked --features local-vector --example local_vector -- shapefile places.zip places-shp.parquet
+```
+
+```sh
+cargo test --locked --features local-vector --lib
+cargo clippy --locked --all-targets --features local-vector -- -D warnings
+```
+
+`geoparquet` CI 检查名保持不变，启用 `local-vector` 并覆盖原有 GeoParquet 与新增格式测试。本地用 Spatial 生成合成 FGB / Shapefile，不依赖系统 GDAL、外部服务或真实业务数据。

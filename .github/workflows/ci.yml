@@ -23,7 +23,7 @@ jobs:
           - name: cloud-metrics-mlt
             features: cloud,metrics,mlt
           - name: geoparquet
-            features: geoparquet
+            features: local-vector
     services:
       postgres:
         image: postgis/postgis:17-3.5

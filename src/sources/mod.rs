@@ -57,6 +57,14 @@ mod geoparquet_remote;
 #[cfg(feature = "geoparquet")]
 pub use geoparquet::{GeoParquetColumns, GeoParquetSource, GeoParquetSourceConfig};
 
+#[cfg(feature = "local-vector")]
+pub mod local_vector;
+#[cfg(feature = "local-vector")]
+pub use local_vector::{
+    FlatGeobufSource, FlatGeobufSourceConfig, ImportedGeoParquet, VectorImportFormat,
+    VectorImportOptions, import_to_geoparquet,
+};
+
 #[cfg(feature = "stac")]
 pub mod stac;
 #[cfg(feature = "stac")]
