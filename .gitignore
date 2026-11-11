@@ -1,0 +1,8 @@
+/target/
+/.cache/
+/.local/
+/.env
+/.env.*
+!.env.example
+.DS_Store
+*.log

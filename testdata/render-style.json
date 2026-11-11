@@ -1,0 +1,23 @@
+{
+  "version": 8,
+  "metadata": {
+    "mapseek:test-fixtures": ["embedded-geojson", "managed-vector", "managed-raster"]
+  },
+  "sources": {
+    "fixture": {
+      "type": "geojson",
+      "data": {
+        "type": "FeatureCollection",
+        "features": [{
+          "type": "Feature",
+          "properties": {},
+          "geometry": {"type": "Point", "coordinates": [0.0, 0.0]}
+        }]
+      }
+    }
+  },
+  "layers": [
+    {"id": "background", "type": "background", "paint": {"background-color": "#102030"}},
+    {"id": "point", "type": "circle", "source": "fixture", "paint": {"circle-radius": 12, "circle-color": "#ff5500"}}
+  ]
+}

@@ -1,0 +1,79 @@
+name: Rust
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: default
+            features: ""
+          - name: cloud-metrics-mlt
+            features: cloud,metrics,mlt
+          - name: geoparquet
+            features: geoparquet
+    services:
+      postgres:
+        image: postgis/postgis:17-3.5
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: maptile_core_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres -d maptile_core_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      FEATURES: ${{ matrix.features }}
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+      RUSTDOCFLAGS: "-D warnings"
+      CARGO_BUILD_JOBS: "2"
+      DATABASE_URL: postgresql://postgres@127.0.0.1:5432/maptile_core_test
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@0176485ebe2f605bde554dd99f804beeaf7db3e2
+        with:
+          toolchain: "1.98.1"
+          components: clippy, rustfmt
+      - name: Install native compilation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends build-essential cmake ninja-build libclang-dev pkg-config libssl-dev
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            target
+          key: cargo-${{ runner.os }}-${{ matrix.name }}-${{ hashFiles('Cargo.lock') }}
+      - name: Check formatting and native source helper
+        run: |
+          cargo fmt --all --check
+          bash scripts/ci/maptile-render-cargo_test.sh
+      - name: Prepare signed DuckDB extensions
+        if: matrix.name == 'geoparquet'
+        run: cargo run --locked --features geoparquet --example geoparquet_extensions -- --install
+      - name: Test
+        run: cargo test --locked --features "$FEATURES"
+      - name: Clippy
+        run: cargo clippy --locked --all-targets --features "$FEATURES" -- -D warnings
+      - name: Rustdoc
+        run: cargo doc --locked --no-deps --features "$FEATURES"
+      - name: Verify source package
+        if: matrix.name == 'default'
+        run: cargo package --locked

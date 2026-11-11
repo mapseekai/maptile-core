@@ -1,0 +1,184 @@
+[package]
+name = "maptile-core"
+version = "0.3.0"
+edition = "2024"
+rust-version = "1.98.1"
+description = "Composable tile sources, dynamic GeoParquet tiling, caching, and map rendering"
+readme = "README.md"
+license = "MIT"
+repository = "https://github.com/mapseekai/maptile-core"
+publish = false
+
+[dependencies]
+async-trait = "0.1"
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"], optional = true }
+async-geotiff = { version = "=0.13.0", default-features = false, features = ["proj", "mosaic", "stac", "webp"], optional = true }
+base64 = "0.23"
+blake3 = "1.8"
+brotli = { version = "9", default-features = false, features = ["std"] }
+bytes = "1"
+cql2 = "0.6"
+dashmap = "6"
+flate2 = "1"
+futures-util = "0.3"
+hex = "0.4"
+indexmap = "2"
+walkdir = "2"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+zstd = { version = "0.14", default-features = false }
+mbtiles = { version = "0.19.1", default-features = false }
+martin-tile-utils = "0.7"
+# Keep the shared store type aligned with async-geotiff and PMTiles.
+object_store = { version = "0.14.2", optional = true }
+pmtiles = { version = "0.24.1", default-features = false, features = ["mmap-async-tokio", "iter-async", "moka", "tilejson", "write", "http-async", "reqwest-rustls", "brotli", "zstd"] }
+prost = "0.14"
+quick-xml = "0.42"
+regex = "1.13"
+raster-style = "=0.4.0"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"], optional = true }
+deadpool-postgres = { version = "0.14", features = ["rt_tokio_1"] }
+duckdb = { version = "1.10505.0", features = ["bundled"], optional = true }
+gdal = { version = "0.19", optional = true }
+gdal-sys = { version = "0.12", optional = true }
+geo-types = { version = "0.7", optional = true }
+geozero = { version = "0.15", default-features = false, features = ["with-wkb", "with-mvt"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+flume = { version = "0.12", optional = true }
+maplibre_native = { version = "=0.9.3", default-features = false, features = ["log"], optional = true }
+mlt-core = { version = "0.17.0", optional = true }
+ndarray = "0.17"
+ahash         = "0.8"
+moka = { version = "0.12", features = ["future"] }
+notify = { version = "8", default-features = false, features = ["macos_kqueue"] }
+parquet = { version = "59", default-features = false, features = ["arrow", "async"], optional = true }
+arrow-array = { version = "59", optional = true }
+arrow-schema = { version = "59", optional = true }
+pg_escape = "0.1"
+prometheus = { version = "0.14", optional = true }
+rustls = { version = "0.23.45", default-features = false, features = ["ring"] }
+rustls-native-certs = "0.8"
+semver = "1"
+tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
+tokio-postgres-rustls = "0.14"
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+sha1 = "0.11"
+thiserror = "2"
+tilejson = "0.4"
+tokio = { version = "1.53.1", features = ["full"] }
+tracing = "0.1"
+url = { version = "2", optional = true }
+uuid = { version = "1", features = ["v4"], optional = true }
+
+[features]
+default = []
+cloud = ["dep:object_store", "dep:url", "pmtiles/object-store"]
+duckdb = ["dep:duckdb"]
+geoparquet = ["dep:parquet", "dep:arrow-array", "dep:arrow-schema", "dep:duckdb", "duckdb/parquet", "dep:axum", "dep:reqwest", "dep:object_store", "dep:url", "dep:uuid"]
+metrics    = ["dep:prometheus"]
+mlt        = ["dep:mlt-core", "dep:geo-types"]
+raster = ["dep:gdal", "dep:gdal-sys", "agtiff"]
+# Pure-Rust COG/STAC dynamic tiling via async-geotiff (no GDAL). cog/stac
+# sources move onto this; outdb stays on `raster` (gdal). ObjectReader is
+# re-exported from async_geotiff::io since v0.0.6.
+agtiff = ["dep:async-geotiff", "dep:object_store"]
+render = ["dep:flume", "dep:maplibre_native", "maplibre_native/tokio"]
+# Benchmark-only renderer lifecycle instrumentation. Non-default so normal
+# render builds contain neither counters nor their API.
+render-bench = ["render"]
+render-opengl = ["render", "maplibre_native/opengl"]
+# STAC discovery and native Raster Style mosaic rendering.
+stac = ["agtiff"]
+
+[dev-dependencies]
+criterion = { version = "0.8", default-features = false, features = ["plotters", "cargo_bench_support"] }
+futures = "0.3"
+# PROJ currently links libsqlite3-sys <0.36; rusqlite 0.40 conflicts.
+rusqlite = { version = "0.37", features = ["bundled"] }
+tempfile = "3"
+tokio = { version = "1.53.1", features = ["full", "macros"] }
+
+[[bench]]
+name = "wkb_mvt_compare"
+harness = false
+
+[[bench]]
+name = "render_native"
+harness = false
+required-features = ["render-bench"]
+
+[lints.clippy]
+correctness = { level = "deny", priority = -1 }
+suspicious = "warn"
+style = "warn"
+complexity = "warn"
+perf = "warn"
+undocumented_unsafe_blocks = "warn"
+
+[[example]]
+name = "geoparquet_extensions"
+required-features = ["geoparquet"]
+
+[[test]]
+name = "postgres_function"
+path = "tests/sources/postgres/function.rs"
+
+[[test]]
+name = "wmts_golden"
+path = "tests/render/wmts.rs"
+
+[[test]]
+name = "pmtiles_local"
+path = "tests/sources/pmtiles/local.rs"
+
+[[test]]
+name = "mbtiles"
+path = "tests/sources/mbtiles.rs"
+
+[[test]]
+name = "archive_inspection"
+path = "tests/sources/archive_inspection.rs"
+
+[[test]]
+name = "composite"
+path = "tests/sources/composite.rs"
+
+[[test]]
+name = "catalog_snapshot"
+path = "tests/styles/catalog.rs"
+
+[[test]]
+name = "mosaic_source_smoke"
+path = "tests/sources/mosaic_source.rs"
+
+[[test]]
+name = "pmtiles_cloud"
+path = "tests/sources/pmtiles/cloud.rs"
+
+[[test]]
+name = "manager"
+path = "tests/sources/manager.rs"
+
+[[test]]
+name = "pmtiles_http"
+path = "tests/sources/pmtiles/http.rs"
+
+[[test]]
+name = "postgres_pool"
+path = "tests/sources/postgres/pool.rs"
+
+[[test]]
+name = "source_default_etag"
+path = "tests/sources/mod.rs"
+
+[[test]]
+name = "postgres_table"
+path = "tests/sources/postgres/table.rs"
+
+[[test]]
+name = "agtiff_cog"
+path = "tests/sources/agtiff_cog.rs"
+
+[[test]]
+name = "render_native"
+path = "tests/render/native.rs"
