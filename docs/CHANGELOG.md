@@ -4,6 +4,10 @@
 
 ## 未发布
 
+### WKB 输入校验
+
+WKB→MVT 与 `wkb_bbox` 在调用 geozero 前，先以无分配的结构预检验证完整载荷、计数、子类型和维度。保留 16 MiB 输入上限，最多接受 64 层几何嵌套；截断、尾随字节、虚假大计数及会触发上游容量下溢的空环会返回错误或 `None`，不进入大容量预分配。有效 OGC/ISO WKB、EWKB、Z/M/ZM、SRID 和大小端组合有回归覆盖。
+
 ### 移除
 
 本地字体/精灵图存储、发现、目录项及font-gen/sprite-gen生成器退出核心库。Resource服务承担分发，样式与渲染仍接受外部glyph/sprite URL。

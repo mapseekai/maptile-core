@@ -251,7 +251,7 @@ mod wkb_mvt_parity {
     //! genuinely unlocked new capability.
 
     use bytes::Bytes;
-    use maptile_core::wkb_mvt::{WkbFeature, encode_features_to_mvt};
+    use maptile_core::wkb_mvt::{WkbFeature, encode_features_to_mvt, wkb_bbox};
 
     const ENV: (f64, f64, f64, f64) = (-180.0, -90.0, 180.0, 90.0);
     const EXTENT: u32 = 4096;
@@ -299,6 +299,119 @@ mod wkb_mvt_parity {
         assert_eq!(tile.layers[0].features.len(), 1);
     }
 
+    fn push_u32(bytes: &mut Vec<u8>, value: u32, little_endian: bool) {
+        bytes.extend_from_slice(&if little_endian {
+            value.to_le_bytes()
+        } else {
+            value.to_be_bytes()
+        });
+    }
+
+    fn dimensional_geometry(kind: u32, dims: u32, little_endian: bool, ewkb: bool) -> Bytes {
+        let mut bytes = vec![u8::from(little_endian)];
+        let type_id = if ewkb {
+            kind | 0x2000_0000
+                | if matches!(dims, 1 | 3) {
+                    0x8000_0000
+                } else {
+                    0
+                }
+                | if matches!(dims, 2 | 3) {
+                    0x4000_0000
+                } else {
+                    0
+                }
+        } else {
+            kind + dims * 1000
+        };
+        push_u32(&mut bytes, type_id, little_endian);
+        if ewkb {
+            push_u32(&mut bytes, 4326, little_endian);
+        }
+        if kind >= 4 {
+            push_u32(&mut bytes, 1, little_endian);
+            let child = if kind == 7 { 1 } else { kind - 3 };
+            bytes.extend_from_slice(&dimensional_geometry(child, dims, !little_endian, ewkb));
+        } else {
+            let coordinates: &[(f64, f64)] = match kind {
+                1 => &[(10.0, 20.0)],
+                2 => &[(10.0, 20.0), (20.0, 30.0)],
+                3 => &[(10.0, 20.0), (20.0, 20.0), (20.0, 30.0), (10.0, 20.0)],
+                _ => unreachable!(),
+            };
+            if kind == 3 {
+                push_u32(&mut bytes, 1, little_endian);
+            }
+            if kind != 1 {
+                push_u32(&mut bytes, coordinates.len() as u32, little_endian);
+            }
+            for &(x, y) in coordinates {
+                let ordinates = [x, y, 999.0, -333.0];
+                let count = match dims {
+                    0 => 2,
+                    1 | 2 => 3,
+                    3 => 4,
+                    _ => unreachable!(),
+                };
+                for value in &ordinates[..count] {
+                    bytes.extend_from_slice(&if little_endian {
+                        value.to_le_bytes()
+                    } else {
+                        value.to_be_bytes()
+                    });
+                }
+            }
+        }
+        Bytes::from(bytes)
+    }
+
+    #[test]
+    fn iso_and_ewkb_dimensions_and_mixed_endianness_preserve_xy() {
+        for kind in 1..=7 {
+            let xy = dimensional_geometry(kind, 0, true, false);
+            let expected_bbox = wkb_bbox(&xy);
+            let expected = encode(xy);
+            for dims in 0..=3 {
+                for little_endian in [false, true] {
+                    for ewkb in [false, true] {
+                        let wkb = dimensional_geometry(kind, dims, little_endian, ewkb);
+                        assert_eq!(wkb_bbox(&wkb), expected_bbox);
+                        let tile = encode(wkb);
+                        assert_eq!(tile.layers[0].features, expected.layers[0].features);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_truncation_of_dimensional_geometries_is_rejected() {
+        for kind in 1..=7 {
+            for dims in 0..=3 {
+                for little_endian in [false, true] {
+                    for ewkb in [false, true] {
+                        let wkb = dimensional_geometry(kind, dims, little_endian, ewkb);
+                        for len in 0..wkb.len() {
+                            let truncated = wkb.slice(..len);
+                            assert!(wkb_bbox(&truncated).is_none());
+                            let result = encode_features_to_mvt(
+                                "x",
+                                [WkbFeature {
+                                    id: None,
+                                    wkb: truncated,
+                                    properties: serde_json::Map::new(),
+                                }],
+                                ENV,
+                                EXTENT,
+                            );
+                            assert!(result.is_err(), "kind={kind}, dims={dims}, len={len}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn rejects_oversized_blob() {
         let huge = Bytes::from(vec![0u8; 17 * 1024 * 1024]);
@@ -322,12 +435,17 @@ mod wkb_mvt_adversarial {
     //! `Err(_)` rather than aborting the process.
 
     use bytes::Bytes;
-    use maptile_core::wkb_mvt::{WkbFeature, encode_features_to_mvt};
+    use maptile_core::error::MaptileError;
+    use maptile_core::wkb_mvt::{WkbFeature, encode_features_to_mvt, wkb_bbox};
 
     const ENV: (f64, f64, f64, f64) = (-180.0, -90.0, 180.0, 90.0);
     const EXTENT: u32 = 4096;
 
     fn must_err(wkb: Bytes) {
+        assert!(
+            wkb_bbox(&wkb).is_none(),
+            "malformed WKB must not have a bbox"
+        );
         let res = encode_features_to_mvt(
             "x",
             std::iter::once(WkbFeature {
@@ -338,7 +456,10 @@ mod wkb_mvt_adversarial {
             ENV,
             EXTENT,
         );
-        assert!(res.is_err(), "expected error, got Ok");
+        assert!(
+            matches!(res, Err(MaptileError::Transcode(ref message)) if message.starts_with("wkb validation:")),
+            "expected rejection before the allocating decoder, got {res:?}"
+        );
     }
 
     #[test]
@@ -380,10 +501,90 @@ mod wkb_mvt_adversarial {
 
     #[test]
     fn multipolygon_with_thousand_phantom_children_errors() {
-        // Synthesises nested geometry depth on the parser side.
+        // A child count must fit the payload before any children are decoded.
         let mut v = vec![0x01u8];
         v.extend_from_slice(&6u32.to_le_bytes()); // MultiPolygon
         v.extend_from_slice(&1000u32.to_le_bytes()); // n children
         must_err(Bytes::from(v));
+    }
+
+    #[test]
+    fn every_counted_geometry_rejects_u32_max_in_both_dialects_and_byte_orders() {
+        for kind in [2u32, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 15, 16, 17] {
+            for type_id in [
+                kind,
+                kind + 1000,
+                kind + 2000,
+                kind + 3000,
+                kind | 0xe000_0000,
+            ] {
+                for little_endian in [false, true] {
+                    let mut bytes = vec![u8::from(little_endian)];
+                    bytes.extend_from_slice(&if little_endian {
+                        type_id.to_le_bytes()
+                    } else {
+                        type_id.to_be_bytes()
+                    });
+                    if type_id & 0x2000_0000 != 0 {
+                        bytes.extend_from_slice(&4326u32.to_le_bytes());
+                    }
+                    bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+                    must_err(Bytes::from(bytes));
+                }
+            }
+        }
+    }
+
+    fn counted_geometry(kind: u32, count: u32, payload: &[u8]) -> Bytes {
+        let mut bytes = vec![1];
+        bytes.extend_from_slice(&kind.to_le_bytes());
+        bytes.extend_from_slice(&count.to_le_bytes());
+        bytes.extend_from_slice(payload);
+        Bytes::from(bytes)
+    }
+
+    #[test]
+    fn nested_counts_and_polygon_ring_counts_are_checked() {
+        let huge_line = counted_geometry(2, u32::MAX, &[]);
+        let huge_polygon = counted_geometry(3, 1, &u32::MAX.to_le_bytes());
+        for child in [
+            counted_geometry(5, 1, &huge_line),
+            counted_geometry(6, 1, &huge_polygon),
+            counted_geometry(4, u32::MAX, &[0; 21]),
+        ] {
+            must_err(counted_geometry(7, 1, &child));
+        }
+    }
+
+    #[test]
+    fn zero_length_rings_and_untagged_curves_error_without_capacity_underflow() {
+        must_err(counted_geometry(3, 1, &0u32.to_le_bytes()));
+        let empty_line = counted_geometry(2, 0, &[]);
+        for kind in [9, 10, 11] {
+            must_err(counted_geometry(kind, 1, &empty_line));
+        }
+    }
+
+    #[test]
+    fn mismatched_child_types_and_trailing_bytes_are_rejected() {
+        let mut point = vec![1];
+        point.extend_from_slice(&1u32.to_le_bytes());
+        point.extend_from_slice(&[0; 16]);
+        for kind in [5, 6, 9, 10, 11, 12, 15, 16] {
+            must_err(counted_geometry(kind, 1, &point));
+        }
+        point.push(0);
+        must_err(Bytes::from(point));
+    }
+
+    #[test]
+    fn deeply_nested_collections_error_without_stack_overflow() {
+        let collection = counted_geometry(7, 1, &[]);
+        let mut bytes = Vec::new();
+        for _ in 0..10_000 {
+            bytes.extend_from_slice(&collection);
+        }
+        bytes.extend_from_slice(&counted_geometry(7, 0, &[]));
+        must_err(Bytes::from(bytes));
     }
 }

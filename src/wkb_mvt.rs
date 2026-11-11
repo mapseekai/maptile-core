@@ -12,9 +12,9 @@
 //!
 //! Per-feature flow:
 //!
-//! 1. Try `Ewkb(bytes).process_geom(&mut writer)` — accepts PostGIS EWKB
-//!    (with optional SRID prefix and Z/M dimensions).
-//! 2. On failure, retry with `Wkb(bytes).process_geom(...)` (plain OGC).
+//! 1. Validate the full WKB structure without allocating from input counts,
+//!    trying PostGIS EWKB first, then ISO WKB.
+//! 2. Decode with the validated dialect into `MvtWriter`.
 //! 3. Lift the resulting `tile::Feature.geometry` (the MVT command-int
 //!    stream) into our [`proto::Feature`] together with our own id and
 //!    dedup'd tag indices.
@@ -31,12 +31,11 @@ use geozero::GeozeroGeometry;
 use geozero::mvt::MvtWriter;
 use geozero::wkb::{Ewkb, Wkb};
 
-/// Maximum accepted WKB blob size. Replaces the deleted depth /
-/// safe-capacity guards from the hand-rolled parser: we trust geozero to
-/// bail on a truncated buffer, but still reject pathologically large
-/// inputs at the API boundary so a single malicious feature can't trigger
-/// multi-GB allocations downstream.
+/// Maximum accepted WKB blob size. Counts must also fit the payload before
+/// reaching geozero, whose MVT writer reserves capacity before reading it.
 const MAX_WKB_BYTES: usize = 16 * 1024 * 1024;
+/// Bound both the validator's and geozero's recursive geometry traversal.
+const MAX_WKB_DEPTH: usize = 64;
 
 /// One feature carried into the encoder.
 #[derive(Debug, Clone)]
@@ -61,6 +60,7 @@ pub struct WkbFeature {
 /// tile's local space before invoking this helper.
 ///
 /// Returns the encoded tile bytes (uncompressed).
+/// Rejects malformed WKB, blobs over 16 MiB, and nesting beyond 64 geometries.
 pub fn encode_features_to_mvt<I>(
     layer_name: &str,
     features: I,
@@ -101,13 +101,6 @@ where
         .map_err(|e| MaptileError::Transcode(format!("mvt writer: {e}")))?;
 
     for feature in features {
-        if feature.wkb.len() > MAX_WKB_BYTES {
-            return Err(MaptileError::Transcode(format!(
-                "wkb: blob exceeds {MAX_WKB_BYTES}-byte cap ({} bytes)",
-                feature.wkb.len()
-            )));
-        }
-
         let geom_feat = encode_one_geometry(&mut writer, &feature.wkb)?;
 
         // Build tag table — keep our typed dedup so we don't pay for the
@@ -153,14 +146,14 @@ where
 }
 
 /// Encode a single WKB geometry into an MVT command stream by driving
-/// the supplied (reusable) `MvtWriter`. Tries EWKB first — it accepts
-/// the same byte sequence as plain WKB when no SRID flag is present —
-/// and falls back to ISO WKB on any error.
+/// the supplied (reusable) `MvtWriter`. Only the dialect whose complete
+/// structure passed validation can reach the allocating writer.
 ///
 /// We call `feature_begin` / `geometry_begin` ourselves to reset the
 /// writer's per-feature state (`last_x`, `last_y`, `line_state`, and the
 /// in-progress `feature` accumulator).
 fn encode_one_geometry(writer: &mut MvtWriter, wkb: &[u8]) -> MaptileResult<EncodedGeom> {
+    let format = validate_wkb(wkb)?;
     writer
         .feature_begin(0)
         .map_err(|e| MaptileError::Transcode(format!("mvt feature_begin: {e}")))?;
@@ -168,36 +161,14 @@ fn encode_one_geometry(writer: &mut MvtWriter, wkb: &[u8]) -> MaptileResult<Enco
         .geometry_begin()
         .map_err(|e| MaptileError::Transcode(format!("mvt geometry_begin: {e}")))?;
 
-    let ewkb_err = match Ewkb(wkb).process_geom(writer) {
-        Ok(()) => {
-            let f = writer.geometry();
-            return Ok(EncodedGeom {
-                r#type: f.r#type,
-                geometry: f.geometry.clone(),
-            });
-        }
-        Err(e) => e,
-    };
-
-    // Reset state and retry as plain WKB.
-    writer
-        .feature_begin(0)
-        .map_err(|e| MaptileError::Transcode(format!("mvt feature_begin: {e}")))?;
-    writer
-        .geometry_begin()
-        .map_err(|e| MaptileError::Transcode(format!("mvt geometry_begin: {e}")))?;
-    match Wkb(wkb).process_geom(writer) {
-        Ok(()) => {
-            let f = writer.geometry();
-            Ok(EncodedGeom {
-                r#type: f.r#type,
-                geometry: f.geometry.clone(),
-            })
-        }
-        Err(e2) => Err(MaptileError::Transcode(format!(
-            "wkb decode: ewkb={ewkb_err}; wkb={e2}"
-        ))),
-    }
+    format
+        .process(wkb, writer)
+        .map_err(|e| MaptileError::Transcode(format!("wkb decode: {e}")))?;
+    let f = writer.geometry();
+    Ok(EncodedGeom {
+        r#type: f.r#type,
+        geometry: f.geometry.clone(),
+    })
 }
 
 struct EncodedGeom {
@@ -207,28 +178,186 @@ struct EncodedGeom {
 
 /// Compute the 2D bounding box of a WKB geometry without decoding it
 /// further. Returns `(minx, miny, maxx, maxy)` or `None` if the WKB is
-/// truncated, uses an unsupported dialect, or contains no coordinates.
+/// malformed, uses an unsupported dialect, contains no coordinates, exceeds
+/// 16 MiB, or is nested beyond 64 geometries.
 ///
 /// Cheap enough to call per row of a parquet scan. Used by the
 /// `geoparquet` live-geometry path to filter rows by tile envelope
 /// before encoding.
 #[must_use]
 pub fn wkb_bbox(wkb: &[u8]) -> Option<(f64, f64, f64, f64)> {
-    if wkb.len() > MAX_WKB_BYTES {
-        return None;
-    }
+    let format = validate_wkb(wkb).ok()?;
     let mut p = geozero::bounds::BoundsProcessor::new();
-    if Ewkb(wkb).process_geom(&mut p).is_err() {
-        // Reset and retry as plain WKB.
-        let mut p2 = geozero::bounds::BoundsProcessor::new();
-        if Wkb(wkb).process_geom(&mut p2).is_err() {
-            return None;
-        }
-        let b = p2.bounds()?;
-        return Some((b.min_x(), b.min_y(), b.max_x(), b.max_y()));
-    }
+    format.process(wkb, &mut p).ok()?;
     let b = p.bounds()?;
     Some((b.min_x(), b.min_y(), b.max_x(), b.max_y()))
+}
+
+#[derive(Clone, Copy)]
+enum WkbFormat {
+    Ewkb,
+    Iso,
+}
+
+impl WkbFormat {
+    fn process<P: geozero::GeomProcessor>(
+        self,
+        wkb: &[u8],
+        processor: &mut P,
+    ) -> geozero::error::Result<()> {
+        match self {
+            Self::Ewkb => Ewkb(wkb).process_geom(processor),
+            Self::Iso => Wkb(wkb).process_geom(processor),
+        }
+    }
+}
+
+/// Structural preflight, not a second coordinate decoder. Skip coordinates
+/// only after proving their byte count fits; never reserve from a WKB count.
+/// Validate child types too: geozero's multi-geometry readers assume them.
+fn validate_wkb(wkb: &[u8]) -> MaptileResult<WkbFormat> {
+    if wkb.len() > MAX_WKB_BYTES {
+        return Err(MaptileError::Transcode(format!(
+            "wkb validation: blob exceeds {MAX_WKB_BYTES}-byte cap ({} bytes)",
+            wkb.len()
+        )));
+    }
+    let validate = |format| {
+        let mut reader = WkbValidator {
+            remaining: wkb,
+            format,
+        };
+        reader.geometry(1, &[], false)?;
+        if !reader.remaining.is_empty() {
+            return Err("trailing bytes after geometry");
+        }
+        Ok(())
+    };
+    let ewkb_err = match validate(WkbFormat::Ewkb) {
+        Ok(()) => return Ok(WkbFormat::Ewkb),
+        Err(e) => e,
+    };
+    validate(WkbFormat::Iso)
+        .map(|()| WkbFormat::Iso)
+        .map_err(|e| MaptileError::Transcode(format!("wkb validation: ewkb={ewkb_err}; wkb={e}")))
+}
+
+struct WkbValidator<'a> {
+    remaining: &'a [u8],
+    format: WkbFormat,
+}
+
+impl<'a> WkbValidator<'a> {
+    fn take(&mut self, size: usize) -> Result<&'a [u8], &'static str> {
+        let (bytes, rest) = self
+            .remaining
+            .split_at_checked(size)
+            .ok_or("truncated geometry")?;
+        self.remaining = rest;
+        Ok(bytes)
+    }
+
+    fn u32(&mut self, little_endian: bool) -> Result<u32, &'static str> {
+        let bytes = self.take(4)?.try_into().expect("checked four-byte slice");
+        Ok(if little_endian {
+            u32::from_le_bytes(bytes)
+        } else {
+            u32::from_be_bytes(bytes)
+        })
+    }
+
+    fn count(&mut self, little_endian: bool, min_bytes: usize) -> Result<usize, &'static str> {
+        let count = self.u32(little_endian)? as usize;
+        // Division avoids overflow even on a 32-bit target.
+        if count > self.remaining.len() / min_bytes {
+            return Err("count exceeds remaining payload");
+        }
+        Ok(count)
+    }
+
+    fn coordinates(&mut self, little_endian: bool, stride: usize) -> Result<usize, &'static str> {
+        let count = self.count(little_endian, stride)?;
+        self.take(count * stride)?;
+        Ok(count)
+    }
+
+    fn geometry(
+        &mut self,
+        depth: usize,
+        allowed_types: &[u32],
+        untagged_line: bool,
+    ) -> Result<(), &'static str> {
+        if depth > MAX_WKB_DEPTH {
+            return Err("geometry nesting exceeds 64 levels");
+        }
+        let little_endian = match self.take(1)?[0] {
+            0 => false,
+            1 => true,
+            _ => return Err("invalid byte order"),
+        };
+        let type_id = self.u32(little_endian)?;
+        let (kind, dimensions) = match self.format {
+            WkbFormat::Ewkb => {
+                if type_id & 0x2000_0000 != 0 {
+                    self.take(4)?; // Optional SRID, in this geometry's byte order.
+                }
+                (
+                    type_id & 0x1fff_ffff,
+                    2 + usize::from(type_id & 0x8000_0000 != 0)
+                        + usize::from(type_id & 0x4000_0000 != 0),
+                )
+            }
+            WkbFormat::Iso => {
+                let dimensions = match type_id / 1000 {
+                    0 => 2,
+                    1 | 2 => 3,
+                    3 => 4,
+                    _ => return Err("invalid ISO geometry type"),
+                };
+                (type_id % 1000, dimensions)
+            }
+        };
+        if !allowed_types.is_empty() && !allowed_types.contains(&kind) {
+            return Err("invalid child geometry type");
+        }
+        let stride = dimensions * 8;
+        let child_types: &[u32] = match kind {
+            1 => return self.take(stride).map(|_| ()),
+            2 | 8 => {
+                let count = self.coordinates(little_endian, stride)?;
+                if kind == 2 && untagged_line && count == 0 {
+                    return Err("untagged line has no coordinates");
+                }
+                return Ok(());
+            }
+            3 | 17 => {
+                let rings = self.count(little_endian, 4)?;
+                for _ in 0..rings {
+                    if self.coordinates(little_endian, stride)? == 0 {
+                        // geozero's ring reservation subtracts one from this count.
+                        return Err("polygon ring has no coordinates");
+                    }
+                }
+                return Ok(());
+            }
+            4 => &[1],
+            5 => &[2],
+            6 | 15 => &[3],
+            7 => &[],
+            9 => &[2, 8],
+            10 | 11 => &[2, 8, 9],
+            12 => &[3, 10],
+            16 => &[17],
+            _ => return Err("unsupported geometry type"),
+        };
+        // A child needs at least its header and count (9 bytes); Points
+        // instead need a header and at least two f64 coordinates (21 bytes).
+        let count = self.count(little_endian, if kind == 4 { 21 } else { 9 })?;
+        for _ in 0..count {
+            self.geometry(depth + 1, child_types, matches!(kind, 9..=11))?;
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -437,5 +566,42 @@ mod tests {
         assert!((bbox.1 - 4.0).abs() < 1e-9);
         assert!((bbox.2 - 3.0).abs() < 1e-9);
         assert!((bbox.3 - 4.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn invalid_count_is_rejected_before_touching_the_writer() {
+        let mut writer = MvtWriter::new(4096, -180.0, -90.0, 180.0, 90.0).unwrap();
+        encode_one_geometry(&mut writer, &wkb_point(3.0, 4.0)).unwrap();
+        let before = writer.geometry().clone();
+        for kind in [2u32, 4] {
+            let mut bytes = vec![1];
+            bytes.extend_from_slice(&kind.to_le_bytes());
+            bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+            assert!(matches!(
+                encode_one_geometry(&mut writer, &bytes),
+                Err(MaptileError::Transcode(message)) if message.starts_with("wkb validation:")
+            ));
+            // Validation runs before even feature_begin, let alone a reserve.
+            assert_eq!(writer.geometry(), &before);
+        }
+    }
+
+    #[test]
+    fn nesting_limit_accepts_64_levels_and_rejects_65() {
+        let mut bytes = Vec::new();
+        for _ in 1..MAX_WKB_DEPTH {
+            bytes.push(1);
+            bytes.extend_from_slice(&7u32.to_le_bytes());
+            bytes.extend_from_slice(&1u32.to_le_bytes());
+        }
+        bytes.extend_from_slice(&wkb_point(3.0, 4.0));
+        let mut writer = MvtWriter::new(4096, -180.0, -90.0, 180.0, 90.0).unwrap();
+        assert!(encode_one_geometry(&mut writer, &bytes).is_ok());
+        assert_eq!(wkb_bbox(&bytes), Some((3.0, 4.0, 3.0, 4.0)));
+
+        let mut deeper = bytes[..9].to_vec();
+        deeper.extend_from_slice(&bytes);
+        assert!(encode_one_geometry(&mut writer, &deeper).is_err());
+        assert!(wkb_bbox(&deeper).is_none());
     }
 }
