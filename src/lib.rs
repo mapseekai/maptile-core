@@ -1,11 +1,18 @@
 // async-geotiff's bounded statistics futures exceed the default query depth.
 #![cfg_attr(feature = "agtiff", recursion_limit = "256")]
 
-//! `maptile-core` — pure tile-serving library: source abstractions, registry,
-//! style/render/raster/resource modules, and a CQL2 filter pipeline.
+//! Composable tile sources, dynamic tiling, caching, and map rendering.
 //!
-//! No configuration parsing lives here; callers construct concrete sources
-//! and inject them via [`sources::manager::SourceManager::register`].
+//! [`sources`] provides a common [`sources::TileSource`] interface for tile
+//! archives, PostgreSQL, and feature-enabled vector and raster backends.
+//! Applications construct sources from their configuration, register them with
+//! [`sources::manager::SourceManager`], and request tiles by source ID.
+//!
+//! [`cache`], [`filter`], [`styles`], and [`transport`] provide tile caching,
+//! CQL2 predicates, style loading, and payload encoding. Optional Cargo features
+//! add GeoParquet, local vector imports, COG/STAC tiling, and native map rendering.
+//! Use [`prelude`] for common types and [`render`] for rendering requests and
+//! WMTS metadata.
 
 pub mod cache;
 pub mod discovery;

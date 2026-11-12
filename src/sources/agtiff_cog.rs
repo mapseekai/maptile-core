@@ -1,11 +1,13 @@
-//! Cloud-Optimized GeoTIFF (COG) raster tile source via async-geotiff
-//! (pure Rust, no GDAL). Replaces the GDAL-backed `cog.rs` for single-COG
-//! dynamic tiling. Full adoption of async-geotiff's `Tiler::tile -> WebP`
-//! pipeline (lossless WebP, requested via `TileStyle::format`); the per-request
-//! style is translated from maptile's resolved `EffectiveStyle` via
-//! [`crate::raster::agtiff_style::to_tile_style`].
+//! Cloud-Optimized GeoTIFF (COG) tiling through async-geotiff.
 //!
-//! See docs/architecture/data-serving.md.
+//! [`AsyncCogSource`] reads local files, HTTP(S) URLs, or injected object stores
+//! and renders Web Mercator tiles. Each request supplies a resolved Raster Style
+//! through [`TileQuery::style`], including its PNG, WebP, or JPEG output format.
+//! [`crate::raster::agtiff_style::to_tile_style`] adapts that style for the tiler.
+//!
+//! [`AsyncCogSourceConfig`] accepts a shared decoded-block cache and a content
+//! identity supplied by the application. Reopen a changed dataset with a new
+//! content identity to separate its cached blocks and tiles.
 
 use std::sync::Arc;
 
@@ -41,16 +43,12 @@ fn reader_config(source_id: &str, block_cache: &Arc<BlockCache>) -> ReaderConfig
     let mut config = ReaderConfig::default();
     config.source_id = source_id.to_string();
     config.block_cache = Arc::clone(block_cache);
-    // Speculatively prefetch the surrounding ring of blocks. The library
-    // default is 0; async-geotiff's own `examples/serve.rs` sets 1 because
-    // interactive pan/zoom makes the neighbour ring exactly what the next
-    // tiles need — without it every viewport tile cold-reads its blocks from
-    // object storage (MinIO) serially. See async-geotiff-rs-note.md.
+    // Prefetch one surrounding ring of blocks for adjacent tile requests.
     config.prefetch_ring = 1;
     config
 }
 
-/// Where the COG bytes live. Built by the server from the stored URI.
+/// COG location or object-store handle supplied by the application.
 #[derive(Clone)]
 pub enum CogObjectSource {
     /// Public HTTP(S) COG. `url` is the full https URL.
@@ -76,13 +74,13 @@ pub struct AsyncCogSourceConfig {
     pub maxzoom: Option<u8>,
     pub bounds: Option<[f64; 4]>,
     pub cache_zoom: Option<crate::cache::CacheZoomRange>,
-    /// Stable content fingerprint input (the source URI). Embedded into the
-    /// cold-cache `cv=` so swapping the underlying file invalidates tiles.
+    /// Nonempty identity of this dataset version, such as a versioned URI or
+    /// content fingerprint. Supply a new value when the underlying bytes change;
+    /// readers and tile caches use it to distinguish content generations.
     pub content_id: String,
-    /// Process-shared decoded-block cache. `Some` ⇒ this COG's `CogReader`
-    /// draws from the injected pool, so the same `source_id` served standalone
-    /// and inside a mosaic reuse one decode budget (see async-geotiff-rs-note
-    /// §11/§14). `None` ⇒ a private per-source cache (legacy / test default).
+    /// Shared decoded-block cache for a common memory budget across readers.
+    /// Readers with the same content identity can reuse decoded blocks.
+    /// `None` creates a private cache with the async-geotiff default capacity.
     pub block_cache: Option<Arc<BlockCache>>,
 }
 
@@ -202,8 +200,7 @@ impl TileSource for AsyncCogSource {
         Box::new(self.clone())
     }
 
-    /// Content version derived from the source URI so swapping the
-    /// pointed-at file renders prior cached tiles unreachable.
+    /// Cache version derived from the application-supplied content identity.
     fn content_version(&self) -> crate::cache::ContentVersion {
         let mut buf = self.content_id.as_bytes().to_vec();
         buf.push(0);
@@ -223,10 +220,8 @@ impl TileSource for AsyncCogSource {
         let tile_style = to_tile_style(style)?;
         let out_format = out_tile_format(style.format);
 
-        // `Tiler::tile` returns `Ok(None)` for tiles fully outside the dataset
-        // or the projection's valid domain (async-geotiff v0.0.7). Surface that
-        // as `TileNotFound`; the server maps it to HTTP 204 (no tile) rather
-        // than synthesising a blank one. See async-geotiff-rs-note.md.
+        // Map an empty tiler result to TileNotFound so the application can
+        // represent a coordinate outside the dataset or projection domain.
         let tile: Bytes = self
             .tiler
             .tile(

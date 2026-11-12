@@ -1,4 +1,8 @@
-//! PostgreSQL function tile source — invokes a user SQL function returning MVT bytea.
+//! PostgreSQL function source for MVT returned by application-defined SQL.
+//!
+//! Functions receive integer `(z, x, y)` coordinates and may also accept a
+//! JSON or JSONB parameter object. [`PostgresFunctionSource`] discovers the
+//! signature at open time and forwards tile requests through [`PostgresPool`].
 
 use std::sync::Arc;
 
@@ -88,15 +92,11 @@ impl PostgresFunctionSource {
         })
     }
 
-    /// Attach a tile cache. Cache is consulted only for query-less requests
-    /// (filter/url_query make the response query-dependent).
-    ///
-    /// Note: this source-level cache does **not** consult [`Self::cache_zoom`];
-    /// the zoom-range filter is applied only by
-    /// [`crate::sources::manager::SourceManager::get_tile`]. Prefer attaching
-    /// the cache at the manager layer via
-    /// [`crate::sources::manager::SourceManager::with_cache`] so the policy
-    /// is honored.
+    /// Attach a tile cache for query-less requests within [`Self::cache_zoom`].
+    /// Concurrent misses for the same source content and tile coordinate share
+    /// one function call. Requests carrying a [`TileQuery`] execute directly.
+    /// A shared manager-level cache can also be configured through
+    /// [`crate::sources::manager::SourceManager::with_cache`].
     #[must_use]
     pub fn with_cache(mut self, cache: Arc<TileCache>) -> Self {
         self.cache = Some(cache);

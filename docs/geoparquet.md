@@ -1,165 +1,310 @@
-# GeoParquet 独立使用
+# GeoParquet 与本地矢量数据
 
-启用 `geoparquet` feature 后，核心库可读取预编码 `(z,x,y,tile)` 归档，或直接从几何 GeoParquet 按需生成 MVT。它不依赖 MapSeek 服务、数据库配置或业务身份。
+`maptile-core` 支持从 GeoParquet 几何数据按需生成 MVT，也支持读取已经编码好的瓦片归档。启用 `local-vector` 后，还可以直接读取本地 FlatGeobuf，或将 GeoJSON、ZIP Shapefile 导入为 GeoParquet 后提供瓦片。
 
-## 构建与扩展
+本指南面向在 Rust 应用中接入文件数据源的开发者。公开接口见 [GeoParquet 源](../src/sources/geoparquet.rs)和[本地矢量源](../src/sources/local_vector.rs)，整体接入方式见[快速开始](getting-started.md)。
 
-当前锁文件使用 `duckdb = 1.10506.1`，对应嵌入式 DuckDB 1.5.6。Parquet 随库编译。几何模式需要匹配该版本及平台的官方签名 Spatial 扩展，远程模式还需要 HTTPFS。
+## 选择数据入口
+
+| 数据 | 入口 | 处理方式 | Feature |
+| --- | --- | --- | --- |
+| 本地 GeoParquet 几何文件 | `GeoParquetSource::open`，设置 `geometry_column` | 查询几何、投影、裁剪并生成 MVT | `geoparquet` |
+| HTTP(S) GeoParquet | `open_http` / `open_http_with_client` | 按 Range 读取远程几何文件并生成 MVT | `geoparquet` |
+| S3 兼容或其他对象存储中的 GeoParquet | `open_object_store` | 通过调用方提供的对象存储客户端按范围读取 | `geoparquet` |
+| 本地预编码瓦片归档 | `GeoParquetSource::open`，使用默认 `geometry_column = None` | 从 `(z, x, y, tile)` 列建立内存索引，按坐标返回瓦片 | `geoparquet` |
+| 本地 FlatGeobuf | `FlatGeobufSource::open` | 直接读取几何并生成 MVT | `local-vector` |
+| 本地 GeoJSON、ZIP Shapefile | `import_to_geoparquet` | 一次性转换为 GeoParquet，再通过几何源提供瓦片 | `local-vector` |
+
+几何源按 `TileCoord` 指定的 XYZ 坐标生成未压缩 MVT。图层名、属性列、要素 ID 和几何裁剪参数在打开源时配置。
+
+## 准备构建环境与 DuckDB 扩展
+
+在调用方的依赖中启用所需 feature：
+
+```toml
+[dependencies]
+maptile-core = { git = "https://github.com/mapseekai/maptile-core.git", features = ["geoparquet"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+```
+
+需要 FlatGeobuf 或文件导入时，将 feature 改为 `local-vector`，它会同时启用 `geoparquet`。构建使用随 crate 编译的 DuckDB，需准备 C/C++ 工具链；通用环境说明见[构建与验证](development.md)。
+
+[Cargo.lock](../Cargo.lock) 锁定 `duckdb 1.10506.1`，对应嵌入式 DuckDB 1.5.6。Parquet 随库编译；几何查询需要匹配版本和平台的官方签名 Spatial 扩展，远程读取还需要 HTTPFS。FlatGeobuf 与导入流程使用 Spatial 内置的 GDAL 驱动。
+
+以实际运行应用的用户，在仓库根目录执行[扩展准备示例](../examples/geoparquet_extensions.rs)：
 
 ```sh
-# 检查已有扩展，不下载。
 cargo run --locked --features geoparquet --example geoparquet_extensions -- --check
-# 明确准备官方扩展。以实际运行程序的用户执行。
+```
+
+此命令检查本机已有的 Parquet、Spatial 和 HTTPFS，并输出嵌入式 DuckDB 版本及平台。首次准备环境时执行：
+
+```sh
 cargo run --locked --features geoparquet --example geoparquet_extensions -- --install
 ```
 
-`--install` 只使用 DuckDB 官方 core 仓库，加载时校验签名。构造数据源仅执行 LOAD，不在请求中安装或升级扩展；缺失扩展会报错，不静默降级。不支持配置任意扩展来源或 SQL 模板。
+安装命令从 DuckDB 官方 core 仓库获取匹配的扩展，加载时校验签名。数据源构造阶段通过 `LOAD` 使用已准备的扩展，扩展缺失会返回加载错误。SQL 由核心根据数据源配置生成。
 
-内置下载受网络限制时，可通过官方 HTTPS 地址下载对应版本和平台的签名扩展，再用同版本 DuckDB 从本地文件执行 `INSTALL`。 [手动安装说明](https://duckdb.org/docs/1.5/extensions/troubleshooting)
+也可以通过 DuckDB 官方 HTTPS 地址获取匹配版本和平台的签名扩展，再用同版本 DuckDB 从本地文件执行 `INSTALL`，操作方式见 [DuckDB 手动安装说明](https://duckdb.org/docs/1.5/extensions/troubleshooting)。
 
-## 本地几何源
+## 读取本地 GeoParquet
 
-将以下代码放入启用了 `geoparquet` 和 Tokio 的调用方。同步打开使用 blocking pool，瓦片查询异步执行：
+准备包含 `geometry` 几何列和整数 `id` 列的 `/data/places.parquet`。以下程序打开数据源、读取一张瓦片并等待源关闭：
 
 ```rust
-use maptile_core::sources::geoparquet::{GeoParquetSource, GeoParquetSourceConfig};
-use maptile_core::sources::{TileCoord, TileSource};
+use maptile_core::sources::{GeoParquetSource, GeoParquetSourceConfig, TileCoord, TileSource};
 
-async fn read_tile() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config = GeoParquetSourceConfig {
         id: "places".into(),
-        path: std::path::PathBuf::from("/data/places.parquet"),
+        path: "/data/places.parquet".into(),
         geometry_column: Some("geometry".into()),
         layer_name: "places".into(),
         id_column: Some("id".into()),
         ..Default::default()
     };
     let source = tokio::task::spawn_blocking(move || GeoParquetSource::open(config)).await??;
+
     let result = source.get_tile(TileCoord { z: 2, x: 2, y: 1 }, None).await;
     source.close().await?;
     let tile = result?;
-    println!("{} bytes", tile.data.len());
+    println!("{} bytes of MVT", tile.data.len());
     Ok(())
 }
 ```
 
-`geometry_column = None` 使用预编码归档模式。打开时只读取配置的 `z`、`x`、`y` 和瓦片列，并建立内存索引。这四列使用无压缩的 Parquet 列块，瓦片内容可按 `encoding` 压缩。归档最多扫描 400 万行。单瓦片上限为 `query_options.max_tile_bytes`，索引及瓦片使用 `query_options.memory_limit_mb` 的一半作为预算，其余用于读取和解码。超出上限时打开失败。远程打开只支持几何模式，必须指定 `geometry_column`。
+根据实际文件调整路径、几何列和 ID 列。读取成功后，程序输出该瓦片的字节数；目标范围内没有要素时，几何源成功返回空瓦片。
 
-## HTTP 和对象存储
+`open` 是同步接口，异步应用通过 `spawn_blocking` 完成打开操作。几何模式在启动时读取 schema 和文件尾元数据，瓦片请求时执行空间查询。需要通过统一入口管理多个源时，将源包装为 `Arc` 后交给 `SourceManager::register`，具体流程见[架构与集成](architecture.md)。
 
-- `GeoParquetSource::open_http(config, url).await`：有界 HTTP(S) Range 读取。默认客户端禁止自动重定向、环境代理及透明解压。
-- `open_http_with_client(config, url, client).await`：注入调用方的 reqwest 客户端。调用方负责同样的重定向/解压限制，以及 DNS 固定和网络出口策略。
-- `open_object_store(config, store, key).await`：通过已有的 `Arc<dyn object_store::ObjectStore>` 读取 S3 兼容或其他对象存储。凭据、桶和端点由调用方授权与配置。
+### 配置字段
 
-远程模式不会先把整个文件落到本地缓存。核心在 loopback 上创建源专属、带随机会话令牌的范围读取器，DuckDB HTTPFS 只接触本机 URL，真实签名查询串和对象存储凭据不会进入 SQL。进程需要允许绑定 loopback listener。
+以下默认值来自 [`GeoParquetSourceConfig`](../src/sources/geoparquet.rs)。
 
-**核心库不提供 MapSeek 服务层的 SSRF 防护。** 独立调用方必须先授权目标地址，并限制私网、云元数据地址、DNS 重绑定及网络出口。不要直接把不可信用户提供的 URL 传给 `open_http`。提供自定义客户端不会自动继承服务工厂的安全策略。
+| 字段 | 默认值 | 用途 |
+| --- | --- | --- |
+| `id` | `"geoparquet"` | 源管理器使用的数据源标识 |
+| `path` | 空路径 | 本地文件路径；远程入口通过独立参数接收 URL 或对象 key |
+| `geometry_column` | `None` | 设置为几何列名时启用动态 MVT；保留默认值时读取瓦片归档 |
+| `layer_name` | `"data"` | 动态 MVT 内部的图层名 |
+| `srid` | `None` | 显式 EPSG 覆盖值，默认读取文件的 CRS 信息 |
+| `id_column` | `None` | 用作 MVT 要素 ID 的整数列 |
+| `properties` | `None` | 默认选择可编码的标量属性；`Some(vec![...])` 指定属性白名单 |
+| `extent` | `4096` | MVT 坐标空间大小，范围为 `1..=65536` |
+| `buffer` | `64` | 瓦片边缘缓冲区，单位与 extent 一致，取值为 `0..=extent` |
+| `minzoom` / `maxzoom` | `0` / `22` | 服务的缩放级别，满足 `0 <= minzoom <= maxzoom <= 30` |
+| `bounds` | `None` | TileJSON 的 WGS84 范围；几何模式可从有效元数据推导 |
+| `name` / `attribution` / `description` | `None` | TileJSON 名称、来源署名和说明 |
+| `columns` | `z`、`x`、`y`、`tile` | 预编码归档的坐标列和瓦片列名称 |
+| `format` / `encoding` | MVT / 未压缩 | 预编码归档中保存的瓦片格式与编码 |
+| `query_options` | 见[查询预算](#查询预算) | 连接数、线程数、内存、期限和瓦片大小预算 |
+| `cache_zoom` | `None` | 默认允许各缩放级别进入管理器缓存，可配置 `CacheZoomRange` |
 
-## 几何与属性契约
+## 读取 HTTP 和对象存储中的 GeoParquet
 
-- 几何列必须为可读取的 WKB/GEOMETRY；当前不支持 GeoArrow 原生几何编码或 spherical edges。
-- `srid` 可提供明确的 EPSG 覆盖值。否则读取 GeoParquet PROJJSON 的 EPSG/OGC:CRS84 标识；省略 crs 等同 CRS84，显式 `crs: null` 需要覆盖值。兼容旧接口：明确指定几何列但没有 geo 元数据的 WKB Parquet 默认 WGS84。
-- 几何先按 always_xy 投影到 EPSG:3857，再相交、裁剪和 MVT 编码。默认 extent=4096、buffer=64；extent 需为 1..=65536，buffer 不超过 extent。zoom 需为有序的 0..=30。
-- `properties = None` 选择 MVT 可表达的标量字段，`Some(...)` 是字段白名单。容器、二进制及其他几何字段不自动输出。
-- 整数 ID 转为非负 BIGINT；负值不编码为 ID，超过有符号 64 位上限报错。普通 UInt64 属性输出十进制字符串以保留精度。
-- 日期、时间和 UUID 输出字符串，DECIMAL 输出浮点数。无法安全推导元数据 bounds 时省略，不在启动时扫描全表。
-- 空数据/无命中得到成功的空瓦片；无效坐标及超出 zoom 范围得到 TileNotFound。
+远程入口使用几何模式，在配置中设置非空的 `geometry_column`。应用可以根据网络环境选择默认 HTTP 客户端、自定义客户端或对象存储客户端：
 
-GeoParquet 1.1 `covering.bbox` 可用于行组裁剪。仅对可解析为数值字段的路径及 4326/3857 启用，以免其他投影造成漏要素。没有合法 covering 仍可查询，但每瓦片可能扫描所有行组。生产者必须保持 covering 与几何一致，核心不全量验证每行 bbox。
+| 接口 | 调用方提供 | 读取行为 |
+| --- | --- | --- |
+| `open_http(config, url).await` | 单个 HTTP(S) 文件 URL | 使用有界 Range 请求，客户端关闭自动重定向、环境代理和透明解压 |
+| `open_http_with_client(config, url, client).await` | 文件 URL 与 `reqwest::Client` | 复用调用方设置的 DNS、连接和网络出口策略 |
+| `open_object_store(config, store, key).await` | `Arc<dyn object_store::ObjectStore>` 与对象 key | 通过现有客户端读取 S3 兼容或其他对象存储 |
 
-## 预算和关闭
+HTTP 服务应返回合法的 `206 Partial Content`、`Content-Range` 和 identity 编码，URL 指向一个确定文件。凭据可由预签名查询串或调用方客户端携带。对象存储的凭据、桶和端点由应用配置。
 
-`GeoParquetSourceConfig.query_options` 的默认值：
+应用在打开源前完成目标地址授权，并按部署环境约束私网地址、云元数据地址、DNS 重绑定和网络出口。接收外部用户 URL 的服务应将这些检查纳入数据源创建流程；自定义 HTTP 客户端还应保留 Range 读取所需的重定向与解压策略。
 
-```text
-pool_size = 2
-threads = 2
-memory_limit_mb = 256
-timeout_ms = 10000
-max_features = 100000
-max_tile_bytes = 8388608
-```
+[远程读取器](../src/sources/geoparquet_remote.rs)在 loopback 上为每个源建立带随机会话令牌的范围读取入口。DuckDB HTTPFS 访问这个本机 URL，真实远程地址的签名查询串和对象存储凭据留在传输层。远程文件按需读取，运行进程需要具备绑定 loopback listener 的权限。
 
-预算按源共享。DuckDB memory_limit 是查询内存限制，不是进程 RSS 上限；多个活跃源仍会占用各自 listener、连接和文件描述符，应用需限制源数量。
+## 几何、属性与瓦片结果
 
-所有 source 克隆共享会话。`source.close().await` 幂等，会拒绝新请求、打断排队和在途查询，并等待本机读取器与查询资源退出。取消一个 close future 后，可用保留的 source 再次 await close。会话只释放自己持有的客户端引用，不强制关闭其他源共用的客户端。
+动态切片接受 WKB 或可读取的 GEOMETRY 列。GeoParquet 元数据中的几何编码使用 `WKB`，边模型使用 `planar`。具体解析和查询逻辑见[几何查询实现](../src/sources/geoparquet_geometry.rs)。
 
-使用 SourceManager 时可调用 `close_source(id).await`：移除源、失效热缓存并等待关闭。普通 remove、不可用标记和替换注册使用非等待式 start_close；显式等待仍应使用 close_source。Drop 发起关闭，但不是资源已完全释放的确认。
+### 坐标系与空间查询
 
-使用不可变、带版本的 URI；替换数据时更新 URI 并重新注册。网络读取验证 ETag/Last-Modified 或对象版本，但缓存命中未必再访问远端；没有 validator 的 HTTP 文件尤其必须保持不变。本地路径会核对文件大小和 mtime，变化时需要重新打开。
+`srid` 可以显式指定正整数 EPSG 代码。默认从 GeoParquet PROJJSON 读取 EPSG 或 OGC:CRS84 标识；省略 `crs` 时按 CRS84 处理，显式 `crs: null` 时由调用方提供 `srid`。对于显式指定几何列且省略 geo 元数据的 WKB Parquet，默认按 WGS84 处理。
 
-## 验证
+查询使用 `always_xy` 按 x/y 顺序投影到 EPSG:3857，再完成空间相交、裁剪与 MVT 编码。有效坐标范围和缩放级别由配置控制；无效坐标或超出级别范围时返回 `TileNotFound`。
 
-```sh
-cargo test --locked --features geoparquet --lib
-cargo clippy --locked --all-targets --features geoparquet -- -D warnings
-# 手动微基准，非生产性能保证。
-cargo test --locked --features geoparquet --lib repeated_tile_probe -- --ignored --nocapture
-```
+GeoParquet 1.1 的 `covering.bbox` 可加速行组裁剪。核心在 EPSG:4326、EPSG:3857 下使用可解析为数值字段的 bbox 路径；其他情况继续通过几何相交查询，读取范围可能覆盖全部行组。数据生产方负责保持每行 bbox 与几何一致，核心在打开时检查字段结构和类型。
 
-核心测试用合成 GeoParquet 验证投影、属性/ID、跨边界几何、covering、查询预算、HTTP Range、源管理和会话关闭。它们不能证明真实 AWS 端点、MapSeek 服务工厂、生产负载或跨平台行为；服务层 S3 集成测试留在 MapSeek。
+TileJSON 优先使用显式 `bounds`，也可采用能够安全转换为 WGS84 的元数据范围。其余情况下保留空 bounds，以文件元数据完成打开过程。
+
+### 属性与要素 ID
+
+`properties = None` 自动选择 MVT 可表达的标量字段，`Some(...)` 使用显式白名单。常见映射如下：
+
+| 输入类型 | MVT 属性表示 |
+| --- | --- |
+| 布尔值 | Boolean |
+| 常规整数与浮点数 | Number |
+| UInt64、128 位整数 | 十进制 String，保留整数精度 |
+| 字符串、日期、时间、UUID、JSON、枚举 | String |
+| DECIMAL | 浮点 Number |
+
+容器、二进制及其他几何列由默认属性选择过程跳过；显式白名单中的字段需要具备 MVT 表示。几何列与 `id_column` 分别用于几何和要素 ID。
+
+`id_column` 接受 8、16、32、64 位有符号或无符号整数列，其中非负值转换为 BIGINT 作为要素 ID，负值对应的要素省略 ID。ID 超出有符号 64 位范围时返回错误。查询命中零条要素或数据集为空时，几何源返回成功的空瓦片。
+
+## 读取预编码瓦片归档
+
+将 `geometry_column` 保持为 `None`，即可通过本地 `open` 读取 `(z, x, y, tile)` 归档。坐标列接受整数，瓦片列保存二进制字节。使用 `columns` 对接实际列名，并通过 `format`、`encoding` 描述已编码瓦片。
+
+打开时选择这四列建立内存索引，随后按 XYZ 返回已保存的字节。归档准备要求来自 [`read_tile_archive`](../src/sources/geoparquet.rs)：
+
+- 四个选定列使用无压缩 Parquet 列块，瓦片字节本身可采用 `encoding` 指定的压缩。
+- 总扫描行数上限为 4,000,000，统计包含重复坐标与空值行。
+- 单瓦片字节数遵守 `query_options.max_tile_bytes`。
+- 索引与保留的瓦片字节使用 `memory_limit_mb * 1024 * 1024 / 2` 的预算，剩余预算用于读取和解码。
+- 单行组所选列块的总量受总预算四分之一约束；元数据上限为总预算八分之一与 16 MiB 中的较小值。
+
+超过读取预算时，打开操作返回错误。缺少指定坐标的归档瓦片时返回 `TileNotFound`。`tile_count()` 返回内存索引中的瓦片条目数。
+
+## 查询预算
+
+`GeoParquetSourceConfig.query_options` 控制每个几何源的执行资源，所有源克隆共享同一预算。默认值和有效范围来自 [`GeoParquetQueryOptions`](../src/sources/geoparquet_geometry.rs)。
+
+| 字段 | 默认值 | 有效范围 | 作用 |
+| --- | --- | --- | --- |
+| `pool_size` | 2 | 1..=32 | 同时使用的 DuckDB 连接数 |
+| `threads` | 2 | 1..=64 | DuckDB 工作线程数 |
+| `memory_limit_mb` | 256 MB | 32..=65536 | DuckDB 管理的查询内存预算 |
+| `timeout_ms` | 10000 ms | 1..=300000 | 单次瓦片请求排队与执行共用的期限 |
+| `max_features` | 100000 | 1..=10000000 | 单瓦片命中要素数上限 |
+| `max_tile_bytes` | 8 MiB | 1..=256 MiB | 单瓦片输出字节上限 |
+
+接入 `SourceManager` 时，瓦片还需符合管理器的 16 MiB 单次响应载荷预算，见 [`manager.rs`](../src/sources/manager.rs)。要素数或输出大小超过相应预算时，查询返回错误。应用可以据此调整数据组织、请求级别或预算参数。DuckDB 查询内存由该源的连接共享，进程总 RSS 还包含运行时、读取缓冲和其他分配。
+
+应用应同时限制活跃源数量，因为每个源各自持有连接、文件描述符，以及远程模式使用的 listener。多源资源规划应同时考虑单源预算和源数量。
+
+## 更新数据与关闭源
+
+使用不可变、带版本的文件路径或对象 URI 管理数据。发布新版本时，先打开新数据源，再用相同 ID 注册到 `SourceManager`；注册过程开始关闭被替换的旧源。GeoParquet 内容版本由源配置及文件或远程对象标识计算，参与管理器缓存键。
+
+本地几何查询检查文件大小和 mtime；文件变化后需要重新打开源。远程读取通过 ETag、Last-Modified 或对象版本检查内容一致性。应用应让每个版本地址始终对应同一内容，尤其是 HTTP 服务缺少版本校验标识时。热缓存命中可以直接返回已有结果，文件更新应通过明确的版本发布与重新注册流程完成。
+
+关闭方式按资源管理目标选择：
+
+| 操作 | 行为 |
+| --- | --- |
+| `source.start_close()` | 开始关闭所有共享会话的克隆，取消排队和在途查询 |
+| `source.close().await` | 开始关闭并等待查询、连接和远程读取器退出 |
+| `manager.close_source(id).await` | 移除源、使该源热缓存失效，并等待关闭完成 |
+| `manager.remove(id)`、标记不可用、替换注册 | 开始关闭被移出的源，并立即返回 |
+
+`close` 可以重复调用。若等待关闭的 future 被取消，可以通过保留的源再次 `await close()`。需要等待旧源完全退出时，在替换前保留旧源引用，再调用它的 `close`；`close_source` 操作的是管理器当前注册的源。
+
+`with_file_lease` 可让源克隆和正在执行的阻塞查询持有调用方的文件生命周期守卫。即使请求被取消，守卫也会保留到对应阻塞查询退出。关闭时会释放当前会话持有的客户端引用，共享客户端的其他使用者继续管理各自引用。远程读取器在最终释放时发起关闭，应用通过显式 `close().await` 确认资源退出。
 
 ## 本地 FlatGeobuf 与一次性导入
 
-启用 `local-vector` feature（包含 `geoparquet`）后，从 `sources` 或 `prelude` 引入公开类型。读取使用 DuckDB Spatial 自带的 GDAL 驱动，需预装与嵌入式 DuckDB 匹配的官方签名 Spatial 扩展。
+启用 `local-vector` 并准备 Spatial 扩展后，可以从 `sources` 或 `prelude` 引入相关类型。FlatGeobuf 适合直接提供文件中的几何数据；GeoJSON 和 ZIP Shapefile 使用一次导入、多次瓦片查询的流程。
+
+### 直接读取 FlatGeobuf
+
+以下示例读取一个本地常规文件，并输出指定瓦片的 MVT 字节数：
 
 ```rust
 use maptile_core::sources::{FlatGeobufSource, FlatGeobufSourceConfig, TileCoord, TileSource};
 
 async fn read_flatgeobuf() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let source = tokio::task::spawn_blocking(|| FlatGeobufSource::open(FlatGeobufSourceConfig {
-        id: "places".into(),
-        path: "/data/places.fgb".into(),
-        layer_name: "places".into(),
-        id_column: Some("id".into()),
-        ..Default::default()
-    })).await??;
+    let source = tokio::task::spawn_blocking(|| {
+        FlatGeobufSource::open(FlatGeobufSourceConfig {
+            id: "places".into(),
+            path: "/data/places.fgb".into(),
+            layer_name: "places".into(),
+            id_column: Some("id".into()),
+            ..Default::default()
+        })
+    })
+    .await??;
     let result = source.get_tile(TileCoord { z: 2, x: 2, y: 1 }, None).await;
     source.close().await?;
-    println!("{} bytes", result?.data.len());
+    println!("{} bytes of MVT", result?.data.len());
     Ok(())
 }
 ```
 
-`FlatGeobufSource` 只读取一个本地常规文件，不接受 URL、glob、SQL 或驱动参数。几何列由驱动发现；CRS 必须有可信的 EPSG / OGC:CRS84 标识，否则需要 `srid` 显式覆盖。几何投影到 EPSG:3857 后，按含 buffer 的瓦片范围精确相交与裁剪，保留跨瓦片、世界边缘及投影后的线段。
+输入使用单个本地文件的 UTF-8 路径，几何列由驱动发现。CRS 使用文件中可信的 EPSG 或 OGC:CRS84 标识，也可通过 `srid` 显式覆盖。数据投影到 EPSG:3857 后，按照带 buffer 的瓦片范围做精确相交和裁剪。
 
-**当前锁定的 Spatial 1.5.6 对 FlatGeobuf 使用完整扫描。** 该版本的索引筛选可能漏掉投影后的长线，并在空命中时产生无效批次。有索引和无索引的文件均可直接切片，大文件的单瓦片查询可能超过预算。连接池、资源预算、文件变化检查、文件 lease、缓存版本及 close 语义与 GeoParquet 相同。
+当前锁定的 Spatial 1.5.6 路径对有索引和无索引的 FlatGeobuf 都执行完整扫描。这一策略用于正确处理投影后的长线和空命中结果，相关回归见[本地矢量测试](../src/sources/local_vector.rs)。大文件的单瓦片扫描可能达到查询期限，应用应按数据体量安排预算。
 
-GeoJSON 和 ZIP Shapefile 通过 `import_to_geoparquet` 一次性转换，瓦片查询只读取导入后的 GeoParquet：
+FlatGeobuf 使用与 GeoParquet 几何源一致的连接池、文件变化检查、内容版本、查询预算和关闭流程。`FlatGeobufSourceConfig` 中的图层名、属性、ID、级别及裁剪字段按前述配置方式使用。
+
+### 导入 GeoJSON 和 ZIP Shapefile
+
+`import_to_geoparquet` 将本地输入转换为独立 GeoParquet 文件，并返回实际路径和几何列名。下例使用 ZIP Shapefile；GeoJSON 对应 `VectorImportFormat::GeoJson`：
 
 ```rust
 use maptile_core::sources::{
-    GeoParquetSource, GeoParquetSourceConfig,
+    GeoParquetSource, GeoParquetSourceConfig, TileCoord, TileSource,
     VectorImportFormat, VectorImportOptions, import_to_geoparquet,
 };
 
 async fn import_places() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let imported = import_to_geoparquet(
         "/data/places.zip",
-        VectorImportFormat::ShapefileZip, // GeoJSON 使用 GeoJson
+        VectorImportFormat::ShapefileZip,
         "/data/places.parquet",
         VectorImportOptions::default(),
-    ).await?;
-    let source = tokio::task::spawn_blocking(move || GeoParquetSource::open(GeoParquetSourceConfig {
-        id: "places".into(),
-        path: imported.path,
-        geometry_column: Some(imported.geometry_column),
-        ..Default::default()
-    })).await??;
+    )
+    .await?;
+    let source = tokio::task::spawn_blocking(move || {
+        GeoParquetSource::open(GeoParquetSourceConfig {
+            id: "places".into(),
+            path: imported.path,
+            geometry_column: Some(imported.geometry_column),
+            ..Default::default()
+        })
+    })
+    .await??;
+    let result = source.get_tile(TileCoord { z: 0, x: 0, y: 0 }, None).await;
     source.close().await?;
+    println!("{} bytes of MVT", result?.data.len());
     Ok(())
 }
 ```
 
-导入将几何规范为 WGS84 WKB，移除 M 维度并保留 Z。输出保留驱动读到的属性和 GeoParquet 1.1 `covering.bbox`，NULL 几何对应 NULL bbox。返回值给出实际几何列名。若属性已经占用 `geometry`，几何列会追加下划线。驱动无法解析的字段或驱动列名冲突会报错，例如原属性 `wkb_geometry` 与 Spatial 生成的 WKB 列同名。正常 GeoJSON 使用 WGS84，Shapefile 通过 `.prj` 识别 CRS，未知 CRS 需要 `VectorImportOptions.srid`。提取后检查 `.shp/.shx` 文件头长度、索引记录数及 `.dbf` 记录体积。各条几何记录的解析由 GDAL 完成。
+导入将几何转换为 WGS84 WKB，保留 Z 维度并移除 M 维度。输出保留驱动读取的属性，生成 GeoParquet 1.1 `covering.bbox`；NULL 几何对应 NULL bbox。正常 GeoJSON 按 WGS84 处理，Shapefile 通过 `.prj` 识别 CRS。输入 CRS 需要显式确定时，设置 `VectorImportOptions.srid`。
 
-ZIP 可含嵌套目录，但必须恰好包含一套同路径、同 stem 的 `.shp/.shx/.dbf`，可另含 `.prj/.cpg`；大小写不敏感。只提取这五类组件。拒绝路径逃逸、绝对路径、链接、特殊文件、重复组件、多个 Shapefile、加密和非 Stored/Deflate 压缩。支持普通单卷 ZIP，最多 128 个条目、1 MiB 中央目录，不支持 ZIP64 目录或尾部附加数据；在分配完整条目索引前检查。ZIP 元数据和实际解压字节均受限。
+输出几何列默认名为 `geometry`，与属性重名时自动追加下划线。因此，后续打开源时使用返回的 `geometry_column`。驱动解析或列名冲突会返回错误，例如输入属性 `wkb_geometry` 与 Spatial 生成的 WKB 列同名。
 
-默认导入预算为 512 MiB、30 秒、两个 DuckDB 线程及 256 MB 的 DuckDB 管理内存，禁止磁盘 spill。`max_bytes` 分别约束输入、ZIP 声明的总解压体积、实际提取字节及完成后的输出；输出大小在 COPY 完成后检查，因此它不是磁盘配额。`timeout_ms` 允许 1..=300000，`max_bytes` 允许 1..=8 GiB。应用仍需限制并行导入数量及磁盘使用。
+### 准备 Shapefile ZIP
 
-目标父目录必须由调用方控制。输入快照和输出位于该目录内的私有临时目录（Unix 权限 0700）；发布文件的权限遵循进程 umask。转换完整成功后才通过同文件系统的硬链接原子发布；目标必须不存在，文件系统需支持硬链接。失败或 future 被取消时不发布输出，阻塞任务退出后清理暂存文件。成功结果由调用方持有，之后可以删除原始 GeoJSON / ZIP。调用方负责授权输入、目标目录及本地文件的访问，保持直接服务的 FlatGeobuf 不变。
+导入器接受普通单卷 ZIP，组件可以位于嵌套目录中。准备文件时遵循以下输入契约：
 
-以下示例分别读取三种格式的世界瓦片，并打印生成的 MVT 字节数。导入命令使用尚未创建的输出路径。
+| 项目 | 要求 |
+| --- | --- |
+| 图层数量 | 一套 Shapefile |
+| 必需组件 | 同目录、同 stem 的 `.shp`、`.shx`、`.dbf`，匹配时忽略大小写 |
+| 可选组件 | 同组 `.prj`、`.cpg`；提取过程使用上述五类组件 |
+| 条目 | 1..=128 个，使用唯一的相对路径，内容为常规文件或目录 |
+| 压缩 | Stored 或 Deflate，条目以明文存储 |
+| 目录结构 | 32 位普通 ZIP 目录，中央目录最多 1 MiB，结束记录位于归档末尾 |
+| 字节预算 | 声明的总解压体积与实际提取字节分别受 `max_bytes` 约束 |
+
+导入器在建立完整条目索引前校验中央目录，并检查路径、文件类型、组件重复和归档头一致性。提取后还会核对 `.shp/.shx` 文件头长度、索引记录数及 `.dbf` 记录体积；几何记录由 Spatial 内置 GDAL 驱动解析。
+
+### 导入预算与文件发布
+
+导入配置由 [`VectorImportOptions`](../src/sources/local_vector.rs) 定义：
+
+| 字段 | 默认值 | 有效范围与用途 |
+| --- | --- | --- |
+| `srid` | `None` | 用正整数 EPSG 代码覆盖输入 CRS |
+| `max_bytes` | 512 MiB | `1..=8 GiB`，分别限制输入、ZIP 声明解压总量、实际提取量和完成后的输出 |
+| `timeout_ms` | 30000 ms | `1..=300000`，暂存、等待工作线程与转换共用的期限 |
+
+每次导入使用 2 个 DuckDB 线程和 256 MB DuckDB 管理内存，并将磁盘 spill 预算设为零。输出大小在 `COPY` 完成后检查，应用另外配置并行导入数量与磁盘配额。
+
+调用方授权输入文件和目标目录，并选择一个尚未创建的输出路径。转换在目标父目录内的私有临时目录进行，Unix 目录权限为 `0700`，发布文件权限遵循进程 umask。完整转换成功后，导入器通过同一文件系统的硬链接原子发布结果，因此目标文件系统需要支持硬链接。
+
+失败或取消会清理暂存结果，清理时间以阻塞任务退出为准。成功返回的 GeoParquet 由调用方持有，可独立于原始 GeoJSON 或 ZIP 使用；应用可在确认导入成功后清理原始输入。直接提供瓦片的 FlatGeobuf 文件应在源的使用期间保持内容不变。
+
+## 运行示例与验证
+
+仓库中的 [`local_vector` 示例](../examples/local_vector.rs)读取世界瓦片 `0/0/0` 并打印 MVT 字节数。准备好对应数据文件，在仓库根目录运行：
 
 ```sh
 cargo run --locked --features local-vector --example local_vector -- fgb places.fgb
@@ -167,9 +312,23 @@ cargo run --locked --features local-vector --example local_vector -- geojson pla
 cargo run --locked --features local-vector --example local_vector -- shapefile places.zip places-shp.parquet
 ```
 
+导入示例中的输出路径应为新路径。使用已有数据进行复测时，可以直接打开已生成的 GeoParquet。
+
+扩展准备完成后，按需要验证 GeoParquet 或包含本地矢量能力的组合：
+
 ```sh
+cargo test --locked --features geoparquet --lib
+cargo clippy --locked --all-targets --features geoparquet -- -D warnings
 cargo test --locked --features local-vector --lib
 cargo clippy --locked --all-targets --features local-vector -- -D warnings
 ```
 
-`geoparquet` CI 检查名保持不变，启用 `local-vector` 并覆盖原有 GeoParquet 与新增格式测试。本地用 Spatial 生成合成 FGB / Shapefile，不依赖系统 GDAL、外部服务或真实业务数据。
+[几何查询测试](../src/sources/geoparquet_geometry.rs)和[本地矢量测试](../src/sources/local_vector.rs)使用合成文件覆盖投影、属性与 ID、跨边界几何、covering、查询预算、HTTP Range、源管理、导入和关闭流程。[`geoparquet` CI 作业](../.github/workflows/ci.yml)启用 `local-vector` 运行这组能力，FGB 与 Shapefile 测试数据由 Spatial 生成。部署验收可再结合实际对象存储端点、应用数据源创建流程、目标平台和业务负载执行集成验证。
+
+查看重复请求的本地微基准可运行：
+
+```sh
+cargo test --locked --features geoparquet --lib repeated_tile_probe -- --ignored --nocapture
+```
+
+该命令用于观察合成数据下的重复查询开销；容量规划应采用实际数据和并发负载的测量结果。

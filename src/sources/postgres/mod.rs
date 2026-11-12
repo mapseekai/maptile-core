@@ -1,12 +1,16 @@
-//! PostgreSQL/PostGIS tile sources.
+//! PostgreSQL/PostGIS sources for dynamic vector and raster tiles.
 //!
-//! Phase 2b-1 ships:
-//! - [`PostgresPool`] — a `deadpool-postgres` wrapper with PostGIS version probing
-//!   and optional rustls TLS.
-//! - [`PostgresFunctionSource`] — a [`crate::sources::TileSource`] that calls a
-//!   user-defined SQL function returning MVT bytea.
+//! - [`PostgresPool`] manages database connections, version probing, and rustls TLS.
+//! - [`PostgresTableSource`] generates MVT from a spatial table and supports
+//!   CQL2 attribute filters and geographic bounding boxes.
+//! - [`PostgresFunctionSource`] calls a user-defined SQL function returning MVT
+//!   `bytea`, with optional JSON or JSONB request parameters.
+//! - With the `raster` feature, `PostgresOutDbRasterSource` reads out-db raster
+//!   references and generates image tiles through GDAL.
 //!
-//! Table-driven sources land in 2b-2; out-db raster in 2b-3.
+//! Configure connections with [`PoolSettings`] and share the pool across sources.
+//! Each source implements [`crate::sources::TileSource`] for registration with
+//! [`crate::sources::manager::SourceManager`].
 
 mod function;
 mod pool;

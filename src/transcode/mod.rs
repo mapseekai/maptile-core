@@ -1,12 +1,12 @@
-//! On-the-fly tile-format transcoding.
+//! Tile-format conversion and encoded-payload entry points.
 //!
-//! Currently supports the MVT ↔ MLT pair (feature flag `mlt`). The pipeline
-//! is shaped so that adding new pairs (e.g. MLT → MVT2 once it exists) only
-//! requires a new internal module + a `match` arm in [`transcode`].
+//! With the `mlt` feature, [`transcode`] converts MVT to MLT and MLT to MVT.
+//! Same-format requests return the supplied tile content. This entry point
+//! accepts uncompressed bytes.
 //!
-//! Source-level wire encoding (gzip / zstd / ...) is **not** handled here:
-//! callers must pass uncompressed bytes. Use [`crate::transport::decode`]
-//! beforehand if needed.
+//! [`transcode_with_gzip`] recognizes gzip, zstd, and zlib payloads and decodes
+//! them before conversion. When the transport encoding is known, use
+//! [`crate::transport::decode`] with that encoding, then call [`transcode`].
 //!
 //! Most of the heavy lifting in `mvt_mlt` (with the `mlt` feature enabled) is adapted from
 //! `tileserver-rs/crates/tileserver-rs/src/transcode.rs` under the MIT license;
@@ -40,13 +40,13 @@ pub fn transcode(data: &[u8], from: TileFormat, to: TileFormat) -> MaptileResult
     }
 }
 
-/// Like [`transcode`], but transparently decodes gzipped / brotli / zstd /
-/// zlib input bytes via [`crate::transport::decode`] before transcoding.
+/// Detect gzip, zstd, or zlib input and decode it before calling [`transcode`].
+/// Uncompressed input passes directly to the format converter. For Brotli,
+/// decode explicitly with [`crate::transport::decode`] and
+/// [`crate::sources::TileEncoding::Brotli`] before calling [`transcode`].
 ///
-/// Convenience wrapper for callers (admin endpoints, ingestion tools) that
-/// haven't already separated wire encoding from tile content. Same error
-/// shape as [`transcode`]; transport decode failures are surfaced as
-/// `MaptileError::Transcode`.
+/// Transport decoding and format conversion failures use
+/// [`MaptileError::Transcode`].
 pub fn transcode_with_gzip(data: &[u8], from: TileFormat, to: TileFormat) -> MaptileResult<Bytes> {
     let encoding = crate::transport::sniff_encoding(data)
         .unwrap_or(crate::sources::TileEncoding::Uncompressed);

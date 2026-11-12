@@ -1,10 +1,14 @@
-//! PostgreSQL table tile source — emits MVT bytes by running an inline
-//! `SELECT ST_AsMVT(...)` per tile, with optional CQL2 filter dispatch.
+//! PostgreSQL table source for dynamic MVT generation.
 //!
-//! On open: discovers the table's geometry column, SRID, properties, and
-//! bounds, builds the cached SQL templates (full inline + base + bbox-search
-//! fragments), and pre-prepares the unfiltered query on every pooled
-//! connection. No DDL is issued on the renderer database.
+//! [`PostgresTableSource::open`] discovers geometry, SRID, properties, and bounds,
+//! then builds SQL templates for individual tiles and batches. Tile requests
+//! prepare the fixed SQL on the borrowed connection with `prepare_typed_cached`,
+//! allowing subsequent requests on that connection to reuse the statement.
+//!
+//! CQL2 attribute filters use a caller-supplied column allowlist, and geographic
+//! bounding boxes add request-specific predicates. Filtered queries prepare their
+//! SQL for that request. Optional tile caching coalesces concurrent reads for
+//! the same source content and tile coordinate.
 
 use std::sync::Arc;
 
@@ -77,21 +81,20 @@ pub struct PostgresTableSource {
     info: TableInfo,
     pool: Arc<PostgresPool>,
     tj: TileJSON,
-    /// Inline `SELECT ST_AsMVT(...)` SQL used for the fast path: no filter,
-    /// no url_query. Mirrors martin / tileserver-rs's table source — avoids
-    /// the plpgsql wrapper for the common case so PG can reuse the prepared
-    /// statement plan without extra function-invocation overhead.
+    /// Inline `SELECT ST_AsMVT(...)` SQL for ordinary tile requests.
+    /// The query structure follows Martin and tileserver-rs table sources;
+    /// each pooled connection prepares and reuses the statement on demand.
     inline_query: String,
     batch_query: String,
     batch_base_select_no_where: String,
     batch_bbox_search_expr: String,
-    /// Inner SELECT (no WHERE). Re-used by the filter path in T8 to splice
-    /// CQL2 + bbox conditions before closing the subquery.
+    /// Inner SELECT to which the filter path adds CQL2 and bounding-box
+    /// conditions before closing the subquery.
     base_select_no_where: String,
     /// SRID-aware bbox-search fragment, computed once at open time.
     bbox_search_expr: String,
-    /// Columns the CQL2 filter is allowed to reference. Empty by default
-    /// — `SourceFactory` injects this from `attributes_schema.keys()`.
+    /// Columns that CQL2 filters may reference. Callers populate this set
+    /// through [`Self::with_allowed_columns`] before sharing the source.
     allowed_columns: Arc<std::collections::HashSet<String>>,
     info_meta: TileInfo,
     cache: Option<Arc<TileCache>>,
@@ -178,15 +181,13 @@ impl PostgresTableSource {
         })
     }
 
-    /// Inline filter dispatch (spec D5/D6). Validates the CQL2 expression
-    /// against `self.allowed_columns`, renders to a PG WHERE fragment via
-    /// cql2-rs, splices it (and the optional `?bbox=` envelope) into the
-    /// per-request SQL, then uses non-cached prepare so changing values do not grow the
-    /// connection statement cache. Fixed tile SQL still uses cached prepare.
+    /// Validate CQL2 against the configured columns and combine the predicate
+    /// with the optional geographic bounding box. Each request prepares its
+    /// generated SQL separately, keeping variable predicates out of the
+    /// connection's fixed-statement cache.
     ///
-    /// No source-level cache lookup here: the cache key is keyed on
-    /// `(source_id, z, x, y)` only, so filtered responses would alias
-    /// each other.
+    /// Filtered queries execute directly because their predicates are specific
+    /// to the request. Ordinary tile requests use the configured tile cache.
     async fn run_filtered(
         &self,
         xyz: TileCoord,
@@ -230,9 +231,8 @@ impl PostgresTableSource {
             Some(expr) => {
                 let allowed: std::collections::HashSet<&str> =
                     self.allowed_columns.iter().map(String::as_str).collect();
-                // FilterError flows through MaptileError::Filter (via #[from])
-                // so the boundary mapping in interfaces/rpc/error.rs surfaces
-                // it as 4xx, not 500.
+                // Preserve the structured FilterError so the calling
+                // application can classify the request failure.
                 crate::filter::validate(expr, &allowed)?;
                 crate::filter::to_sql_where(expr)?
             }
@@ -241,13 +241,9 @@ impl PostgresTableSource {
         Ok(sql)
     }
 
-    /// Run the unfiltered inline query and gzip the result. Compress
-    /// before caching: nearly every HTTP client sends
-    /// `Accept-Encoding: gzip`, so caching the gzipped bytes lets
-    /// tile_service pass them through unchanged on every cache hit
-    /// instead of re-compressing the same MVT for the lifetime of the
-    /// entry. Empty results stay empty (avoid emitting a 20-byte gzip
-    /// stream for nothing).
+    /// Run the fixed tile query and gzip a nonempty result before caching.
+    /// The response records its encoding so the application can reuse the
+    /// encoded payload. Empty query results retain an empty byte buffer.
     async fn fetch_and_encode(&self, xyz: TileCoord) -> MaptileResult<TileResponse> {
         let conn = self.pool.get().await?;
         let stmt = conn
@@ -286,10 +282,9 @@ impl PostgresTableSource {
         })
     }
 
-    /// Inject the column whitelist used by the CQL2 filter validator.
-    /// `SourceFactory` calls this with `attributes_schema.keys()` from
-    /// the source config (D4); callers that don't set a whitelist will
-    /// have every filter rejected with `unknown column` errors.
+    /// Set the columns that CQL2 attribute filters may reference.
+    /// Populate the allowlist with the database columns the application exposes
+    /// for filtering. Each property in a filter must occur in this set.
     #[must_use]
     pub fn with_allowed_columns(mut self, allowed: Arc<std::collections::HashSet<String>>) -> Self {
         self.allowed_columns = allowed;
@@ -387,12 +382,9 @@ impl TileSource for PostgresTableSource {
         xyz: TileCoord,
         query: Option<&TileQuery<'_>>,
     ) -> MaptileResult<TileResponse> {
-        // Dispatch (spec D5/D6):
-        //   - filter or bbox set    → inline filter SQL via cql2-rs
-        //   - otherwise (incl. plain url_query) → cached prepared
-        //     unfiltered inline_query
-        // url_query is no longer routed to the plpgsql function path —
-        // it stays in tile_service for normalization into a CQL2 filter.
+        // Filter or bbox requests use request-specific SQL. Other requests
+        // use the fixed tile query. Applications translate table-source URL
+        // parameters into TileQuery.filter or TileQuery.bbox before this call.
         let filter_present = query.and_then(|q| q.filter).is_some();
         let bbox_present = query.and_then(|q| q.bbox).is_some();
         if filter_present || bbox_present {
@@ -743,21 +735,16 @@ fn build_tilejson_with_vector_layers(
     if let Some(b) = bounds {
         tj.bounds = Some(tilejson::Bounds::new(b[0], b[1], b[2], b[3]));
     }
-    // The RPC TileInfo contract requires an explicit zoom range. Keep the
-    // bounds-derived minimum when available, and publish the serving defaults
-    // otherwise so a valid source is not rejected during conversion.
+    // Publish an explicit zoom range for catalog consumers, using the
+    // bounds-derived minimum when available.
     tj.minzoom = Some(min_zoom.unwrap_or(0));
     tj.maxzoom = Some(22);
     let fields: std::collections::BTreeMap<String, String> = columns
         .iter()
         .map(|(name, ty)| (name.clone(), pg_type_to_tilejson_field(ty).to_string()))
         .collect();
-    // Layer id MUST match what the CQL2 SQL function emits as the MVT
-    // layer name — `generate_cql2_tile_function_with_columns` uses
-    // `ST_AsMVT(tile, '<table_name>', ...)`. If we used `cfg.id` here
-    // (e.g. "vector.<table>"), the MVT bytes would be tagged "<table>"
-    // and a MapLibre client matching by tilejson layer id would render
-    // an empty map.
+    // Match the layer name passed to ST_AsMVT by both query builders.
+    // Clients use this TileJSON layer ID to select the encoded MVT layer.
     let mut layer = tilejson::VectorLayer::new(cfg.table.clone(), fields);
     layer.description = cfg.description.clone();
     layer.minzoom = tj.minzoom;

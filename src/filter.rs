@@ -1,11 +1,14 @@
-//! CQL2 filter pipeline backed by the `cql2` crate (OGC reference).
+//! CQL2 parsing, column validation, and PostgreSQL predicate generation.
 //!
-//! Public surface — see
-//! `docs/architecture/data-serving.md`
-//! for the locked decisions (D1–D6).
+//! Parse text or JSON with [`parse_cql2`], validate the expression against the
+//! caller's column allowlist with [`validate`], then generate a SQL predicate
+//! with [`to_sql_where`]. Parsing, validation, and SQL generation are separate
+//! operations.
 //!
-//! Built as `pub(crate)` while migration is in progress; T12 deletes
-//! the old `filter` directory and promotes this file to `pub mod filter`.
+//! Validation accepts scalar comparisons, Boolean composition, `IN`, `LIKE`,
+//! and null checks. [`MAX_DEPTH`], [`MAX_IN_VALUES`], and [`MAX_LITERAL_BYTES`]
+//! bound the accepted expressions. PostgreSQL table sources apply geographic
+//! bounding boxes separately through [`crate::sources::TileQuery::bbox`].
 #![allow(dead_code, unused_imports)]
 
 use std::collections::HashSet;
@@ -23,8 +26,7 @@ pub enum FilterError {
     Sql(String),
 }
 
-/// Caps from spec D2. Tight to keep the request-path SQL small and
-/// the parser stack bounded.
+/// Maximum AST depth accepted during validation.
 pub const MAX_DEPTH: usize = 16;
 pub const MAX_IN_VALUES: usize = 256;
 pub const MAX_LITERAL_BYTES: usize = 1024;
@@ -35,32 +37,31 @@ pub type UrlQuery = std::collections::BTreeMap<String, String>;
 /// Parse CQL2 text or JSON. `cql2::Expr` implements `FromStr`, dispatching
 /// to `parse_json` / `parse_text` based on the leading character.
 ///
-/// **Note**: cql2-rs 0.5.x's text parser splits `'O''Reilly'` at the
-/// doubled quote (treats `''` as literal-end, not an escape). Callers
-/// constructing filters from user input that may contain single
-/// quotes MUST use the JSON form — `tile_service` does this.
+/// Use the JSON form for application-generated filters containing user-provided
+/// strings, including values with single quotes. Call [`validate`] before
+/// converting the parsed expression to SQL.
 pub fn parse_cql2(text: &str) -> Result<Cql2Expr, FilterError> {
     text.parse::<Cql2Expr>()
         .map_err(|e| FilterError::Parse(e.to_string()))
 }
 
-/// Render a validated `Cql2Expr` to a Postgres WHERE fragment (no
-/// leading `WHERE`, no trailing semicolon). Literals are escaped via
-/// `pg_escape` (cql2-rs internal). Identifiers are double-quoted.
+/// Render a validated [`Cql2Expr`] as the predicate inside a PostgreSQL `WHERE`
+/// clause. The returned fragment contains the expression itself. The CQL2 SQL
+/// renderer escapes literals and quotes identifiers; callers first apply
+/// [`validate`] with their column allowlist.
 pub fn to_sql_where(expr: &Cql2Expr) -> Result<String, FilterError> {
     use cql2::ToSqlAst;
     expr.to_sql().map_err(|e| FilterError::Sql(e.to_string()))
 }
 
-/// Walk the cql2 AST and reject anything outside the D2 op-set, refer
-/// to a column not in `allowed_columns`, or exceed the size caps.
+/// Validate operators, column references, nesting depth, and literal sizes.
+/// Every property reference must be present in `allowed_columns`.
 pub fn validate(expr: &Cql2Expr, allowed_columns: &HashSet<&str>) -> Result<(), FilterError> {
     walk(expr, allowed_columns, 0)
 }
 
-/// D2 op allow-list. cql2-rs canonicalises ops to lowercase and to the
-/// punctuation form (e.g. `eq` → `=`); we accept both spellings the
-/// parser actually emits.
+/// Scalar comparison and Boolean operators accepted by [`validate`].
+/// Both named and punctuation forms emitted by the parser are accepted.
 const ALLOWED_OPS: &[&str] = &[
     "=", "eq", "<>", "!=", "ne", "<", "lt", "<=", "le", "lte", ">", "gt", ">=", "ge", "gte", "and",
     "or", "not", "in", "like", "isnull",
@@ -196,10 +197,8 @@ mod tests {
 
     #[test]
     fn escapes_quote_in_literal() {
-        // Test via JSON form, where the parser is unambiguous about
-        // string contents — cql2-rs's *text* parser handles `''` as a
-        // CQL2 literal terminator (not as an escape), so we route
-        // strings-with-quotes through JSON in production.
+        // JSON preserves the literal single quote in the supplied value;
+        // SQL generation must then escape that value as a string literal.
         let json = r#"{"op":"=","args":[{"property":"name"},"O'Reilly"]}"#;
         let e = parse_cql2(json).unwrap();
         let sql = to_sql_where(&e).unwrap();

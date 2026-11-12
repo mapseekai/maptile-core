@@ -28,10 +28,9 @@ pub mod mosaic_source;
 #[cfg(all(feature = "agtiff", feature = "raster"))]
 pub use mosaic_source::{MosaicMember, MosaicSource, MosaicSourceConfig, pixel_selection_from_str};
 
-/// The process-shared decoded-block cache type. Re-exported so the server
-/// can build one at startup and inject it into both `AsyncCogSourceConfig`
-/// and `MosaicSourceConfig`, bounding every COG reader (standalone or inside
-/// a mosaic) to one decode-memory budget (async-geotiff-rs-note §11/§14).
+/// Decoded-block cache shared by COG readers.
+/// Applications can inject one cache into COG and mosaic configurations to
+/// allocate a common decoded-block memory budget.
 #[cfg(feature = "agtiff")]
 pub use async_geotiff::io::BlockCache;
 
@@ -126,16 +125,12 @@ pub trait TileSource: Send + Sync + 'static {
         SourceKind::Other
     }
 
-    /// Stable fingerprint of this source's underlying content.
+    /// Fingerprint used to partition cached tiles by source content.
     ///
-    /// Cold-cache keys embed this as `cv={hex}` so that replacing a
-    /// source's content (e.g. swapping a COG file) renders all prior
-    /// cached tiles unreachable.
-    ///
-    /// The default hashes only `self.id()`, which is **safe but useless**
-    /// for invalidation. Source implementations whose content can change
-    /// without the id changing MUST override this with a digest of the
-    /// content identity (ETag, file mtime+size, table OID + migration id).
+    /// Cache keys include this version so a new content identity selects a new
+    /// set of entries. The default derives the fingerprint from [`Self::id`].
+    /// Sources that reuse an ID across content changes must override this method
+    /// with a content fingerprint, file generation, or durable edit revision.
     fn content_version(&self) -> crate::cache::ContentVersion {
         crate::cache::ContentVersion::from_input(self.id().as_bytes())
     }
@@ -207,9 +202,10 @@ pub trait TileSource: Send + Sync + 'static {
         compute_default_etag(&response.data)
     }
 
-    /// Default implementation: call `get_tile` then compute SHA-1 of the bytes
-    /// as the ETag. Source implementations that have a cheaper authoritative
-    /// ETag source (postgres LSN, pmtiles blob hash, ...) should override.
+    /// Fetch a tile and compare its [`Self::tile_etag`] with `if_none_match`.
+    /// A match returns [`TileEtagResponse::NotModified`]; otherwise the response
+    /// includes the tile and its ETag. The default validator derives from the
+    /// payload, and a source can override it with an authoritative content ID.
     async fn get_tile_with_etag(
         &self,
         xyz: TileCoord,
