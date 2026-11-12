@@ -1,12 +1,14 @@
 //! On-demand, bounded GeoParquet queries over local files or source-scoped
 //! range readers. DuckDB sees no remote credentials or user URL query strings.
 
+use super::duckdb_query::{FinishQuery, QueryControl};
+use super::file_stamp::FileStamp;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
-use duckdb::{Connection, InterruptHandle, named_params};
+use duckdb::{Connection, named_params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
@@ -342,7 +344,6 @@ impl GeometrySource {
             .await
             .map_err(|_| timeout())?
             .map_err(|_| config("GeoParquet query pool closed"))?;
-        let notify = Arc::new(Notify::new());
         let (lease, running) = {
             let mut state = self
                 .pool
@@ -356,12 +357,7 @@ impl GeometrySource {
                 .connections
                 .pop()
                 .ok_or_else(|| config("GeoParquet query pool invariant"))?;
-            let running = Arc::new(Mutex::new(QueryState {
-                interrupt: conn.interrupt_handle(),
-                cancelled: false,
-                done: false,
-                wake: notify.clone(),
-            }));
+            let running = QueryControl::new(&conn);
             state.running.retain(|s| s.strong_count() > 0);
             state.running.push(Arc::downgrade(&running));
             state.active += 1;
@@ -374,30 +370,7 @@ impl GeometrySource {
                 running,
             )
         };
-        let cancellation = CancelQuery {
-            state: running.clone(),
-            notify: notify.clone(),
-        };
-        let watchdog_state = running.clone();
-        tokio::spawn(async move {
-            tokio::select! { () = tokio::time::sleep_until(deadline) => {}, () = notify.notified() => {} }
-            loop {
-                {
-                    let mut state = watchdog_state
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if state.done {
-                        return;
-                    }
-                    state.cancelled = true;
-                    state.interrupt.interrupt();
-                }
-                // Repeated interruption also covers cancellation before the
-                // blocking task starts executing SQL. The permit stays leased
-                // until the interrupted operation actually exits.
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        });
+        let cancellation = running.watch(deadline);
         let sql = self.sql.clone();
         let local = self.local.clone();
         let options = self.options.clone();
@@ -406,11 +379,7 @@ impl GeometrySource {
             let _completion = FinishQuery(running.clone());
             // Drop order matters: finish/disarm before the connection is reused.
             let result = (|| {
-                if running
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .cancelled
-                {
+                if running.cancelled() {
                     return Err(timeout());
                 }
                 check_stamp(&local)?;
@@ -474,7 +443,7 @@ impl GeometrySource {
 }
 struct PoolState {
     connections: Vec<Connection>,
-    running: Vec<Weak<Mutex<QueryState>>>,
+    running: Vec<Weak<QueryControl>>,
     active: usize,
     closed: bool,
 }
@@ -493,14 +462,7 @@ impl QueryPool {
         state.closed = true;
         self.slots.close();
         for running in state.running.iter().filter_map(Weak::upgrade) {
-            let mut running = running
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if !running.done {
-                running.cancelled = true;
-                running.interrupt.interrupt();
-                running.wake.notify_one();
-            }
+            running.cancel();
         }
         state.connections.clear();
         if let Some(remote) = &self.remote {
@@ -532,39 +494,6 @@ impl Drop for ConnectionLease {
     }
 }
 
-struct QueryState {
-    interrupt: Arc<InterruptHandle>,
-    cancelled: bool,
-    done: bool,
-    wake: Arc<Notify>,
-}
-struct FinishQuery(Arc<Mutex<QueryState>>);
-impl Drop for FinishQuery {
-    fn drop(&mut self) {
-        self.0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .done = true;
-    }
-}
-struct CancelQuery {
-    state: Arc<Mutex<QueryState>>,
-    notify: Arc<Notify>,
-}
-impl Drop for CancelQuery {
-    fn drop(&mut self) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !state.done {
-            state.cancelled = true;
-            state.interrupt.interrupt();
-        }
-        self.notify.notify_one();
-    }
-}
-
 pub(super) fn spatial_connection(options: &GeoParquetQueryOptions) -> MaptileResult<Connection> {
     options.validate()?;
     let db_config = duckdb::Config::default()
@@ -579,21 +508,6 @@ pub(super) fn spatial_connection(options: &GeoParquetQueryOptions) -> MaptileRes
         "cannot load DuckDB spatial extension; preinstall the signed extension matching the embedded DuckDB version: {e}"
     )))?;
     Ok(conn)
-}
-
-#[derive(Clone, PartialEq)]
-pub(super) struct FileStamp {
-    len: u64,
-    modified: SystemTime,
-}
-impl FileStamp {
-    pub(super) fn read(path: &Path) -> MaptileResult<Self> {
-        let meta = std::fs::metadata(path).map_err(MaptileError::backend)?;
-        Ok(Self {
-            len: meta.len(),
-            modified: meta.modified().map_err(MaptileError::backend)?,
-        })
-    }
 }
 
 fn check_stamp(local: &Option<(PathBuf, FileStamp)>) -> MaptileResult<()> {

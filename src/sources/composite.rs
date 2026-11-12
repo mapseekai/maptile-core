@@ -15,16 +15,21 @@
 //!   ignore it. ETags are derived from the children, so query-bearing requests
 //!   bypass the standard cache via [`crate::sources::manager::SourceManager`].
 
+use crate::cache::CacheZoomRange;
 use crate::error::{MaptileError, MaptileResult};
 use crate::sources::{
     TileCoord, TileEncoding, TileFormat, TileInfo, TileQuery, TileResponse, TileSource, mvt,
     read_tile_batch_with,
 };
 use crate::transport;
-use bytes::Bytes;
+use futures_util::{StreamExt, stream};
+use geozero::mvt::Message;
 use std::sync::Arc;
 use std::time::SystemTime;
 use tilejson::{TileJSON, VectorLayer};
+
+const MAX_CHILD_READS: usize = 8;
+const MAX_COMPOSITE_BYTES: usize = transport::MAX_DECODED_TILE_BYTES;
 
 /// One child of a [`CompositeSource`].
 #[derive(Clone)]
@@ -115,6 +120,14 @@ impl TileSource for CompositeSource {
         &self.tilejson
     }
 
+    fn cache_zoom(&self) -> CacheZoomRange {
+        self.children
+            .iter()
+            .fold(CacheZoomRange::default(), |range, child| {
+                range.intersection(child.source.cache_zoom())
+            })
+    }
+
     fn tile_info(&self) -> TileInfo {
         TileInfo {
             format: TileFormat::Mvt,
@@ -135,21 +148,23 @@ impl TileSource for CompositeSource {
         xyz: TileCoord,
         query: Option<&TileQuery<'_>>,
     ) -> MaptileResult<TileResponse> {
-        // Fetch all children concurrently — composite latency is the slowest
-        // child, not the sum.
-        let mut futs = Vec::with_capacity(self.children.len());
-        for child in &self.children {
-            let q = if child.source.supports_url_query() || child.source.supports_filter() {
-                query
-            } else {
-                None
-            };
-            futs.push(child.source.get_tile(xyz, q));
+        let mut reads = stream::iter(0..self.children.len())
+            .map(|index| async move {
+                let child = &self.children[index];
+                let q = if child.source.supports_url_query() || child.source.supports_filter() {
+                    query
+                } else {
+                    None
+                };
+                (child, child.source.get_tile(xyz, q).await)
+            })
+            .buffered(MAX_CHILD_READS);
+        let mut results = Vec::new();
+        let mut remaining = MAX_COMPOSITE_BYTES;
+        while let Some((child, result)) = reads.next().await {
+            retain_tile(child, result, &mut results, &mut remaining)?;
         }
-
-        let results = futures_util::future::join_all(futs).await;
-
-        self.merge_tiles(xyz, results)
+        self.merge_tiles(xyz, results).await
     }
 
     async fn read_tile_batch(
@@ -158,7 +173,8 @@ impl TileSource for CompositeSource {
         query: Option<&TileQuery<'_>>,
     ) -> MaptileResult<Vec<TileResponse>> {
         read_tile_batch_with(coords, self.tile_info(), |coord| async move {
-            let mut results = Vec::with_capacity(self.children.len());
+            let mut results = Vec::new();
+            let mut remaining = MAX_COMPOSITE_BYTES;
             for child in &self.children {
                 let q = if child.source.supports_url_query() || child.source.supports_filter() {
                     query
@@ -172,9 +188,9 @@ impl TileSource for CompositeSource {
                     )),
                     Err(error) => Err(error),
                 };
-                results.push(result);
+                retain_tile(child, result, &mut results, &mut remaining)?;
             }
-            self.merge_tiles(coord, results)
+            self.merge_tiles(coord, results).await
         })
         .await
     }
@@ -193,44 +209,64 @@ impl TileSource for CompositeSource {
 }
 
 impl CompositeSource {
-    fn merge_tiles(
+    async fn merge_tiles(
         &self,
         xyz: TileCoord,
-        results: Vec<MaptileResult<TileResponse>>,
+        results: Vec<(String, TileResponse)>,
     ) -> MaptileResult<TileResponse> {
-        let mut tiles: Vec<mvt::proto::Tile> = Vec::with_capacity(self.children.len());
-        let mut prefixes: Vec<&str> = Vec::with_capacity(self.children.len());
-        let mut last_modified: Option<SystemTime> = None;
-
-        for (child, res) in self.children.iter().zip(results) {
-            match res {
-                Ok(resp) => {
-                    last_modified = max_opt(last_modified, resp.last_modified);
-                    let raw = transport::decode(&resp.data, resp.info.encoding)?;
-                    if raw.is_empty() {
-                        continue;
-                    }
-                    let tile = mvt::decode(&raw)?;
-                    tiles.push(tile);
-                    prefixes.push(child.layer_prefix.as_str());
+        let info = self.tile_info();
+        transport::run_blocking(move || {
+            let mut tiles = Vec::with_capacity(results.len());
+            let mut prefixes = Vec::with_capacity(results.len());
+            let mut last_modified = None;
+            let mut remaining = MAX_COMPOSITE_BYTES;
+            for (prefix, resp) in &results {
+                last_modified = max_opt(last_modified, resp.last_modified);
+                let raw = transport::decode_with_limit(&resp.data, resp.info.encoding, remaining)?;
+                remaining -= raw.len();
+                if !raw.is_empty() {
+                    tiles.push(mvt::decode(&raw)?);
+                    prefixes.push(prefix.as_str());
                 }
-                Err(MaptileError::TileNotFound(..)) => continue,
-                Err(e) => return Err(e),
             }
-        }
-
-        if tiles.is_empty() {
-            return Err(MaptileError::TileNotFound(xyz.z, xyz.x, xyz.y));
-        }
-
-        let merged = mvt::merge(tiles, &prefixes);
-        let bytes: Bytes = mvt::encode(&merged);
-
-        Ok(TileResponse {
-            data: bytes,
-            info: self.tile_info(),
-            last_modified,
+            if tiles.is_empty() {
+                return Err(MaptileError::TileNotFound(xyz.z, xyz.x, xyz.y));
+            }
+            let merged = mvt::merge(tiles, &prefixes);
+            if merged.encoded_len() > MAX_COMPOSITE_BYTES {
+                return Err(MaptileError::PayloadTooLarge {
+                    limit: MAX_COMPOSITE_BYTES,
+                });
+            }
+            Ok(TileResponse {
+                data: mvt::encode(&merged),
+                info,
+                last_modified,
+            })
         })
+        .await
+    }
+}
+
+fn retain_tile(
+    child: &CompositeChild,
+    result: MaptileResult<TileResponse>,
+    results: &mut Vec<(String, TileResponse)>,
+    remaining: &mut usize,
+) -> MaptileResult<()> {
+    match result {
+        Ok(tile) => {
+            *remaining =
+                remaining
+                    .checked_sub(tile.data.len())
+                    .ok_or(MaptileError::PayloadTooLarge {
+                        limit: MAX_COMPOSITE_BYTES,
+                    })?;
+            results.push((child.layer_prefix.clone(), tile));
+            Ok(())
+        }
+        Err(MaptileError::TileNotFound(..)) => Ok(()),
+        Err(error) => Err(error),
     }
 }
 
@@ -266,24 +302,16 @@ fn composite_etag(children: &[CompositeChild], resp: &TileResponse) -> String {
 }
 
 /// Build the merged TileJSON: union of vector_layers (with prefixes applied),
-/// `minzoom = max(children)`, `maxzoom = min(children)`, bounds union.
+/// plus the union of child zoom ranges and bounds.
 fn build_tilejson(id: &str, children: &[CompositeChild]) -> TileJSON {
     let mut tj = tilejson::tilejson! { tiles: vec![] };
     tj.name = Some(format!("composite:{id}"));
 
-    let mut min_z: Option<u8> = None;
-    let mut max_z: Option<u8> = None;
     let mut bounds: Option<tilejson::Bounds> = None;
     let mut all_layers: Vec<VectorLayer> = Vec::new();
 
     for child in children {
         let child_tj = child.source.tilejson();
-        if let Some(z) = child_tj.minzoom {
-            min_z = Some(min_z.map_or(z, |cur| cur.max(z)));
-        }
-        if let Some(z) = child_tj.maxzoom {
-            max_z = Some(max_z.map_or(z, |cur| cur.min(z)));
-        }
         if let Some(b) = child_tj.bounds {
             bounds = Some(bounds.map_or(b, |cur| union_bounds(cur, b)));
         }
@@ -299,8 +327,12 @@ fn build_tilejson(id: &str, children: &[CompositeChild]) -> TileJSON {
         }
     }
 
-    tj.minzoom = min_z;
-    tj.maxzoom = max_z;
+    tj.minzoom = children.iter().try_fold(u8::MAX, |acc, child| {
+        Some(acc.min(child.source.tilejson().minzoom?))
+    });
+    tj.maxzoom = children.iter().try_fold(0, |acc, child| {
+        Some(acc.max(child.source.tilejson().maxzoom?))
+    });
     tj.bounds = bounds;
     if !all_layers.is_empty() {
         tj.vector_layers = Some(all_layers);
@@ -323,6 +355,7 @@ mod tests {
     use crate::sources::TileEtagResponse;
     use crate::sources::mvt::proto;
     use async_trait::async_trait;
+    use bytes::Bytes;
     use tilejson::tilejson;
 
     struct MvtFake {
@@ -330,6 +363,7 @@ mod tests {
         tj: TileJSON,
         bytes: Bytes,
         encoding: TileEncoding,
+        cache_zoom: CacheZoomRange,
     }
 
     impl MvtFake {
@@ -360,6 +394,7 @@ mod tests {
                 tj,
                 bytes,
                 encoding: TileEncoding::Uncompressed,
+                cache_zoom: CacheZoomRange::default(),
             })
         }
     }
@@ -378,12 +413,16 @@ mod tests {
                 encoding: self.encoding,
             }
         }
+        fn cache_zoom(&self) -> CacheZoomRange {
+            self.cache_zoom
+        }
         fn clone_source(&self) -> Box<dyn TileSource> {
             Box::new(MvtFake {
                 id: self.id.clone(),
                 tj: self.tj.clone(),
                 bytes: self.bytes.clone(),
                 encoding: self.encoding,
+                cache_zoom: self.cache_zoom,
             })
         }
         async fn get_tile(
@@ -456,7 +495,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tilejson_min_max_zoom_intersect_and_union() {
+    async fn tilejson_covers_disjoint_children_and_respects_disabled_cache() {
         let a_src = MvtFake::new("a", &["x"]);
         // override zoom range
         let mut a_tj = a_src.tj.clone();
@@ -467,22 +506,25 @@ mod tests {
             tj: a_tj,
             bytes: a_src.bytes.clone(),
             encoding: TileEncoding::Uncompressed,
+            cache_zoom: CacheZoomRange::default(),
         });
         let b_src = MvtFake::new("b", &["y"]);
         let mut b_tj = b_src.tj.clone();
-        b_tj.minzoom = Some(5);
+        b_tj.minzoom = Some(11);
         b_tj.maxzoom = Some(14);
         let b = Arc::new(MvtFake {
             id: "b".into(),
             tj: b_tj,
             bytes: b_src.bytes.clone(),
             encoding: TileEncoding::Uncompressed,
+            cache_zoom: CacheZoomRange::disabled(),
         });
         let c = CompositeSource::new("c", vec![CompositeChild::new(a), CompositeChild::new(b)])
             .unwrap();
         let tj = c.tilejson();
-        assert_eq!(tj.minzoom, Some(5)); // max of children
-        assert_eq!(tj.maxzoom, Some(10)); // min of children
+        assert_eq!(tj.minzoom, Some(2));
+        assert_eq!(tj.maxzoom, Some(14));
+        assert!(c.cache_zoom().is_disabled());
         assert_eq!(
             tj.vector_layers.as_ref().unwrap().len(),
             2 // x + y
@@ -545,6 +587,7 @@ mod tests {
             tj,
             bytes: gz,
             encoding: TileEncoding::Gzip,
+            cache_zoom: CacheZoomRange::default(),
         });
         let c = CompositeSource::new("c", vec![CompositeChild::new(gz_src)]).unwrap();
         let resp = c

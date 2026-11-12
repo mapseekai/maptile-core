@@ -7,22 +7,19 @@
 use crate::cache::ContentVersion;
 use crate::error::{MaptileError, MaptileResult};
 use crate::sources::archive_inspection::ArchiveSourceType;
+use crate::sources::file_stamp::FileStamp;
 use crate::sources::pmtiles::{
-    PmtilesConfig, archive_content_version, archive_tile_etag, directory_cache,
-    pmt_compression_to_encoding, pmt_tile_type_to_format,
+    PmtilesConfig, archive_content_version, archive_tile_etag, pmt_compression_to_encoding,
+    pmt_tile_type_to_format, reader::Reader,
 };
-use crate::sources::{
-    SourceKind, TileCoord, TileEncoding, TileFormat, TileInfo, TileQuery, TileResponse, TileSource,
-};
+use crate::sources::{SourceKind, TileCoord, TileInfo, TileQuery, TileResponse, TileSource};
 use async_trait::async_trait;
 use std::io::SeekFrom;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 use tilejson::TileJSON;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::Mutex;
-
-type LocalReader = pmtiles::AsyncPmTilesReader<FileBackend, pmtiles::MokaCache>;
 
 struct FileBackend {
     file: Mutex<tokio::fs::File>,
@@ -54,26 +51,15 @@ impl pmtiles::AsyncBackend for FileBackend {
             .read_to_end(&mut data)
             .await
             .map_err(pmtiles::PmtError::Reading)?;
-        if data.len() != length {
-            return Err(pmtiles::PmtError::Reading(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "PMTiles read ended before the requested range",
-            )));
-        }
         Ok(pmtiles::BackendResponse::new(bytes::Bytes::from(data)))
     }
 }
 
 pub struct LocalPmtilesSource {
     cfg: PmtilesConfig,
-    // `pmtiles::AsyncPmTilesReader::get_tile` takes `&self` and the reader
-    // is opened once at construction; an `Arc` is enough and avoids
-    // serialising tile reads through a `RwLock` held across `.await`.
-    reader: Arc<LocalReader>,
+    reader: Arc<Reader<FileBackend>>,
     tj: TileJSON,
     info: TileInfo,
-    native_format: TileFormat,
-    encoding: TileEncoding,
     last_modified: Option<SystemTime>,
     content_version: ContentVersion,
 }
@@ -95,24 +81,17 @@ impl LocalPmtilesSource {
         // atomic path replacement cannot identify the wrong archive.
         let metadata = file.metadata().await.ok();
         let last_modified = metadata.as_ref().and_then(|m| m.modified().ok());
-        let validator = last_modified
-            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-            .map(|modified| format!("modified:{}", modified.as_nanos()));
-        let content_version = archive_content_version(
-            &cfg.path,
-            validator.as_deref(),
-            metadata.as_ref().map(std::fs::Metadata::len),
-        );
-        let reader: LocalReader = pmtiles::AsyncPmTilesReader::try_from_cached_source(
-            FileBackend {
-                file: Mutex::new(file),
-            },
-            directory_cache(),
-        )
-        .await
-        .map_err(MaptileError::backend)?;
+        let validator = metadata
+            .as_ref()
+            .and_then(|meta| FileStamp::from_metadata(meta).ok())
+            .map(|stamp| format!("{stamp:?}"));
+        let content_version = archive_content_version(&cfg.path, validator.as_deref());
+        let reader = Reader::open(FileBackend {
+            file: Mutex::new(file),
+        })
+        .await?;
 
-        let header = reader.get_header();
+        let header = &reader.header;
         let native_format = pmt_tile_type_to_format(header.tile_type)?;
         let encoding = pmt_compression_to_encoding(header.tile_compression)?;
 
@@ -120,9 +99,8 @@ impl LocalPmtilesSource {
             format: cfg.serve_as.unwrap_or(native_format),
             encoding,
         };
-        let reader = Arc::new(reader);
         let tj = super::read_tilejson(
-            reader.clone(),
+            &reader,
             cfg.description.as_deref(),
             TileInfo {
                 format: native_format,
@@ -133,11 +111,9 @@ impl LocalPmtilesSource {
 
         Ok(Self {
             cfg,
-            reader,
+            reader: Arc::new(reader),
             tj,
             info,
-            native_format,
-            encoding,
             last_modified,
             content_version,
         })
@@ -172,8 +148,6 @@ impl TileSource for LocalPmtilesSource {
             reader: self.reader.clone(),
             tj: self.tj.clone(),
             info: self.info,
-            native_format: self.native_format,
-            encoding: self.encoding,
             last_modified: self.last_modified,
             content_version: self.content_version,
         })
@@ -189,8 +163,7 @@ impl TileSource for LocalPmtilesSource {
         let bytes = self
             .reader
             .get_tile(coord)
-            .await
-            .map_err(MaptileError::backend)?
+            .await?
             .ok_or(MaptileError::TileNotFound(xyz.z, xyz.x, xyz.y))?;
         Ok(TileResponse {
             data: bytes,
@@ -271,9 +244,8 @@ mod tests {
             .unwrap();
         assert_eq!(response.bytes.as_ref(), b"archive payload");
         assert!(matches!(
-            backend.read(0, 15).await,
-            Err(pmtiles::PmtError::Reading(error))
-                if error.kind() == std::io::ErrorKind::UnexpectedEof
+            backend.read_exact(0, 15).await,
+            Err(pmtiles::PmtError::UnexpectedNumberOfBytesReturned(15, 0))
         ));
         assert!(
             backend

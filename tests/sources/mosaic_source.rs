@@ -196,9 +196,12 @@ async fn empty_members_returns_err() {
 
 #[tokio::test]
 async fn construction_succeeds_and_bounds_are_union() {
-    let src = MosaicSource::open(two_member_cfg(None), make_block_cache())
-        .await
-        .expect("open with two members must succeed");
+    let src = MosaicSource::open(
+        two_member_cfg_with_srid(None, Some(3857)),
+        make_block_cache(),
+    )
+    .await
+    .expect("open with two members must succeed");
 
     // Union of [-10,-10,0,0] ∪ [0,0,10,10] = [-10,-10,10,10]
     let tj = src.tilejson();
@@ -325,6 +328,40 @@ async fn request_selection_executes_all_async_geotiff_reducers() {
     }
 
     assert_eq!(actual, [10, 90, 10, 40, 20]);
+}
+
+#[tokio::test]
+async fn request_selection_overrides_style_and_partitions_the_cache() {
+    use maptile_core::cache::{StyleHash, TileCache};
+    use maptile_core::sources::manager::SourceManager;
+    let fixture = AlgorithmFixture::new().await;
+    let mut ranked = fixture.style.raster_style().as_value().clone();
+    ranked["raster:mosaic"]["pixel_selection"] = "highest".into();
+    ranked["raster:mosaic"]["rank_channel"] = 1.into();
+    let style =
+        EffectiveStyle::from_raster_style(RasterStyle::from_value(ranked).unwrap()).unwrap();
+    let manager = SourceManager::new().with_cache(Arc::new(TileCache::new(1, None, None).unwrap()));
+    let id = fixture.source.id().to_string();
+    manager.register(Arc::new(fixture.source));
+    let coord = TileCoord { z: 0, x: 0, y: 0 };
+    for (selection, value) in [
+        (None, 90),
+        (Some(MosaicPixelSelection::First), 10),
+        (None, 90),
+    ] {
+        let query = TileQuery {
+            style: Some(&style),
+            style_hash: Some(StyleHash::from_bytes([3; 32])),
+            pixel_selection: selection,
+            ..Default::default()
+        };
+        let tile = manager.get_tile(&id, coord, Some(&query)).await.unwrap();
+        let rgba = image::load_from_memory(&tile.data).unwrap().to_rgba8();
+        assert_eq!(
+            rgba.get_pixel(rgba.width() / 2, rgba.height() / 2).0[0],
+            value
+        );
+    }
 }
 
 #[tokio::test]

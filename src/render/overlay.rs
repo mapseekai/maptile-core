@@ -351,17 +351,15 @@ fn geo_to_pixel(
     height: u32,
     scale: f32,
 ) -> (f32, f32) {
-    let tile_size = 512.0 * scale as f64;
+    use super::types::{TILE_SIZE, mercator_y};
+
+    let tile_size = f64::from(TILE_SIZE) * f64::from(scale);
     let scale_factor = tile_size * 2.0_f64.powf(zoom) / 360.0;
 
     let dx = (point.lon - center_lon) * scale_factor;
 
-    let center_y = (std::f64::consts::PI / 4.0 + center_lat.to_radians() / 2.0)
-        .tan()
-        .ln();
-    let point_y = (std::f64::consts::PI / 4.0 + point.lat.to_radians() / 2.0)
-        .tan()
-        .ln();
+    let center_y = mercator_y(center_lat);
+    let point_y = mercator_y(point.lat);
     let dy = -(point_y - center_y) * scale_factor * 180.0 / std::f64::consts::PI;
 
     let px = (width as f64 / 2.0 + dx) as f32;
@@ -437,11 +435,16 @@ fn draw_path(
         .map(|p| geo_to_pixel(p, center_lon, center_lat, zoom, width, height, scale))
         .collect();
 
-    if let Some(fill) = path.fill_color {
+    if let Some(fill) = path.fill_color
+        && pixels.iter().all(|(x, y)| x.is_finite() && y.is_finite())
+    {
         fill_polygon(image, &pixels, fill);
     }
 
-    let stroke_width = path.stroke_width * scale;
+    if !path.stroke_width.is_finite() || path.stroke_width <= 0.0 {
+        return;
+    }
+    let stroke_width = path.stroke_width.min(32.0) * scale;
     for pair in pixels.windows(2) {
         draw_line(
             image,
@@ -464,6 +467,19 @@ fn draw_line(
     color: Rgba<u8>,
     thickness: f32,
 ) {
+    let half_thick = thickness / 2.0;
+    let margin = f64::from(half_thick.ceil()) + 1.0;
+    let Some([x0, y0, x1, y1]) = clip_line(
+        [x0, y0, x1, y1],
+        [
+            -margin,
+            -margin,
+            f64::from(image.width()) + margin,
+            f64::from(image.height()) + margin,
+        ],
+    ) else {
+        return;
+    };
     let dx = x1 - x0;
     let dy = y1 - y0;
     let length = (dx * dx + dy * dy).sqrt();
@@ -472,7 +488,6 @@ fn draw_line(
     }
 
     let steps = length.ceil() as i32;
-    let half_thick = thickness / 2.0;
 
     for i in 0..=steps {
         let t = i as f32 / steps as f32;
@@ -493,6 +508,38 @@ fn draw_line(
             }
         }
     }
+}
+
+fn clip_line(line: [f32; 4], bounds: [f64; 4]) -> Option<[f32; 4]> {
+    if !line.iter().all(|coordinate| coordinate.is_finite()) {
+        return None;
+    }
+    let [x0, y0, x1, y1] = line.map(f64::from);
+    let [left, top, right, bottom] = bounds;
+    let (dx, dy) = (x1 - x0, y1 - y0);
+    let (mut start, mut end) = (0.0_f64, 1.0_f64);
+    for (direction, distance) in [
+        (-dx, x0 - left),
+        (dx, right - x0),
+        (-dy, y0 - top),
+        (dy, bottom - y0),
+    ] {
+        if direction == 0.0 {
+            if distance < 0.0 {
+                return None;
+            }
+        } else if direction < 0.0 {
+            start = start.max(distance / direction);
+        } else {
+            end = end.min(distance / direction);
+        }
+    }
+    (start <= end).then_some([
+        (x0 + start * dx) as f32,
+        (y0 + start * dy) as f32,
+        (x0 + end * dx) as f32,
+        (y0 + end * dy) as f32,
+    ])
 }
 
 fn fill_polygon(image: &mut RgbaImage, pixels: &[(f32, f32)], color: Rgba<u8>) {
@@ -570,7 +617,13 @@ fn draw_marker(
         scale,
     );
 
-    let size = marker.size * scale;
+    if !px.is_finite() || !py.is_finite() || !marker.size.is_finite() || marker.size <= 0.0 {
+        return;
+    }
+    let size = marker.size.min(128.0) * scale;
+    if px < -size || px > width as f32 + size || py < -size || py > height as f32 + size {
+        return;
+    }
     let half_size = size / 2.0;
 
     let circle_radius = half_size * 0.6;
@@ -922,6 +975,14 @@ fn coords_to_geopoints(arr: &[Value]) -> Vec<GeoPoint> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clips_long_segments_to_the_viewport_before_rasterization() {
+        let bounds = [-2.0, -2.0, 514.0, 514.0];
+        let line = clip_line([-30_000_000.0, 256.0, 30_000_000.0, 256.0], bounds).unwrap();
+        assert_eq!(line, [-2.0, 256.0, 514.0, 256.0]);
+        assert!(clip_line([-30_000_000.0, -8.0, 30_000_000.0, -8.0], bounds).is_none());
+    }
 
     #[test]
     fn parse_hex_color_3_digit() {

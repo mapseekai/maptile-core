@@ -14,6 +14,7 @@ use tokio_postgres::types::Type;
 
 use super::PostgresPool;
 use super::outdb_types::PostgresOutDbRasterConfig;
+use crate::cache::ContentVersion;
 use crate::error::{MaptileError, MaptileResult};
 use crate::raster::style::EffectiveStyle;
 use crate::raster::style::pipeline;
@@ -45,6 +46,7 @@ pub struct PostgresOutDbRasterSource {
     function: String,
     sql_query: String,
     cache_zoom: crate::cache::CacheZoomRange,
+    content_version: ContentVersion,
 }
 
 impl std::fmt::Debug for PostgresOutDbRasterSource {
@@ -102,6 +104,7 @@ impl PostgresOutDbRasterSource {
             function: function_name.clone(),
             sql_query,
             cache_zoom: config.cache_zoom.unwrap_or_default(),
+            content_version: ContentVersion::new_generation(),
         })
     }
 
@@ -404,6 +407,10 @@ fn warp_to_tile_mem(
 impl TileSource for PostgresOutDbRasterSource {
     fn id(&self) -> &str {
         &self.id
+    }
+
+    fn content_version(&self) -> ContentVersion {
+        self.content_version
     }
 
     fn tilejson(&self) -> &TileJSON {

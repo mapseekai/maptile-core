@@ -3,10 +3,19 @@
 use crate::error::{MaptileError, MaptileResult};
 use crate::raster::style::EffectiveStyle;
 use crate::sources::{
-    TileCoord, TileEncoding, TileFormat, TileInfo, TileQuery, TileResponse, TileSource,
+    MosaicPixelSelection, TileCoord, TileEncoding, TileFormat, TileInfo, TileQuery, TileResponse,
+    TileSource, effective_pixel_selection,
+};
+use async_geotiff::{
+    bounds::Bbox,
+    error::{AgError, AgResult},
+    mosaic::{AssetRef, MosaicConfig, MosaicSource, MosaicTiler},
+    tms::{TileCoord as AgTileCoord, TileMatrixSet},
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+
+const MAX_SEARCH_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StacSourceConfig {
@@ -30,7 +39,7 @@ pub struct StacSourceConfig {
     pub name: Option<String>,
     pub attribution: Option<String>,
     pub description: Option<String>,
-    /// Cap on how many items the search returns per tile (defaults to 50).
+    /// Cap on how many items the search returns per tile (defaults to 50, maximum 64).
     #[serde(default = "default_limit")]
     pub limit: u32,
     /// Per-source cache zoom policy. `None` ≡ cache every zoom.
@@ -60,23 +69,26 @@ pub struct StacAsset {
     pub bbox: Option<[f64; 4]>,
 }
 
+#[derive(Clone)]
 pub struct StacSource {
-    id: String,
-    cfg: StacSourceConfig,
+    search: StacSearch,
     tj: tilejson::TileJSON,
-    /// HTTP client — held in an Arc so clone_source is cheap. We reuse
-    /// the reqwest version that `pmtiles` re-exports to avoid pulling
-    /// two incompatible reqwest versions into the build.
-    http: Arc<pmtiles::reqwest::Client>,
-    block_cache: Arc<async_geotiff::io::BlockCache>,
+    tiler: MosaicTiler<StacSearch>,
+    content_version: crate::cache::ContentVersion,
+}
+
+#[derive(Clone)]
+struct StacSearch {
+    cfg: Arc<StacSourceConfig>,
+    http: pmtiles::reqwest::Client,
+    limit: usize,
 }
 
 impl std::fmt::Debug for StacSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StacSource")
-            .field("id", &self.id)
-            .field("api_url", &self.cfg.api_url)
-            .field("collections", &self.cfg.collections)
+            .field("id", &self.search.cfg.id)
+            .field("collections", &self.search.cfg.collections)
             .finish()
     }
 }
@@ -93,8 +105,10 @@ impl StacSource {
                 "stac.collections must list at least one collection".into(),
             ));
         }
+        let mosaic_config = MosaicConfig::default();
         let http = pmtiles::reqwest::Client::builder()
             .user_agent(concat!("maptile-core/", env!("CARGO_PKG_VERSION")))
+            .timeout(mosaic_config.request_timeout)
             .build()
             .map_err(MaptileError::backend)?;
 
@@ -108,58 +122,93 @@ impl StacSource {
             tj.bounds = Some(tilejson::Bounds::new(b[0], b[1], b[2], b[3]));
         }
 
+        let search = StacSearch {
+            limit: (cfg.limit as usize).min(mosaic_config.max_assets_per_tile),
+            cfg: Arc::new(cfg),
+            http,
+        };
+        let tiler = MosaicTiler::builder(search.clone())
+            .config(mosaic_config)
+            .build();
         Ok(Self {
-            id: cfg.id.clone(),
-            cfg,
+            search,
             tj,
-            http: Arc::new(http),
-            block_cache: Arc::new(async_geotiff::io::BlockCache::new(Default::default())),
+            tiler,
+            content_version: crate::cache::ContentVersion::new_generation(),
         })
     }
 
     /// List the COG assets covering one tile. Public so callers can
     /// inspect what would be rendered (e.g. for catalog UIs).
     pub async fn list_assets_for_tile(&self, xyz: TileCoord) -> MaptileResult<Vec<StacAsset>> {
+        Ok(self
+            .search
+            .list(xyz)
+            .await?
+            .into_iter()
+            .map(|(asset, _)| asset)
+            .collect())
+    }
+}
+
+impl StacSearch {
+    async fn list(&self, xyz: TileCoord) -> MaptileResult<Vec<(StacAsset, Option<String>)>> {
+        if self.limit == 0 {
+            return Ok(Vec::new());
+        }
         let bbox = tile_to_wgs84_bbox(xyz.z, xyz.x, xyz.y);
         let url = build_search_url(&self.cfg.api_url);
 
         let mut payload = serde_json::json!({
             "bbox": bbox,
             "collections": self.cfg.collections,
-            "limit": self.cfg.limit,
+            "limit": self.limit,
         });
         if let Some(dt) = &self.cfg.datetime {
             payload["datetime"] = serde_json::Value::String(dt.clone());
         }
 
-        let resp = self
+        let mut resp = self
             .http
             .post(&url)
             .header("content-type", "application/json")
             .body(serde_json::to_vec(&payload).map_err(MaptileError::from)?)
             .send()
             .await
-            .map_err(MaptileError::backend)?;
+            .map_err(|error| MaptileError::backend(error.without_url()))?;
         if !resp.status().is_success() {
             return Err(MaptileError::BackendMsg(format!(
                 "stac search returned HTTP {}",
                 resp.status()
             )));
         }
-        let raw = resp.bytes().await.map_err(MaptileError::backend)?;
-        let body: serde_json::Value =
-            serde_json::from_slice(&raw).map_err(MaptileError::backend)?;
-        Ok(extract_assets_from_item_collection(
-            &body,
-            &self.cfg.asset_role,
-        ))
+        let mut raw = Vec::new();
+        while let Some(chunk) = resp
+            .chunk()
+            .await
+            .map_err(|error| MaptileError::backend(error.without_url()))?
+        {
+            if chunk.len() > MAX_SEARCH_BYTES - raw.len() {
+                return Err(MaptileError::PayloadTooLarge {
+                    limit: MAX_SEARCH_BYTES,
+                });
+            }
+            raw.extend_from_slice(&chunk);
+        }
+        let role = self.cfg.clone();
+        let limit = self.limit;
+        crate::transport::run_blocking(move || {
+            let body = serde_json::from_slice(&raw).map_err(MaptileError::backend)?;
+            Ok(extract_assets(&body, &role.asset_role, limit))
+        })
+        .await
     }
 }
 
 #[async_trait::async_trait]
 impl TileSource for StacSource {
     fn id(&self) -> &str {
-        &self.id
+        &self.search.cfg.id
     }
     fn tilejson(&self) -> &tilejson::TileJSON {
         &self.tj
@@ -175,18 +224,15 @@ impl TileSource for StacSource {
     }
 
     fn cache_zoom(&self) -> crate::cache::CacheZoomRange {
-        // Single source of truth: read from the stored config.
-        self.cfg.cache_zoom.unwrap_or_default()
+        self.search.cfg.cache_zoom.unwrap_or_default()
+    }
+
+    fn content_version(&self) -> crate::cache::ContentVersion {
+        self.content_version
     }
 
     fn clone_source(&self) -> Box<dyn TileSource> {
-        Box::new(StacSource {
-            id: self.id.clone(),
-            cfg: self.cfg.clone(),
-            tj: self.tj.clone(),
-            http: self.http.clone(),
-            block_cache: self.block_cache.clone(),
-        })
+        Box::new(self.clone())
     }
 
     async fn get_tile(
@@ -194,14 +240,25 @@ impl TileSource for StacSource {
         xyz: TileCoord,
         query: Option<&TileQuery<'_>>,
     ) -> MaptileResult<TileResponse> {
-        let style = query
-            .and_then(|q| q.style)
-            .ok_or_else(|| {
-                MaptileError::InvalidRequest("canonical raster style is required".into())
-            })?
-            .clone();
-        let assets = self.list_assets_for_tile(xyz).await?;
-        let tile = render_assets(&assets, xyz, &style, self.block_cache.clone()).await?;
+        let style: &EffectiveStyle = query.and_then(|q| q.style).ok_or_else(|| {
+            MaptileError::InvalidRequest("canonical raster style is required".into())
+        })?;
+        let selection = effective_pixel_selection(query, MosaicPixelSelection::First);
+        let tile_style = crate::raster::agtiff_style::to_mosaic_tile_style(style, selection)?;
+        let tile = self
+            .tiler
+            .tile(
+                AgTileCoord {
+                    tms: TileMatrixSet::WebMercatorQuad,
+                    z: xyz.z,
+                    x: xyz.x,
+                    y: xyz.y,
+                },
+                &tile_style,
+            )
+            .await
+            .map_err(crate::raster::agtiff_style::render_error)?
+            .ok_or(MaptileError::TileNotFound(xyz.z, xyz.x, xyz.y))?;
         Ok(TileResponse {
             data: tile,
             info: TileInfo {
@@ -217,60 +274,35 @@ impl TileSource for StacSource {
     }
 }
 
-// A tile search is not a complete collection: upstream rejects statistical
-// styles until the caller binds a fixed dataset or mosaic collection.
-struct TileAssets(Vec<async_geotiff::mosaic::AssetRef>);
-
 #[async_trait::async_trait]
-impl async_geotiff::mosaic::MosaicSource for TileAssets {
-    async fn assets_for_tile(
-        &self,
-        _: async_geotiff::tms::TileCoord,
-    ) -> async_geotiff::error::AgResult<Vec<async_geotiff::mosaic::AssetRef>> {
-        Ok(self.0.clone())
-    }
-}
-
-async fn render_assets(
-    assets: &[StacAsset],
-    xyz: TileCoord,
-    style: &EffectiveStyle,
-    block_cache: Arc<async_geotiff::io::BlockCache>,
-) -> MaptileResult<bytes::Bytes> {
-    use async_geotiff::{
-        bounds::Bbox,
-        mosaic::{AssetRef, MosaicTiler},
-        tms::{TileCoord as AgTileCoord, TileMatrixSet},
-    };
-    let tile_style = crate::raster::agtiff_style::to_tile_style(style)?;
-    let assets = TileAssets(
-        assets
-            .iter()
-            .map(|asset| {
-                let b = asset.bbox.unwrap_or([-180., -90., 180., 90.]);
-                AssetRef {
-                    url: asset.href.clone(),
-                    source_id: asset.href.clone(),
-                    bbox: Bbox::new(b[0], b[1], b[2], b[3]),
-                }
-            })
-            .collect(),
-    );
-    MosaicTiler::builder(assets)
-        .block_cache(block_cache)
-        .build()
-        .tile(
-            AgTileCoord {
-                tms: TileMatrixSet::WebMercatorQuad,
+impl MosaicSource for StacSearch {
+    async fn assets_for_tile(&self, xyz: AgTileCoord) -> AgResult<Vec<AssetRef>> {
+        let assets = self
+            .list(TileCoord {
                 z: xyz.z,
                 x: xyz.x,
                 y: xyz.y,
-            },
-            &tile_style,
-        )
-        .await
-        .map_err(crate::raster::agtiff_style::render_error)?
-        .ok_or(MaptileError::TileNotFound(xyz.z, xyz.x, xyz.y))
+            })
+            .await
+            .map_err(|error| match error {
+                MaptileError::PayloadTooLarge { .. } => AgError::ResourceLimit(error.to_string()),
+                _ => AgError::Mosaic(error.to_string()),
+            })?;
+        // ReaderPool pins a snapshot by (href, source_id). Only checksummed
+        // assets have a revision that can be reused across STAC searches.
+        let generation = uuid::Uuid::new_v4().to_string();
+        Ok(assets
+            .into_iter()
+            .map(|(asset, checksum)| {
+                let b = asset.bbox.unwrap_or([-180., -90., 180., 90.]);
+                AssetRef {
+                    url: asset.href,
+                    source_id: checksum.unwrap_or_else(|| generation.clone()),
+                    bbox: Bbox::new(b[0], b[1], b[2], b[3]),
+                }
+            })
+            .collect())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -307,13 +339,24 @@ pub fn extract_assets_from_item_collection(
     body: &serde_json::Value,
     asset_role: &str,
 ) -> Vec<StacAsset> {
+    extract_assets(body, asset_role, usize::MAX)
+        .into_iter()
+        .map(|(asset, _)| asset)
+        .collect()
+}
+
+fn extract_assets(
+    body: &serde_json::Value,
+    asset_role: &str,
+    limit: usize,
+) -> Vec<(StacAsset, Option<String>)> {
     let features = match body.get("features").and_then(|v| v.as_array()) {
         Some(f) => f,
         None => return Vec::new(),
     };
 
-    let mut out = Vec::with_capacity(features.len());
-    for item in features {
+    let mut out = Vec::with_capacity(features.len().min(limit));
+    for item in features.iter().take(limit) {
         let id = item
             .get("id")
             .and_then(|v| v.as_str())
@@ -324,16 +367,17 @@ pub fn extract_assets_from_item_collection(
             .and_then(|p| p.get("eo:cloud_cover"))
             .and_then(|v| v.as_f64());
         let bbox = item.get("bbox").and_then(|v| v.as_array()).and_then(|arr| {
-            if arr.len() >= 4 {
-                Some([
-                    arr[0].as_f64()?,
-                    arr[1].as_f64()?,
-                    arr[2].as_f64()?,
-                    arr[3].as_f64()?,
-                ])
-            } else {
-                None
-            }
+            let offset = match arr.len() {
+                4 => 2,
+                6 => 3,
+                _ => return None,
+            };
+            Some([
+                arr[0].as_f64()?,
+                arr[1].as_f64()?,
+                arr[offset].as_f64()?,
+                arr[offset + 1].as_f64()?,
+            ])
         });
 
         let assets = match item.get("assets").and_then(|v| v.as_object()) {
@@ -341,18 +385,17 @@ pub fn extract_assets_from_item_collection(
             None => continue,
         };
 
-        // Prefer asset whose roles contains `asset_role`, else fall back
-        // to the first COG-typed asset.
         let chosen = assets
-            .iter()
-            .find(|(_, v)| {
-                v.get("roles")
-                    .and_then(|r| r.as_array())
-                    .map(|arr| arr.iter().any(|x| x.as_str() == Some(asset_role)))
-                    .unwrap_or(false)
+            .get(asset_role)
+            .or_else(|| {
+                assets.values().find(|v| {
+                    v.get("roles")
+                        .and_then(|r| r.as_array())
+                        .is_some_and(|roles| roles.iter().any(|x| x.as_str() == Some(asset_role)))
+                })
             })
             .or_else(|| {
-                assets.iter().find(|(_, v)| {
+                assets.values().find(|v| {
                     v.get("type")
                         .and_then(|t| t.as_str())
                         .map(is_cog_mime_type)
@@ -360,19 +403,27 @@ pub fn extract_assets_from_item_collection(
                 })
             });
 
-        if let Some((_key, val)) = chosen {
+        if let Some(val) = chosen {
             let href = val.get("href").and_then(|v| v.as_str()).unwrap_or("");
             if href.is_empty() {
                 continue;
             }
             let mime_type = val.get("type").and_then(|v| v.as_str()).map(str::to_string);
-            out.push(StacAsset {
-                id: id.clone(),
-                href: href.to_string(),
-                mime_type,
-                cloud_cover,
-                bbox,
-            });
+            let checksum = val
+                .get("file:checksum")
+                .and_then(|v| v.as_str())
+                .filter(|value| !value.is_empty() && value.len() <= 256)
+                .map(str::to_owned);
+            out.push((
+                StacAsset {
+                    id,
+                    href: href.to_string(),
+                    mime_type,
+                    cloud_cover,
+                    bbox,
+                },
+                checksum,
+            ));
         }
     }
     out
@@ -466,6 +517,22 @@ mod tests {
     fn empty_features_yields_empty_assets() {
         let json = serde_json::json!({"features": []});
         assert!(extract_assets_from_item_collection(&json, "data").is_empty());
+    }
+
+    #[test]
+    fn discovery_prefers_an_exact_asset_key_and_limits_items() {
+        let collection = serde_json::json!({"features": [
+            {"id":"first", "bbox":[-1, -2, 0, 3, 4, 500], "assets": {
+                "a": {"href":"https://example.test/a.tif", "type":"image/tiff"},
+                "red": {"href":"https://example.test/red.tif", "type":"image/tiff", "file:checksum":"test-checksum"}
+            }},
+            {"id":"second", "assets": {"red":{"href":"https://example.test/second.tif"}}}
+        ]});
+        let matches = extract_assets(&collection, "red", 1);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].0.href, "https://example.test/red.tif");
+        assert_eq!(matches[0].0.bbox, Some([-1.0, -2.0, 3.0, 4.0]));
+        assert_eq!(matches[0].1.as_deref(), Some("test-checksum"));
     }
 
     #[test]

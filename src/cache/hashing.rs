@@ -67,11 +67,20 @@ impl ContentVersion {
         Self(bytes)
     }
 
-    /// Convenience: digest an arbitrary byte stream and truncate to 4 bytes.
+    pub(crate) fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    /// Digest an arbitrary byte stream.
     #[must_use]
     pub fn from_input(input: &[u8]) -> Self {
         let h = blake3::hash(input);
         Self(*h.as_bytes())
+    }
+
+    /// Isolate the caches of independently opened sources with unknown data revisions.
+    pub(crate) fn new_generation() -> Self {
+        Self::from_input(uuid::Uuid::new_v4().as_bytes())
     }
 
     #[must_use]

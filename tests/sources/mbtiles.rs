@@ -202,7 +202,90 @@ mod mbtiles {
 
     // Each test owns a complete PNG archive; no shared on-disk fixture or
     // create-if-missing race can hide a truncated payload from a previous run.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn replacing_archive_cannot_fill_the_new_generation_from_the_old_pool() {
+        use maptile_core::cache::TileCache;
+        use maptile_core::sources::manager::SourceManager;
+        use std::sync::Arc;
+
+        let first = fixture();
+        let cfg = MbtilesConfig {
+            id: "stable".into(),
+            path: first.path().to_owned(),
+            serve_as: None,
+            description: None,
+        };
+        let old = Arc::new(MbtilesSource::open(cfg.clone()).await.unwrap());
+        let version = old.content_version();
+        let manager =
+            SourceManager::new().with_cache(Arc::new(TileCache::new(8, None, None).unwrap()));
+        manager.register(old.clone());
+        let coord = TileCoord { z: 0, x: 0, y: 0 };
+        let before = manager.get_tile("stable", coord, None).await.unwrap().data;
+        let replacement = fixture_with_color([255, 0, 0]);
+        replacement.persist(first.path()).unwrap();
+        assert_eq!(old.content_version(), version);
+        let uncached = TileCoord { z: 1, x: 0, y: 1 };
+        assert!(matches!(
+            manager.get_tile("stable", uncached, None).await,
+            Err(MaptileError::SourceUnavailable(_))
+        ));
+        let new = Arc::new(MbtilesSource::open(cfg).await.unwrap());
+        assert_ne!(new.content_version(), version);
+        let expected = new.get_tile(coord, None).await.unwrap().data;
+        assert_ne!(before, expected);
+        manager.register(new);
+        assert_eq!(
+            manager.get_tile("stable", coord, None).await.unwrap().data,
+            expected
+        );
+    }
+
+    #[tokio::test]
+    async fn wal_commit_changes_archive_identity() {
+        let file = fixture();
+        let writer = rusqlite::Connection::open(file.path()).unwrap();
+        writer
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+            .unwrap();
+        let cfg = MbtilesConfig {
+            id: "wal".into(),
+            path: file.path().to_path_buf(),
+            serve_as: None,
+            description: None,
+        };
+        let before = MbtilesSource::open(cfg.clone()).await.unwrap();
+        let coord = TileCoord { z: 0, x: 0, y: 0 };
+        let replacement = fixture_with_color([128, 0, 0]);
+        let data: Vec<u8> = rusqlite::Connection::open(replacement.path())
+            .unwrap()
+            .query_row(
+                "SELECT tile_data FROM tiles WHERE zoom_level=0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        writer
+            .execute("UPDATE tiles SET tile_data=?1 WHERE zoom_level=0", [&data])
+            .unwrap();
+        assert!(matches!(
+            before.get_tile(coord, None).await,
+            Err(MaptileError::SourceUnavailable(_))
+        ));
+        let after = MbtilesSource::open(cfg).await.unwrap();
+        assert_ne!(before.content_version(), after.content_version());
+        assert_eq!(
+            after.get_tile(coord, None).await.unwrap().data.as_ref(),
+            data.as_slice()
+        );
+    }
+
     fn fixture() -> tempfile::NamedTempFile {
+        fixture_with_color([0, 0, 0])
+    }
+
+    fn fixture_with_color(color: [u8; 3]) -> tempfile::NamedTempFile {
         let file = tempfile::NamedTempFile::new().expect("temporary MBTiles fixture");
         let conn = rusqlite::Connection::open(file.path()).expect("open fixture");
         conn.execute_batch(
@@ -218,7 +301,7 @@ mod mbtiles {
              INSERT INTO metadata VALUES('attribution','test');",
         ).expect("create fixture schema");
         let mut png = std::io::Cursor::new(Vec::new());
-        image::DynamicImage::new_rgb8(256, 256)
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(256, 256, image::Rgb(color)))
             .write_to(&mut png, image::ImageFormat::Png)
             .expect("encode complete tile");
         for (zoom, x, y) in [(0, 0, 0), (1, 0, 0), (2, 1, 1)] {

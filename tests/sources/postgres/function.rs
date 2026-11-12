@@ -166,6 +166,59 @@ async fn supports_url_query_reflects_signature() {
 }
 
 #[tokio::test]
+async fn same_id_replacement_caches_the_new_function_generation() {
+    use maptile_core::{cache::TileCache, sources::manager::SourceManager};
+
+    let Some(dsn) = common::postgres::pg_dsn() else {
+        return;
+    };
+    let guard = common::postgres::SchemaGuard::create(&dsn).await;
+    install_basic_function(&dsn, &guard.name, "basic").await;
+    install_with_query_function(&dsn, &guard.name, "json_tiles").await;
+    let pool = make_pool(&dsn).await;
+    pool.get()
+        .await
+        .unwrap()
+        .batch_execute(&format!(
+            "CREATE FUNCTION \"{0}\".jsonb_tiles(int, int, int, jsonb) RETURNS bytea
+         LANGUAGE sql AS $$ SELECT \"{0}\".json_tiles($1,$2,$3,$4::json) $$",
+            guard.name
+        ))
+        .await
+        .unwrap();
+    let mut cfg = PostgresFunctionConfig {
+        id: "same".into(),
+        schema: guard.name.clone(),
+        function: "basic".into(),
+        description: None,
+        minzoom: None,
+        maxzoom: None,
+        bounds: None,
+        cache_zoom: None,
+    };
+    let old = Arc::new(
+        PostgresFunctionSource::open(pool.clone(), cfg.clone())
+            .await
+            .unwrap(),
+    );
+    let manager = SourceManager::new().with_cache(Arc::new(TileCache::new(8, None, None).unwrap()));
+    let coord = TileCoord { z: 0, x: 0, y: 0 };
+    manager.register(old.clone());
+    let before = manager.get_tile("same", coord, None).await.unwrap().data;
+    cfg.function = "jsonb_tiles".into();
+    let new = Arc::new(PostgresFunctionSource::open(pool, cfg).await.unwrap());
+    assert_ne!(old.content_version(), new.content_version());
+    assert_eq!(new.content_version(), new.clone_source().content_version());
+    let expected = new.get_tile(coord, None).await.unwrap().data;
+    assert_ne!(before, expected);
+    manager.register(new);
+    assert_eq!(
+        manager.get_tile("same", coord, None).await.unwrap().data,
+        expected
+    );
+}
+
+#[tokio::test]
 async fn function_source_passes_query_params() {
     use maptile_core::sources::TileQuery;
     use std::collections::BTreeMap;

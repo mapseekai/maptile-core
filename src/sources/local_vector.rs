@@ -15,10 +15,11 @@ use duckdb::{Connection, InterruptHandle};
 use tempfile::TempDir;
 use tokio::sync::Notify;
 
+use super::file_stamp::FileStamp;
 use super::geoparquet::{GeoParquetQueryOptions, GeoParquetSource, GeoParquetSourceConfig};
 use super::geoparquet_geometry::{
-    FileStamp, GeometrySource, identifier, literal, single_file_path, spatial_connection,
-    unused_name, validate_single_file_path,
+    GeometrySource, identifier, literal, single_file_path, spatial_connection, unused_name,
+    validate_single_file_path,
 };
 use super::{TileCoord, TileInfo, TileQuery, TileResponse, TileSource};
 use crate::error::{MaptileError, MaptileResult};

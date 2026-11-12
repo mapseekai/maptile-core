@@ -12,6 +12,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_postgres::config::SslMode;
 use tokio_postgres::{CancelToken, Client, Config, NoTls};
 
+use crate::cache::ContentVersion;
 use crate::error::{MaptileError, MaptileResult};
 
 use super::{MINIMUM_POSTGIS_VERSION, MINIMUM_POSTGRES_VERSION, ST_TILE_ENVELOPE_MARGIN_VERSION};
@@ -47,6 +48,7 @@ pub struct PostgresPool {
     postgis_version: Version,
     supports_tile_margin: bool,
     ssl_mode: SslMode,
+    pub(super) database_identity: ContentVersion,
 }
 
 impl PostgresPool {
@@ -80,6 +82,15 @@ impl PostgresPool {
         }
 
         let supports_tile_margin = postgis_version >= ST_TILE_ENVELOPE_MARGIN_VERSION;
+        let origin = (
+            pg_config.get_hosts(),
+            pg_config.get_hostaddrs(),
+            pg_config.get_ports(),
+            pg_config.get_user(),
+            pg_config.get_dbname(),
+            pg_config.get_options(),
+        );
+        let database_identity = ContentVersion::from_input(format!("{origin:?}").as_bytes());
         drop(conn);
 
         if settings.pre_warm {
@@ -98,6 +109,7 @@ impl PostgresPool {
             postgis_version,
             supports_tile_margin,
             ssl_mode: pg_config.get_ssl_mode(),
+            database_identity,
         })
     }
 

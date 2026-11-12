@@ -2,7 +2,7 @@
 //!
 //! Layered above raw GDAL buffers so band-math, mosaic, encode, decode all
 //! consume the same struct. Pure-data type with no GDAL or `image`-crate
-//! dependency in its constructors apart from [`Self::from_rgba8`]; the
+//! dependency in its constructors apart from [`RasterImage::from_rgba8`]; the
 //! `from_gdal_buffer` constructor lives in the `cog` / `outdb` adapter
 //! refactor (Phase 15).
 
@@ -110,14 +110,7 @@ impl RasterImage {
     /// `0.0..=255.0` range; the validity mask is initialised to all-true
     /// (encoders that need transparency should set `mask` accordingly).
     pub fn from_rgba8(rgba: &[u8], width: u32, height: u32) -> MaptileResult<Self> {
-        let expected = (width as usize)
-            .checked_mul(height as usize)
-            .and_then(|n| n.checked_mul(4))
-            .ok_or_else(|| {
-                MaptileError::Render(format!(
-                    "rgba buffer dimensions {width}x{height} overflow usize"
-                ))
-            })?;
+        let expected = rgba_len(width, height)?;
         if rgba.len() != expected {
             return Err(MaptileError::Render(format!(
                 "rgba buffer is {} bytes; expected {expected} for {width}x{height}",
@@ -145,6 +138,19 @@ impl RasterImage {
             crs: None,
         })
     }
+}
+
+pub(super) const MAX_IMAGE_WORKING_BYTES: usize = 256 * 1024 * 1024;
+
+pub(super) fn rgba_len(width: u32, height: u32) -> MaptileResult<usize> {
+    let pixels = u64::from(width) * u64::from(height);
+    // RGBA8 input, four f32 planes, and one validity byte per pixel.
+    if pixels > (MAX_IMAGE_WORKING_BYTES / 21) as u64 {
+        return Err(MaptileError::PayloadTooLarge {
+            limit: MAX_IMAGE_WORKING_BYTES,
+        });
+    }
+    Ok(pixels as usize * 4)
 }
 
 #[cfg(test)]

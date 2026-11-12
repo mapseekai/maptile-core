@@ -2,6 +2,7 @@
 //! on-demand geometry queries through DuckDB Spatial when geometry_column is set.
 //! Geometry is projected to Web Mercator before clipping and MVT encoding.
 
+use super::file_stamp::FileStamp;
 pub use super::geoparquet_geometry::GeoParquetQueryOptions;
 use super::geoparquet_geometry::{GeometrySource, valid_bounds};
 use super::geoparquet_remote::RemoteFile;
@@ -144,18 +145,21 @@ impl GeoParquetSource {
                 "geoparquet: bounds must be finite WGS84 bounds".into(),
             ));
         }
+        let stamp = FileStamp::read(&cfg.path)?;
         let (tiles, geometry) = if cfg.geometry_column.is_some() {
             (HashMap::new(), Some(Arc::new(GeometrySource::open(&cfg)?)))
         } else {
-            (read_tile_archive(&cfg.path, &cfg.columns)?, None)
+            (read_tile_archive(&cfg)?, None)
         };
-        let metadata = std::fs::metadata(&cfg.path).map_err(MaptileError::backend)?;
+        if FileStamp::read(&cfg.path)? != stamp {
+            return Err(MaptileError::SourceUnavailable(
+                "GeoParquet file changed while opening".into(),
+            ));
+        }
         let identity = format!(
-            "{:?}:{:?}:{}:{:?}",
+            "{:?}:{:?}:{stamp:?}",
             cfg,
             cfg.path.canonicalize().map_err(MaptileError::backend)?,
-            metadata.len(),
-            metadata.modified().map_err(MaptileError::backend)?
         );
         let content_version = crate::cache::ContentVersion::from_input(identity.as_bytes());
 
@@ -427,73 +431,140 @@ impl TileSource for GeoParquetSource {
 // Parquet reader
 // ---------------------------------------------------------------------------
 
-/// Hard cap on rows ingested by [`read_tile_archive`]. The doc comment on
-/// `GeoParquetSource` advertises "small to medium" archives (~1M tiles);
-/// 4M leaves headroom while preventing an attacker-supplied parquet from
-/// triggering an OOM in the open path. Larger workloads should switch to
-/// PMTiles/MBTiles.
+/// Hard cap on rows scanned, including duplicates and nulls.
 const GEOPARQUET_MAX_TILES: usize = 4_000_000;
 
 fn read_tile_archive(
-    path: &std::path::Path,
-    columns: &GeoParquetColumns,
+    cfg: &GeoParquetSourceConfig,
 ) -> MaptileResult<HashMap<(u8, u32, u32), Bytes>> {
-    use arrow_array::Array;
     use arrow_array::cast::AsArray;
-    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use arrow_schema::{DataType, Schema};
+    use parquet::arrow::ProjectionMask;
+    use parquet::arrow::arrow_reader::{
+        ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
+    };
+    use parquet::file::reader::{ChunkReader, Length};
     use std::fs::File;
 
-    let file = File::open(path).map_err(MaptileError::backend)?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(MaptileError::backend)?;
+    cfg.query_options.validate()?;
+    let budget = cfg
+        .query_options
+        .memory_limit_mb
+        .saturating_mul(1024 * 1024);
+    let index_budget = budget / 2;
+    let metadata_limit = (budget / 8).min(16 * 1024 * 1024);
+    let file = File::open(&cfg.path)?;
+    let footer_offset = file
+        .len()
+        .checked_sub(8)
+        .ok_or_else(|| MaptileError::InvalidMetadata("truncated Parquet footer".into()))?;
+    let footer = file
+        .get_bytes(footer_offset, 8)
+        .map_err(MaptileError::backend)?;
+    let metadata_len = u32::from_le_bytes(footer[..4].try_into().unwrap()) as usize;
+    if metadata_len > metadata_limit {
+        return Err(MaptileError::PayloadTooLarge {
+            limit: metadata_limit,
+        });
+    }
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file.try_clone()?)
+        .map_err(MaptileError::backend)?;
 
     // Resolve column indices once, before iterating batches.
     let schema = builder.schema().clone();
+    let columns = &cfg.columns;
     let z_idx = column_index(&schema, &columns.z)?;
     let x_idx = column_index(&schema, &columns.x)?;
     let y_idx = column_index(&schema, &columns.y)?;
     let tile_idx = column_index(&schema, &columns.tile)?;
-
-    let reader = builder.build().map_err(MaptileError::backend)?;
+    if !matches!(
+        schema.field(tile_idx).data_type(),
+        DataType::Binary | DataType::LargeBinary | DataType::BinaryView
+    ) {
+        return Err(MaptileError::Config(format!(
+            "geoparquet: column {:?} must contain binary tile bytes",
+            columns.tile,
+        )));
+    }
+    let mut selected = vec![z_idx, x_idx, y_idx, tile_idx];
+    selected.sort_unstable();
+    selected.dedup();
+    let parquet_schema = builder.parquet_schema();
+    let mask = ProjectionMask::roots(parquet_schema, selected.iter().copied());
+    let file_metadata = builder.metadata().clone();
+    let rows = file_metadata
+        .row_groups()
+        .iter()
+        .try_fold(0usize, |total, group| {
+            let rows = usize::try_from(group.num_rows()).ok()?;
+            total.checked_add(rows)
+        });
+    if rows.is_none_or(|rows| rows > GEOPARQUET_MAX_TILES) {
+        return Err(MaptileError::Config(format!(
+            "geoparquet: archive exceeds {GEOPARQUET_MAX_TILES} tile rows; use PMTiles/MBTiles",
+        )));
+    }
+    for group in file_metadata.row_groups() {
+        let mut bytes = 0usize;
+        for (_, column) in group
+            .columns()
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| mask.leaf_included(*i))
+        {
+            // Cargo feature unification must not enable eager decompression on this path.
+            if column.compression() != parquet::basic::Compression::UNCOMPRESSED {
+                return Err(MaptileError::InvalidMetadata(
+                    "pre-encoded GeoParquet archive columns must be uncompressed".into(),
+                ));
+            }
+            let size = column.uncompressed_size().max(column.compressed_size());
+            bytes = bytes.saturating_add(usize::try_from(size).unwrap_or(usize::MAX));
+            if bytes > budget / 4 {
+                return Err(MaptileError::PayloadTooLarge { limit: budget / 4 });
+            }
+        }
+    }
+    // BinaryView keeps repeated dictionary entries borrowed until we check the tile budget.
+    let mut fields = schema.fields().to_vec();
+    fields[tile_idx] = Arc::new(
+        schema
+            .field(tile_idx)
+            .clone()
+            .with_data_type(DataType::BinaryView),
+    );
+    let options = ArrowReaderOptions::new().with_schema(Arc::new(Schema::new(fields)));
+    let metadata =
+        ArrowReaderMetadata::try_new(file_metadata, options).map_err(MaptileError::backend)?;
+    let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(file, metadata)
+        .with_projection(mask)
+        .build()
+        .map_err(MaptileError::backend)?;
+    let [z_idx, x_idx, y_idx, tile_idx] = [z_idx, x_idx, y_idx, tile_idx]
+        .map(|idx| selected.binary_search(&idx).expect("selected column"));
 
     let mut out: HashMap<(u8, u32, u32), Bytes> = HashMap::new();
+    let mut retained = 0usize;
+    let mut seen_rows = 0usize;
     for batch in reader {
-        if out.len() >= GEOPARQUET_MAX_TILES {
+        let batch = batch.map_err(MaptileError::backend)?;
+        seen_rows = seen_rows.saturating_add(batch.num_rows());
+        if seen_rows > GEOPARQUET_MAX_TILES {
             return Err(MaptileError::Config(format!(
                 "geoparquet: archive exceeds {GEOPARQUET_MAX_TILES} tile rows; \
                  use PMTiles/MBTiles for larger workloads"
             )));
         }
-        let batch = batch.map_err(MaptileError::backend)?;
 
         let z_col = batch.column(z_idx);
         let x_col = batch.column(x_idx);
         let y_col = batch.column(y_idx);
         let tile_col = batch.column(tile_idx);
 
-        // The tile column must be Binary or LargeBinary.
-        let tile_bytes: Box<dyn Iterator<Item = Option<&[u8]>>> =
-            if let Some(arr) = tile_col.as_binary_opt::<i32>() {
-                Box::new((0..arr.len()).map(move |i| {
-                    if arr.is_null(i) {
-                        None
-                    } else {
-                        Some(arr.value(i))
-                    }
-                }))
-            } else if let Some(arr) = tile_col.as_binary_opt::<i64>() {
-                Box::new((0..arr.len()).map(move |i| {
-                    if arr.is_null(i) {
-                        None
-                    } else {
-                        Some(arr.value(i))
-                    }
-                }))
-            } else {
-                return Err(MaptileError::Config(format!(
-                    "geoparquet: column {:?} must be Binary or LargeBinary",
-                    columns.tile
-                )));
-            };
+        let tile_bytes = tile_col
+            .as_binary_view_opt()
+            .ok_or_else(|| MaptileError::InvalidMetadata("expected a binary tile column".into()))?
+            .iter();
 
         let z_iter = primitive_u32_iter(z_col)?;
         let x_iter = primitive_u32_iter(x_col)?;
@@ -506,7 +577,21 @@ fn read_tile_archive(
             if z > u8::MAX as u32 {
                 continue;
             }
-            out.insert((z as u8, x, y), Bytes::copy_from_slice(tile));
+            if tile.len() > cfg.query_options.max_tile_bytes {
+                return Err(MaptileError::PayloadTooLarge {
+                    limit: cfg.query_options.max_tile_bytes,
+                });
+            }
+            let key = (z as u8, x, y);
+            // Include key, hash table capacity, and per-tile allocation overhead.
+            retained -= out.get(&key).map_or(0, |old| old.len() + 128);
+            retained = retained.saturating_add(tile.len() + 128);
+            if retained > index_budget {
+                return Err(MaptileError::PayloadTooLarge {
+                    limit: index_budget,
+                });
+            }
+            out.insert(key, Bytes::copy_from_slice(tile));
         }
     }
     Ok(out)
@@ -728,11 +813,11 @@ mod tests {
             ArrowWriter::try_new(std::fs::File::create(&path).unwrap(), schema, None).unwrap();
         writer.write(&batch).unwrap();
         writer.close().unwrap();
-        let source = GeoParquetSource::open(GeoParquetSourceConfig {
+        let cfg = GeoParquetSourceConfig {
             path,
             ..Default::default()
-        })
-        .unwrap();
+        };
+        let source = GeoParquetSource::open(cfg.clone()).unwrap();
         let cloned = source.clone();
         assert!(Arc::ptr_eq(&source.tiles, &cloned.tiles));
         assert_eq!(source.tile_count(), 2);
@@ -748,6 +833,12 @@ mod tests {
         assert!(matches!(
             source.get_tile(TileCoord { z: 1, x: 0, y: 0 }, None).await,
             Err(MaptileError::TileNotFound(..))
+        ));
+        let mut bounded = cfg;
+        bounded.query_options.max_tile_bytes = 5;
+        assert!(matches!(
+            GeoParquetSource::open(bounded),
+            Err(MaptileError::PayloadTooLarge { limit: 5 })
         ));
     }
 }

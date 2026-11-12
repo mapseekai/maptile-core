@@ -43,6 +43,8 @@ pub mod tools {
     };
 }
 
+use super::file_stamp::FileStamp;
+use crate::cache::ContentVersion;
 use crate::error::{MaptileError, MaptileResult};
 use crate::sources::archive_inspection::{
     ArchiveSourceType, inspect_archive, set_raster_tile_size,
@@ -52,9 +54,8 @@ use crate::sources::{
 };
 use async_trait::async_trait;
 use bytes::Bytes;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::SystemTime;
 use tilejson::TileJSON;
 
 #[derive(Debug, Clone)]
@@ -74,23 +75,41 @@ pub struct MbtilesSource {
     info: TileInfo,
     native_format: TileFormat,
     encoding: TileEncoding,
-    last_modified: Option<SystemTime>,
+    wal_path: PathBuf,
+    stamp: ArchiveStamp,
+    content_version: ContentVersion,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ArchiveStamp {
+    main: FileStamp,
+    wal: Option<FileStamp>,
+}
+
+impl ArchiveStamp {
+    fn read(path: &Path, wal_path: &Path) -> std::io::Result<Self> {
+        let main = FileStamp::read(path)?;
+        let wal = match std::fs::metadata(wal_path) {
+            // A reader may create an empty WAL while opening a checkpointed archive.
+            Ok(metadata) if metadata.len() > 32 => Some(FileStamp::from_metadata(&metadata)?),
+            Ok(_) => None,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        Ok(Self { main, wal })
+    }
 }
 
 impl MbtilesSource {
     pub async fn open(cfg: MbtilesConfig) -> MaptileResult<Self> {
-        if !cfg.path.exists() {
-            return Err(MaptileError::Io(std::sync::Arc::new(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("MBTiles file not found: {}", cfg.path.display()),
-            ))));
-        }
-        let last_modified = std::fs::metadata(&cfg.path)
-            .ok()
-            .and_then(|m| m.modified().ok());
+        let archive_path = std::fs::canonicalize(&cfg.path)?;
+        let mut wal_path = archive_path.as_os_str().to_os_string();
+        wal_path.push("-wal");
+        let wal_path = PathBuf::from(wal_path);
+        let stamp = ArchiveStamp::read(&archive_path, &wal_path)?;
 
         let pool = Arc::new(
-            mbtiles::MbtilesPool::open_readonly(&cfg.path)
+            mbtiles::MbtilesPool::open_readonly(&archive_path)
                 .await
                 .map_err(MaptileError::backend)?,
         );
@@ -116,7 +135,7 @@ impl MbtilesSource {
 
         // The declaration classifies the archive. Tile bytes are sampled only
         // to determine transport encoding, never to override that declaration.
-        let archive = mbtiles::Mbtiles::new(&cfg.path).map_err(MaptileError::backend)?;
+        let archive = mbtiles::Mbtiles::new(&archive_path).map_err(MaptileError::backend)?;
         let mut conn = archive
             .open_readonly()
             .await
@@ -158,6 +177,10 @@ impl MbtilesSource {
             },
         )?;
         let tj = inspection.tilejson;
+        if ArchiveStamp::read(&cfg.path, &wal_path)? != stamp {
+            return Err(MaptileError::SourceUnavailable(cfg.id));
+        }
+        let content_version = ContentVersion::from_input(format!("{cfg:?}:{stamp:?}").as_bytes());
 
         tracing::info!(
             "MbtilesSource '{}' opened: native={:?} encoding={:?} serve_as={:?}",
@@ -174,8 +197,19 @@ impl MbtilesSource {
             info,
             native_format,
             encoding,
-            last_modified,
+            wal_path,
+            stamp,
+            content_version,
         })
+    }
+
+    fn check_file(&self) -> MaptileResult<()> {
+        if ArchiveStamp::read(&self.cfg.path, &self.wal_path).is_ok_and(|stamp| stamp == self.stamp)
+        {
+            Ok(())
+        } else {
+            Err(MaptileError::SourceUnavailable(self.cfg.id.clone()))
+        }
     }
 }
 
@@ -216,36 +250,14 @@ impl TileSource for MbtilesSource {
             info: self.info,
             native_format: self.native_format,
             encoding: self.encoding,
-            last_modified: self.last_modified,
+            wal_path: self.wal_path.clone(),
+            stamp: self.stamp.clone(),
+            content_version: self.content_version,
         })
     }
 
-    /// Content version derived from `(path, mtime, size)` so the cache
-    /// busts automatically when the underlying `.mbtiles` file is
-    /// replaced in place under a stable source `id`.  Best-effort: if
-    /// `metadata()` fails (e.g. file deleted), mtime/size fall back to
-    /// `0` and we still get a deterministic fingerprint for the path.
-    fn content_version(&self) -> crate::cache::ContentVersion {
-        let path = &self.cfg.path;
-        let path_str = path.to_string_lossy();
-        let (mtime, size) = std::fs::metadata(path)
-            .ok()
-            .map(|m| {
-                let mtime = m
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                (mtime, m.len())
-            })
-            .unwrap_or((0, 0));
-        let mut buf = Vec::with_capacity(path_str.len() + 17);
-        buf.extend_from_slice(path_str.as_bytes());
-        buf.push(0);
-        buf.extend_from_slice(&mtime.to_le_bytes());
-        buf.extend_from_slice(&size.to_le_bytes());
-        crate::cache::ContentVersion::from_input(&buf)
+    fn content_version(&self) -> ContentVersion {
+        self.content_version
     }
 
     async fn get_tile(
@@ -253,17 +265,24 @@ impl TileSource for MbtilesSource {
         xyz: TileCoord,
         _query: Option<&TileQuery<'_>>,
     ) -> MaptileResult<TileResponse> {
-        // MbtilesPool::get_tile handles TMS↔XYZ y-flip internally.
-        let bytes = self
-            .pool
-            .get_tile(xyz.z, xyz.x, xyz.y)
-            .await
+        self.check_file()?;
+        // A pooled connection may be opened concurrently with replacement.
+        let bytes = self.pool.get_tile(xyz.z, xyz.x, xyz.y).await;
+        self.check_file()?;
+        let bytes = bytes
             .map_err(MaptileError::backend)?
             .ok_or(MaptileError::TileNotFound(xyz.z, xyz.x, xyz.y))?;
         Ok(TileResponse {
             data: Bytes::from(bytes),
             info: self.info,
-            last_modified: self.last_modified,
+            last_modified: Some(
+                self.stamp
+                    .wal
+                    .as_ref()
+                    .map_or(self.stamp.main.modified, |wal| {
+                        self.stamp.main.modified.max(wal.modified)
+                    }),
+            ),
         })
     }
 }

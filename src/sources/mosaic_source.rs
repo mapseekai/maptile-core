@@ -23,11 +23,11 @@ use object_store::ObjectStore;
 use tilejson::{TileJSON, tilejson};
 
 use crate::error::{MaptileError, MaptileResult};
-use crate::raster::agtiff_style::to_tile_style;
+use crate::raster::agtiff_style::to_mosaic_tile_style;
 use crate::raster::style::RasterOutputFormat;
 use crate::sources::{
     MosaicPixelSelection, TileCoord, TileEncoding, TileFormat, TileInfo, TileQuery, TileResponse,
-    TileSource,
+    TileSource, effective_pixel_selection,
 };
 
 // ---------------------------------------------------------------------------
@@ -94,16 +94,11 @@ fn project_bounds_to_wgs84(bounds: [f64; 4], _srid: i32) -> MaptileResult<[f64; 
 /// Returns [`MaptileError::Config`] unless `s` is one of the five canonical
 /// lower-case values.
 pub fn pixel_selection_from_str(s: &str) -> MaptileResult<MosaicPixelSelection> {
-    match s {
-        "first" => Ok(MosaicPixelSelection::First),
-        "highest" => Ok(MosaicPixelSelection::Highest),
-        "lowest" => Ok(MosaicPixelSelection::Lowest),
-        "mean" => Ok(MosaicPixelSelection::Mean),
-        "median" => Ok(MosaicPixelSelection::Median),
-        _ => Err(MaptileError::Config(format!(
+    MosaicPixelSelection::from_name(s).ok_or_else(|| {
+        MaptileError::Config(format!(
             "invalid mosaic pixel_selection {s:?}; expected first/highest/lowest/mean/median"
-        ))),
-    }
+        ))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -127,9 +122,10 @@ pub struct MosaicSourceConfig {
     pub id: String,
     pub members: Vec<MosaicMember>,
     pub pixel_selection: MosaicPixelSelection,
-    /// Union WGS84 bbox.  `None` → union of member `bbox_wgs84`.
+    /// Explicit union bbox in `srid` (WGS84 by default).
+    /// `None` → union of member `bbox_wgs84`.
     pub bounds: Option<[f64; 4]>,
-    /// SRID hint (informational).
+    /// CRS of the explicit `bounds`, when supplied.
     pub srid: Option<i32>,
     /// Object-store backend shared by all members. `Some` ⇒ each member's
     /// `url` is a *decoded object key* within this single store (single
@@ -217,7 +213,11 @@ impl MosaicSource {
                 },
             )
         });
-        let tilejson_bounds = bounds_for_tilejson(stored_bounds, cfg.srid)?;
+        let tilejson_bounds = if has_explicit_bounds {
+            bounds_for_tilejson(stored_bounds, cfg.srid)?
+        } else {
+            stored_bounds
+        };
 
         // Build AssetRef vec.
         let assets: Vec<AssetRef> = cfg
@@ -333,7 +333,10 @@ impl TileSource for MosaicSource {
             MaptileError::InvalidRequest("canonical raster style is required".into())
         })?;
 
-        let tile_style = to_tile_style(style)?;
+        let tile_style = to_mosaic_tile_style(
+            style,
+            effective_pixel_selection(query, self.pixel_selection),
+        )?;
         let out_format = out_tile_format(style.format);
 
         let tile: Bytes = self

@@ -4,32 +4,93 @@ use crate::cache::ContentVersion;
 use crate::error::{MaptileError, MaptileResult};
 use crate::sources::archive_inspection::ArchiveSourceType;
 use crate::sources::pmtiles::{
-    PmtilesConfig, archive_content_version, archive_tile_etag, directory_cache,
-    pmt_compression_to_encoding, pmt_tile_type_to_format,
+    PmtilesConfig, archive_content_version, archive_tile_etag, pmt_compression_to_encoding,
+    pmt_tile_type_to_format, reader::Reader,
 };
-use crate::sources::{
-    SourceKind, TileCoord, TileEncoding, TileInfo, TileQuery, TileResponse, TileSource,
-};
+use crate::sources::{SourceKind, TileCoord, TileInfo, TileQuery, TileResponse, TileSource};
 use async_trait::async_trait;
-use bytes::Bytes;
-use object_store::ObjectStoreExt;
+use bytes::BytesMut;
+use futures_util::TryStreamExt;
+use object_store::{GetOptions, GetRange, ObjectStore, path::Path};
+use pmtiles::{AsyncBackend, BackendResponse, PmtError, PmtResult};
 use std::sync::Arc;
-use std::time::Duration;
 use tilejson::TileJSON;
 
-/// Type alias for a cloud-backed PMTiles reader with a directory cache.
-type CloudReader = pmtiles::AsyncPmTilesReader<pmtiles::ObjectStoreBackend, pmtiles::MokaCache>;
+struct CloudBackend {
+    store: Arc<dyn ObjectStore>,
+    path: Path,
+}
+
+impl AsyncBackend for CloudBackend {
+    async fn read(&self, offset: usize, length: usize) -> PmtResult<BackendResponse> {
+        let start = offset as u64;
+        let end = (offset + length) as u64;
+        let response = self
+            .store
+            .get_opts(
+                &self.path,
+                GetOptions {
+                    range: Some(GetRange::Bounded(start..end)),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        let size = response.meta.size;
+        if response.range != (start..end.min(size)) || start >= size {
+            return Err(PmtError::RangeRequestsUnsupported);
+        }
+        let version = response
+            .meta
+            .version
+            .as_ref()
+            .filter(|version| !version.is_empty() && version.as_str() != "null")
+            .map(|version| format!("version:{size}:{version}"))
+            .or_else(|| {
+                response
+                    .meta
+                    .e_tag
+                    .as_ref()
+                    .filter(|etag| !etag.is_empty() && !etag.starts_with("W/"))
+                    .map(|etag| format!("etag:{size}:{etag}"))
+            })
+            .unwrap_or_else(|| {
+                format!(
+                    "modified:{size}:{}",
+                    response.meta.last_modified.to_rfc3339()
+                )
+            });
+        let expected = (response.range.end - start) as usize;
+        let mut body = response.into_stream();
+        let mut bytes = BytesMut::new();
+        while let Some(chunk) = body.try_next().await? {
+            if chunk.len() > expected - bytes.len() {
+                return Err(PmtError::ResponseBodyTooLong(
+                    bytes.len().saturating_add(chunk.len()),
+                    expected,
+                ));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        if bytes.len() != expected {
+            return Err(PmtError::UnexpectedNumberOfBytesReturned(
+                expected,
+                bytes.len(),
+            ));
+        }
+        Ok(BackendResponse {
+            bytes: bytes.freeze(),
+            data_version_string: Some(version),
+        })
+    }
+}
 
 /// Cloud object storage PMTiles source backed by any `object_store` implementation.
+#[derive(Clone)]
 pub struct CloudPmtilesSource {
     cfg: PmtilesConfig,
-    // `pmtiles::AsyncPmTilesReader::get_tile` takes `&self` and the reader
-    // is opened once at construction; an `Arc` is enough and avoids
-    // serialising tile reads through a `RwLock` held across `.await`.
-    reader: Arc<CloudReader>,
+    reader: Arc<Reader<CloudBackend>>,
     tj: TileJSON,
     info: TileInfo,
-    encoding: TileEncoding,
     content_version: ContentVersion,
 }
 
@@ -62,33 +123,17 @@ impl CloudPmtilesSource {
         let object_path =
             object_store::path::Path::from_url_path(url.path()).map_err(MaptileError::backend)?;
 
-        let metadata = tokio::time::timeout(Duration::from_secs(5), store.head(&object_path))
-            .await
-            .ok()
-            .and_then(Result::ok);
-        let validator = metadata.as_ref().map(|metadata| {
-            if let Some(version) = metadata.version.as_ref().filter(|v| !v.is_empty()) {
-                format!("version:{version}")
-            } else if let Some(etag) = metadata.e_tag.as_ref().filter(|etag| !etag.is_empty()) {
-                format!("etag:{etag}")
-            } else {
-                format!("modified:{}", metadata.last_modified.to_rfc3339())
-            }
-        });
-        let content_version = archive_content_version(
-            &cfg.path,
-            validator.as_deref(),
-            metadata.as_ref().map(|metadata| metadata.size),
-        );
+        let reader = Reader::open(CloudBackend {
+            store,
+            path: object_path,
+        })
+        .await?;
+        let stable = reader
+            .version()
+            .filter(|version| !version.starts_with("modified:"));
+        let content_version = archive_content_version(&cfg.path, stable);
 
-        // ObjectStoreBackend::new takes Box<dyn ObjectStore>, not Arc.
-        let backend = pmtiles::ObjectStoreBackend::new(Box::from(store), object_path);
-        let cache = directory_cache();
-        let reader = pmtiles::AsyncPmTilesReader::try_from_cached_source(backend, cache)
-            .await
-            .map_err(MaptileError::backend)?;
-
-        let header = reader.get_header();
+        let header = &reader.header;
         let native_format = pmt_tile_type_to_format(header.tile_type)?;
         let encoding = pmt_compression_to_encoding(header.tile_compression)?;
 
@@ -96,9 +141,8 @@ impl CloudPmtilesSource {
             format: cfg.serve_as.unwrap_or(native_format),
             encoding,
         };
-        let reader = Arc::new(reader);
         let tj = super::read_tilejson(
-            reader.clone(),
+            &reader,
             cfg.description.as_deref(),
             TileInfo {
                 format: native_format,
@@ -109,10 +153,9 @@ impl CloudPmtilesSource {
 
         Ok(Self {
             cfg,
-            reader,
+            reader: Arc::new(reader),
             tj,
             info,
-            encoding,
             content_version,
         })
     }
@@ -141,14 +184,7 @@ impl TileSource for CloudPmtilesSource {
     }
 
     fn clone_source(&self) -> Box<dyn TileSource> {
-        Box::new(CloudPmtilesSource {
-            cfg: self.cfg.clone(),
-            reader: self.reader.clone(),
-            tj: self.tj.clone(),
-            info: self.info,
-            encoding: self.encoding,
-            content_version: self.content_version,
-        })
+        Box::new(self.clone())
     }
 
     async fn get_tile(
@@ -156,12 +192,12 @@ impl TileSource for CloudPmtilesSource {
         xyz: TileCoord,
         _query: Option<&TileQuery<'_>>,
     ) -> MaptileResult<TileResponse> {
-        let coord = pmtiles::TileCoord::new(xyz.z, xyz.x, xyz.y).map_err(MaptileError::backend)?;
-        let bytes: Bytes = self
+        let coord = pmtiles::TileCoord::new(xyz.z, xyz.x, xyz.y)
+            .map_err(|_| MaptileError::TileNotFound(xyz.z, xyz.x, xyz.y))?;
+        let bytes = self
             .reader
             .get_tile(coord)
-            .await
-            .map_err(MaptileError::backend)?
+            .await?
             .ok_or(MaptileError::TileNotFound(xyz.z, xyz.x, xyz.y))?;
         Ok(TileResponse {
             data: bytes,

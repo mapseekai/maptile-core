@@ -91,6 +91,14 @@ impl CacheZoomRange {
         self.minzoom.is_none_or(|m| zoom >= m) && self.maxzoom.is_none_or(|m| zoom <= m)
     }
 
+    #[must_use]
+    pub(crate) fn intersection(self, other: Self) -> Self {
+        Self {
+            minzoom: self.minzoom.max(other.minzoom),
+            maxzoom: [self.maxzoom, other.maxzoom].into_iter().flatten().min(),
+        }
+    }
+
     /// Fill any `None` field of `self` with the corresponding field
     /// from `other`. Pre-set fields are kept as-is.
     #[must_use]

@@ -6,6 +6,15 @@
 
 use std::str::FromStr;
 
+pub(crate) const TILE_SIZE: u32 = 512;
+
+pub(crate) fn mercator_y(lat: f64) -> f64 {
+    lat.clamp(-85.051_128_779_806_6, 85.051_128_779_806_6)
+        .to_radians()
+        .tan()
+        .asinh()
+}
+
 /// Maximum allowed image dimension (width or height) in pixels — guards
 /// against memory-exhaustion DoS via oversized static map requests.
 pub const MAX_IMAGE_DIMENSION: u32 = 4096;
@@ -136,8 +145,8 @@ impl RenderRequest {
             style_json: style_json.into(),
             isolate_native_state: false,
             camera: RenderCamera::new(lon, lat, z as f64),
-            width: 512,
-            height: 512,
+            width: TILE_SIZE,
+            height: TILE_SIZE,
             scale,
             format,
             #[cfg(feature = "render")]
@@ -151,22 +160,26 @@ impl RenderRequest {
         if self.width == 0 || self.height == 0 {
             return Err(RenderRequestError::ZeroDimension);
         }
-        if self.width > MAX_IMAGE_DIMENSION || self.height > MAX_IMAGE_DIMENSION {
-            return Err(RenderRequestError::TooLarge {
-                width: self.width,
-                height: self.height,
-                max: MAX_IMAGE_DIMENSION,
-            });
-        }
         if self.scale == 0 || self.scale > MAX_SCALE {
             return Err(RenderRequestError::InvalidScale {
                 scale: self.scale,
                 max: MAX_SCALE,
             });
         }
+        let width = self.width.saturating_mul(u32::from(self.scale));
+        let height = self.height.saturating_mul(u32::from(self.scale));
+        if width > MAX_IMAGE_DIMENSION || height > MAX_IMAGE_DIMENSION {
+            return Err(RenderRequestError::TooLarge {
+                width,
+                height,
+                max: MAX_IMAGE_DIMENSION,
+            });
+        }
         if !self.camera.lon.is_finite()
             || !self.camera.lat.is_finite()
             || !self.camera.zoom.is_finite()
+            || !self.camera.bearing.is_finite()
+            || !self.camera.pitch.is_finite()
         {
             return Err(RenderRequestError::NonFiniteCamera);
         }

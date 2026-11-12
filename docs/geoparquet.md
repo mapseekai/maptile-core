@@ -43,7 +43,7 @@ async fn read_tile() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 }
 ```
 
-`geometry_column = None` 保留旧归档模式，在打开时建立内存瓦片索引。远程打开只支持几何模式，必须指定 `geometry_column`。
+`geometry_column = None` 使用预编码归档模式。打开时只读取配置的 `z`、`x`、`y` 和瓦片列，并建立内存索引。这四列使用无压缩的 Parquet 列块，瓦片内容可按 `encoding` 压缩。归档最多扫描 400 万行。单瓦片上限为 `query_options.max_tile_bytes`，索引及瓦片使用 `query_options.memory_limit_mb` 的一半作为预算，其余用于读取和解码。超出上限时打开失败。远程打开只支持几何模式，必须指定 `geometry_column`。
 
 ## HTTP 和对象存储
 

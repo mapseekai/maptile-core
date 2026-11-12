@@ -215,7 +215,7 @@ struct WorkerState {
 }
 
 impl RenderBackend for WorkerState {
-    type Output = maplibre_native::Image;
+    type Output = RenderedImage;
 
     fn render(&mut self, request: &RenderRequest) -> MaptileResult<Self::Output> {
         if request.isolate_native_state {
@@ -224,7 +224,7 @@ impl RenderBackend for WorkerState {
             // Pixel caching is handled above the renderer, after live permission checks.
             let mut renderer =
                 MapLibreRenderer::new(request.width, request.height, f32::from(request.scale))?;
-            return renderer.render_image(request);
+            return renderer.render(request);
         }
         if !self.renderers.contains_key(&request.scale) {
             let renderer = MapLibreRenderer::new(
@@ -237,7 +237,7 @@ impl RenderBackend for WorkerState {
         self.renderers
             .get_mut(&request.scale)
             .expect("renderer was inserted for the requested scale")
-            .render_image(request)
+            .render(request)
     }
 
     fn reset(&mut self) {
@@ -246,13 +246,13 @@ impl RenderBackend for WorkerState {
 }
 
 pub struct RendererPool {
-    workers: WorkerGroup<maplibre_native::Image>,
+    workers: WorkerGroup<RenderedImage>,
 }
 
 #[cfg(debug_assertions)]
 #[doc(hidden)]
 pub struct RenderQueueAdmissionForTest {
-    _receiver: tokio::sync::oneshot::Receiver<MaptileResult<maplibre_native::Image>>,
+    _receiver: tokio::sync::oneshot::Receiver<MaptileResult<RenderedImage>>,
 }
 
 #[cfg(debug_assertions)]
@@ -321,7 +321,7 @@ impl RendererPool {
         }
 
         impl RenderBackend for BlockingBackend {
-            type Output = maplibre_native::Image;
+            type Output = RenderedImage;
 
             fn render(&mut self, _request: &RenderRequest) -> MaptileResult<Self::Output> {
                 if self.first.swap(false, Ordering::SeqCst) {
@@ -416,27 +416,20 @@ impl RendererPool {
         keepalive: Option<RenderKeepalive>,
     ) -> MaptileResult<RenderedImage> {
         let request = request.validate().map_err(MaptileError::from)?;
-        let worker_request = request.clone();
         let (response, receiver) = tokio::sync::oneshot::channel();
         submit_with_timeout(
             self.workers.sender(),
             RenderJob {
-                request: worker_request,
+                request,
                 response,
                 keepalive,
             },
             admission_timeout,
         )
         .await?;
-        let image = receiver
+        receiver
             .await
-            .map_err(|_| MaptileError::Render("render worker lost the response".into()))??;
-
-        tokio::task::spawn_blocking(move || postprocess(image, request))
-            .await
-            .map_err(|error| {
-                MaptileError::Render(format!("render post-processing task failed: {error}"))
-            })?
+            .map_err(|_| MaptileError::Render("render worker lost the response".into()))?
     }
 }
 
@@ -461,13 +454,6 @@ async fn submit_for_test_with_timeout<O: Send + 'static>(
     admission_timeout: std::time::Duration,
 ) -> MaptileResult<()> {
     submit_with_timeout(sender, job, admission_timeout).await
-}
-
-fn postprocess(
-    image: maplibre_native::Image,
-    request: RenderRequest,
-) -> MaptileResult<RenderedImage> {
-    crate::render::native::postprocess_image(image.as_image(), &request)
 }
 
 #[cfg(test)]

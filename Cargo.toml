@@ -68,7 +68,7 @@ tilejson = "0.4"
 tokio = { version = "1.53.1", features = ["full"] }
 tracing = "0.1"
 url = { version = "2", optional = true }
-uuid = { version = "1", features = ["v4"], optional = true }
+uuid = { version = "1", features = ["v4"] }
 tempfile = { version = "3", optional = true }
 zip = { version = "9.5.1", default-features = false, features = ["deflate-flate2"], optional = true }
 
@@ -76,7 +76,7 @@ zip = { version = "9.5.1", default-features = false, features = ["deflate-flate2
 default = []
 cloud = ["dep:object_store", "dep:url", "pmtiles/object-store"]
 duckdb = ["dep:duckdb"]
-geoparquet = ["dep:parquet", "dep:arrow-array", "dep:arrow-schema", "dep:duckdb", "duckdb/parquet", "dep:axum", "dep:reqwest", "dep:object_store", "dep:url", "dep:uuid"]
+geoparquet = ["dep:parquet", "dep:arrow-array", "dep:arrow-schema", "dep:duckdb", "duckdb/parquet", "dep:axum", "dep:reqwest", "dep:object_store", "dep:url"]
 local-vector = ["geoparquet", "dep:tempfile", "dep:zip"]
 metrics    = ["dep:prometheus"]
 mlt        = ["dep:mlt-core", "dep:geo-types"]

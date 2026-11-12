@@ -1,5 +1,4 @@
-//! Bridge between [`RasterImage`] and raw RGBA8 byte buffers — the wire
-//! format that [`crate::render::encode::encode_rgba`] consumes.
+//! Bridge between [`RasterImage`] and the RGBA8 buffers used by image encoders.
 
 use crate::error::MaptileResult;
 use crate::raster::image::RasterImage;

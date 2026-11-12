@@ -12,7 +12,8 @@
 //! [`crate::render::RenderRequest`] (or returns the bbox for an external
 //! auto-fit pass that consumes overlays).
 
-use crate::render::types::{RenderCamera, RenderFormat, RenderRequest};
+use crate::render::types::{RenderCamera, RenderFormat, RenderRequest, TILE_SIZE, mercator_y};
+use std::f64::consts::TAU;
 use std::str::FromStr;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -179,7 +180,10 @@ impl StaticTarget {
                 max_lat,
             } => {
                 let lon = (min_lon + max_lon) / 2.0;
-                let lat = (min_lat + max_lat) / 2.0;
+                let lat = ((mercator_y(min_lat) + mercator_y(max_lat)) / 2.0)
+                    .sinh()
+                    .atan()
+                    .to_degrees();
                 let zoom = bbox_to_zoom(min_lon, min_lat, max_lon, max_lat, width, height);
                 RenderCamera::new(lon, lat, zoom)
             }
@@ -210,19 +214,11 @@ fn bbox_to_zoom(
     width: u32,
     height: u32,
 ) -> f64 {
-    const WORLD_PX_AT_Z0: f64 = 512.0;
-
+    let world = f64::from(TILE_SIZE);
     let lon_span = (max_lon - min_lon).abs().max(1e-9);
-    let zoom_lon = (WORLD_PX_AT_Z0 * (width as f64 / 360.0) / lon_span).log2();
-
-    // Latitude span via Mercator projection y values.
-    let to_y = |lat: f64| {
-        let r = lat.to_radians();
-        ((1.0 + r.sin()) / (1.0 - r.sin())).ln() / 2.0
-    };
-    let lat_span = (to_y(max_lat) - to_y(min_lat)).abs().max(1e-9);
-    let zoom_lat =
-        (WORLD_PX_AT_Z0 * (height as f64 / (2.0 * std::f64::consts::PI)) / lat_span).log2();
+    let zoom_lon = (f64::from(width) * 360.0 / (world * lon_span)).log2();
+    let lat_span = (mercator_y(max_lat) - mercator_y(min_lat)).abs().max(1e-9);
+    let zoom_lat = (f64::from(height) * TAU / (world * lat_span)).log2();
 
     zoom_lon.min(zoom_lat).clamp(0.0, 22.0)
 }
@@ -300,25 +296,37 @@ mod tests {
     }
 
     #[test]
-    fn bbox_yields_finite_zoom() {
-        let z = bbox_to_zoom(-123.0, 37.0, -122.0, 38.0, 800, 600);
-        assert!(z.is_finite());
-        assert!(z > 0.0 && z < 22.0);
+    fn bbox_zoom_contains_the_projected_extent() {
+        let z = bbox_to_zoom(
+            -180.0,
+            -85.051_128_779_806_6,
+            180.0,
+            85.051_128_779_806_6,
+            512,
+            512,
+        );
+        assert!(z.abs() < 1e-9);
+        let z = bbox_to_zoom(-10.0, 10.0, 10.0, 60.0, 800, 300);
+        let world = f64::from(TILE_SIZE) * z.exp2();
+        assert!(world * 20.0 / 360.0 <= 800.0 + 1e-9);
+        assert!(world * (mercator_y(60.0) - mercator_y(10.0)) / TAU <= 300.0 + 1e-9);
     }
 
     #[test]
     fn bbox_into_request_centers_correctly() {
         let target = StaticTarget::BoundingBox {
             min_lon: -10.0,
-            min_lat: -5.0,
+            min_lat: 10.0,
             max_lon: 10.0,
-            max_lat: 5.0,
+            max_lat: 60.0,
         };
         let req = target
             .into_request("{}", 512, 512, 1, RenderFormat::Png)
             .unwrap();
         assert!(req.camera.lon.abs() < 1e-9);
-        assert!(req.camera.lat.abs() < 1e-9);
+        assert!(
+            (2.0 * mercator_y(req.camera.lat) - mercator_y(10.0) - mercator_y(60.0)).abs() < 1e-9
+        );
     }
 
     #[test]

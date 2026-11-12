@@ -345,6 +345,51 @@ async fn batch_preserves_projected_properties_feature_ids_and_filter_validation(
 }
 
 #[tokio::test]
+async fn geographic_bbox_matches_projected_single_and_batch_tiles() {
+    use maptile_core::sources::{TileQuery, mvt};
+
+    let Some(dsn) = common::postgres::pg_dsn() else {
+        return;
+    };
+    let pool = make_pool(&dsn).await;
+    let query = TileQuery {
+        bbox: Some([0.9, 0.9, 1.1, 1.1]),
+        ..TileQuery::default()
+    };
+    let coord = TileCoord { z: 4, x: 8, y: 7 };
+    for srid in [4326, 3857, 32631] {
+        let guard = common::postgres::SchemaGuard::create(&dsn).await;
+        create_simple_table(&dsn, &guard.name, "bbox").await;
+        if srid != 4326 {
+            pool.get()
+                .await
+                .unwrap()
+                .batch_execute(&format!(
+                    "ALTER TABLE \"{}\".bbox ALTER COLUMN geom TYPE geometry(Point,{srid}) \
+                 USING ST_Transform(geom,{srid})",
+                    guard.name
+                ))
+                .await
+                .unwrap();
+        }
+        let mut config = cfg_for(&guard.name, "bbox");
+        config.id_column = Some("id".into());
+        let source = PostgresTableSource::open(pool.clone(), config)
+            .await
+            .unwrap();
+        let single = source.get_tile(coord, Some(&query)).await.unwrap();
+        let batch = source
+            .read_tile_batch(&[coord], Some(&query))
+            .await
+            .unwrap();
+        assert_eq!(single.data, batch[0].data, "SRID {srid}");
+        let tile = mvt::decode(&single.data).unwrap();
+        assert_eq!(tile.layers[0].features.len(), 1, "SRID {srid}");
+        assert_eq!(tile.layers[0].features[0].id, Some(2));
+    }
+}
+
+#[tokio::test]
 async fn cancelled_batch_stops_sql_and_releases_its_pool_slot() {
     use std::time::Duration;
     let Some(dsn) = common::postgres::pg_dsn() else {

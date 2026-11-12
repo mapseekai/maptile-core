@@ -23,7 +23,7 @@ async fn write_minimal_pmtiles_fixture(path: &std::path::Path) {
     let mut writer = PmTilesWriter::new(TileType::Mvt)
         .tile_compression(Compression::None)
         .internal_compression(Compression::None)
-        .metadata(r#"{"name":"test","vector_layers":[]}"#)
+        .metadata(r#"{"name":"test","vector_layers":[{"id":"sample","fields":{}}]}"#)
         .create(file)
         .expect("create PMTiles writer");
 
@@ -45,6 +45,75 @@ async fn open_succeeds_on_valid_file() {
     };
     let src = LocalPmtilesSource::open(cfg).await.expect("open");
     assert_eq!(src.id(), "s");
+}
+
+#[tokio::test]
+async fn compact_archive_smaller_than_initial_range_serves_tiles() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    write_minimal_pmtiles_fixture(file.path()).await;
+    let mut archive = std::fs::read(file.path()).unwrap();
+    let field = |bytes: &[u8], at| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+    let root_end = (field(&archive, 8) + field(&archive, 16)) as usize;
+    let metadata_offset = field(&archive, 24) as usize;
+    let padding = (metadata_offset - root_end) as u64;
+    for offset_field in [24, 40, 56] {
+        let offset = field(&archive, offset_field);
+        if offset >= metadata_offset as u64 {
+            archive[offset_field..offset_field + 8]
+                .copy_from_slice(&(offset - padding).to_le_bytes());
+        }
+    }
+    archive.drain(root_end..metadata_offset);
+    assert!(archive.len() < 16_384);
+    std::fs::write(file.path(), archive).unwrap();
+    let source = LocalPmtilesSource::open(PmtilesConfig {
+        id: "compact".into(),
+        path: file.path().to_string_lossy().into(),
+        serve_as: None,
+        description: None,
+    })
+    .await
+    .unwrap();
+    assert_eq!(source.tilejson().name.as_deref(), Some("test"));
+    let tile = source
+        .get_tile(TileCoord { z: 0, x: 0, y: 0 }, None)
+        .await
+        .unwrap();
+    assert_eq!(tile.data.as_ref(), b"test-tile-data");
+}
+
+#[tokio::test]
+async fn tiles_are_found_through_leaf_directories() {
+    use pmtiles::{Compression, PmTilesWriter, TileId, TileType};
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let mut writer = PmTilesWriter::new(TileType::Mvt)
+        .tile_compression(Compression::None)
+        .internal_compression(Compression::None)
+        .metadata(r#"{"name":"leaves","vector_layers":[{"id":"leaves","fields":{}}]}"#)
+        .create(file.reopen().unwrap())
+        .unwrap();
+    for id in 0u64..5_000 {
+        writer
+            .add_tile(TileId::new(id).unwrap().into(), &id.to_le_bytes())
+            .unwrap();
+    }
+    writer.finalize().unwrap();
+    let bytes = std::fs::read(file.path()).unwrap();
+    assert_ne!(u64::from_le_bytes(bytes[48..56].try_into().unwrap()), 0);
+
+    let source = LocalPmtilesSource::open(PmtilesConfig {
+        id: "leaves".into(),
+        path: file.path().to_string_lossy().into_owned(),
+        serve_as: None,
+        description: None,
+    })
+    .await
+    .unwrap();
+    let expected = 4_999u64;
+    let coord: pmtiles::TileCoord = TileId::new(expected).unwrap().into();
+    let (z, x, y) = (coord.z(), coord.x(), coord.y());
+    let tile = source.get_tile(TileCoord { z, x, y }, None).await.unwrap();
+    assert_eq!(tile.data.as_ref(), expected.to_le_bytes());
 }
 
 #[tokio::test]

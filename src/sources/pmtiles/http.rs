@@ -1,32 +1,121 @@
 //! HTTP remote PMTiles source.
 
+use super::{
+    PmtilesConfig, archive_content_version, archive_tile_etag, pmt_compression_to_encoding,
+    pmt_tile_type_to_format,
+    reader::{IO_TIMEOUT, Reader},
+};
 use crate::cache::ContentVersion;
 use crate::error::{MaptileError, MaptileResult};
 use crate::sources::archive_inspection::ArchiveSourceType;
-use crate::sources::pmtiles::{
-    PmtilesConfig, archive_content_version, archive_tile_etag, directory_cache,
-    pmt_compression_to_encoding, pmt_tile_type_to_format,
-};
-use crate::sources::{
-    SourceKind, TileCoord, TileEncoding, TileInfo, TileQuery, TileResponse, TileSource,
-};
+use crate::sources::{SourceKind, TileCoord, TileInfo, TileQuery, TileResponse, TileSource};
 use async_trait::async_trait;
+use bytes::BytesMut;
+use pmtiles::reqwest::{self, StatusCode, header};
+use pmtiles::{AsyncBackend, BackendResponse, PmtError, PmtResult};
 use std::sync::Arc;
-use std::time::Duration;
 use tilejson::TileJSON;
 
-/// HTTP PMTiles reader with a bounded `MokaCache` directory cache.
-type HttpReader = pmtiles::AsyncPmTilesReader<pmtiles::HttpBackend, pmtiles::MokaCache>;
+struct HttpBackend {
+    client: reqwest::Client,
+    url: String,
+}
 
+impl AsyncBackend for HttpBackend {
+    async fn read(&self, offset: usize, length: usize) -> PmtResult<BackendResponse> {
+        let end = offset + length - 1;
+        let mut response = self
+            .client
+            .get(&self.url)
+            .header(header::RANGE, format!("bytes={offset}-{end}"))
+            .header(header::ACCEPT_ENCODING, "identity")
+            .send()
+            .await
+            .map_err(reqwest::Error::without_url)?
+            .error_for_status()
+            .map_err(reqwest::Error::without_url)?;
+        if response.status() != StatusCode::PARTIAL_CONTENT {
+            return Err(PmtError::RangeRequestsUnsupported);
+        }
+        let (expected, total) = content_range(response.headers(), offset, end)?;
+        let version = response
+            .headers()
+            .get(header::ETAG)
+            .and_then(|etag| etag.to_str().ok())
+            .filter(|etag| etag.starts_with('"') && etag.ends_with('"'))
+            .map(|etag| format!("etag:{total}:{etag}"))
+            .or_else(|| {
+                response
+                    .headers()
+                    .get(header::LAST_MODIFIED)
+                    .and_then(|value| value.to_str().ok())
+                    .map(|value| format!("modified:{total}:{value}"))
+            })
+            .unwrap_or_else(|| format!("length:{total}"));
+        let mut bytes = BytesMut::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(reqwest::Error::without_url)?
+        {
+            if chunk.len() > expected - bytes.len() {
+                return Err(PmtError::ResponseBodyTooLong(
+                    bytes.len().saturating_add(chunk.len()),
+                    expected,
+                ));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        if bytes.len() != expected {
+            return Err(PmtError::UnexpectedNumberOfBytesReturned(
+                expected,
+                bytes.len(),
+            ));
+        }
+        Ok(BackendResponse {
+            bytes: bytes.freeze(),
+            data_version_string: Some(version),
+        })
+    }
+}
+
+fn content_range(
+    headers: &header::HeaderMap,
+    offset: usize,
+    end: usize,
+) -> PmtResult<(usize, u64)> {
+    let invalid = || {
+        PmtError::Reading(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid PMTiles Content-Range",
+        ))
+    };
+    let value = headers
+        .get(header::CONTENT_RANGE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("bytes "))
+        .ok_or_else(invalid)?;
+    let (range, total) = value.split_once('/').ok_or_else(invalid)?;
+    let total: u64 = total.parse().map_err(|_| invalid())?;
+    let (first, last) = range.split_once('-').ok_or_else(invalid)?;
+    let first: usize = first.parse().map_err(|_| invalid())?;
+    let last: usize = last.parse().map_err(|_| invalid())?;
+    if first != offset
+        || last < first
+        || last as u64 != (end as u64).min(total.saturating_sub(1))
+        || total == 0
+    {
+        return Err(invalid());
+    }
+    Ok((last - first + 1, total))
+}
+
+#[derive(Clone)]
 pub struct HttpPmtilesSource {
     cfg: PmtilesConfig,
-    // `pmtiles::AsyncPmTilesReader::get_tile` takes `&self` and the reader
-    // is opened once at construction; `Arc` is sufficient and avoids
-    // serialising tile reads through a `RwLock` held across `.await`.
-    reader: Arc<HttpReader>,
+    reader: Arc<Reader<HttpBackend>>,
     tj: TileJSON,
     info: TileInfo,
-    encoding: TileEncoding,
     content_version: ContentVersion,
 }
 
@@ -34,7 +123,6 @@ impl std::fmt::Debug for HttpPmtilesSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HttpPmtilesSource")
             .field("id", &self.cfg.id)
-            .field("url", &self.cfg.path)
             .field("info", &self.info)
             .finish_non_exhaustive()
     }
@@ -42,82 +130,36 @@ impl std::fmt::Debug for HttpPmtilesSource {
 
 impl HttpPmtilesSource {
     pub async fn open(cfg: PmtilesConfig) -> MaptileResult<Self> {
-        // Use the reqwest version re-exported by pmtiles to avoid version mismatch.
-        let client = pmtiles::reqwest::Client::builder()
+        let client = reqwest::Client::builder()
             .user_agent(concat!("maptile-core/", env!("CARGO_PKG_VERSION")))
+            .timeout(IO_TIMEOUT)
             .build()
             .map_err(MaptileError::backend)?;
-
-        // HEAD is best-effort: origins and signed URLs may only support GET.
-        // Bound the extra request and isolate this generation when validators
-        // cannot be obtained, rather than trusting unchanged header bounds.
-        let metadata = client
-            .head(&cfg.path)
-            .timeout(Duration::from_secs(5))
-            .send()
-            .await
-            .ok()
-            .filter(|response| response.status().is_success())
-            .map(|response| response.headers().clone());
-        let content_version = http_content_version(&cfg.path, metadata.as_ref());
-
-        let cache = directory_cache();
-        let reader: HttpReader =
-            pmtiles::AsyncPmTilesReader::new_with_cached_url(cache, client, cfg.path.as_str())
-                .await
-                .map_err(MaptileError::backend)?;
-
-        let header = reader.get_header();
-        let native_format = pmt_tile_type_to_format(header.tile_type)?;
-        let encoding = pmt_compression_to_encoding(header.tile_compression)?;
-
-        let info = TileInfo {
-            format: cfg.serve_as.unwrap_or(native_format),
-            encoding,
-        };
-        let reader = Arc::new(reader);
-        let tj = super::read_tilejson(
-            reader.clone(),
-            cfg.description.as_deref(),
-            TileInfo {
-                format: native_format,
-                encoding,
-            },
-        )
+        let reader = Reader::open(HttpBackend {
+            client,
+            url: cfg.path.clone(),
+        })
         .await?;
-
+        let stable = reader
+            .version()
+            .filter(|version| version.starts_with("etag:"));
+        let content_version = archive_content_version(&cfg.path, stable);
+        let native_info = TileInfo {
+            format: pmt_tile_type_to_format(reader.header.tile_type)?,
+            encoding: pmt_compression_to_encoding(reader.header.tile_compression)?,
+        };
+        let tj = super::read_tilejson(&reader, cfg.description.as_deref(), native_info).await?;
         Ok(Self {
+            info: TileInfo {
+                format: cfg.serve_as.unwrap_or(native_info.format),
+                ..native_info
+            },
             cfg,
-            reader,
+            reader: Arc::new(reader),
             tj,
-            info,
-            encoding,
             content_version,
         })
     }
-}
-
-fn http_content_version(
-    path: &str,
-    headers: Option<&pmtiles::reqwest::header::HeaderMap>,
-) -> ContentVersion {
-    use pmtiles::reqwest::header::{CONTENT_LENGTH, ETAG, LAST_MODIFIED};
-    let length = headers
-        .and_then(|headers| headers.get(CONTENT_LENGTH))
-        .and_then(|length| length.to_str().ok())
-        .and_then(|length| length.parse::<u64>().ok());
-    let etag = headers
-        .and_then(|headers| headers.get(ETAG))
-        .and_then(|etag| etag.to_str().ok())
-        .filter(|etag| !etag.is_empty() && !etag.starts_with("W/"));
-    let validator = etag.map(|etag| format!("etag:{etag}")).or_else(|| {
-        headers
-            .and_then(|headers| headers.get(LAST_MODIFIED))
-            .and_then(|modified| modified.to_str().ok())
-            .filter(|modified| !modified.is_empty())
-            .map(|modified| format!("modified:{modified}"))
-    });
-    archive_content_version(path, validator.as_deref(), length)
 }
 
 #[async_trait]
@@ -143,14 +185,7 @@ impl TileSource for HttpPmtilesSource {
     }
 
     fn clone_source(&self) -> Box<dyn TileSource> {
-        Box::new(HttpPmtilesSource {
-            cfg: self.cfg.clone(),
-            reader: self.reader.clone(),
-            tj: self.tj.clone(),
-            info: self.info,
-            encoding: self.encoding,
-            content_version: self.content_version,
-        })
+        Box::new(self.clone())
     }
 
     async fn get_tile(
@@ -163,8 +198,7 @@ impl TileSource for HttpPmtilesSource {
         let bytes = self
             .reader
             .get_tile(coord)
-            .await
-            .map_err(MaptileError::backend)?
+            .await?
             .ok_or(MaptileError::TileNotFound(xyz.z, xyz.x, xyz.y))?;
         Ok(TileResponse {
             data: bytes,
@@ -181,34 +215,13 @@ impl TileSource for HttpPmtilesSource {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pmtiles::reqwest::header::{CONTENT_LENGTH, ETAG, HeaderMap, LAST_MODIFIED};
+    use pmtiles::reqwest::header::{CONTENT_RANGE, HeaderMap};
 
     #[test]
-    fn http_identity_uses_validators_and_isolates_unverifiable_opens() {
-        let path = "https://example.com/tiles.pmtiles";
+    fn range_can_end_early_at_eof() {
         let mut headers = HeaderMap::new();
-        headers.insert(CONTENT_LENGTH, "100".parse().unwrap());
-        headers.insert(ETAG, "\"first\"".parse().unwrap());
-        let first = http_content_version(path, Some(&headers));
-        assert_eq!(first, http_content_version(path, Some(&headers)));
-        headers.insert(ETAG, "\"second\"".parse().unwrap());
-        assert_ne!(first, http_content_version(path, Some(&headers)));
-        headers.insert(ETAG, "W/\"second\"".parse().unwrap());
-        assert_ne!(
-            http_content_version(path, Some(&headers)),
-            http_content_version(path, Some(&headers))
-        );
-        headers.insert(
-            LAST_MODIFIED,
-            "Wed, 30 Sep 2026 00:00:00 GMT".parse().unwrap(),
-        );
-        assert_eq!(
-            http_content_version(path, Some(&headers)),
-            http_content_version(path, Some(&headers))
-        );
-        assert_ne!(
-            http_content_version(path, None),
-            http_content_version(path, None)
-        );
+        headers.insert(CONTENT_RANGE, "bytes 0-199/200".parse().unwrap());
+        assert_eq!(content_range(&headers, 0, 16383).unwrap(), (200, 200));
+        assert!(content_range(&headers, 1, 16383).is_err());
     }
 }

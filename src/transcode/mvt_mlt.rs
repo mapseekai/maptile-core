@@ -1,363 +1,347 @@
 //! MVT ↔ MLT bidirectional transcoding.
 //!
-//! Adapted from `tileserver-rs/crates/tileserver-rs/src/transcode.rs`
-//! under the MIT license; see `third_party/tileserver-rs/LICENSE`.
-//! The MVT protobuf schema is the one in
-//! [`crate::sources::mvt::proto`]; we do not redefine it here.
+//! Originally adapted from `tileserver-rs/crates/tileserver-rs/src/transcode.rs`
+//! under the MIT license.
+//! See `third_party/tileserver-rs/LICENSE`.
 
 use crate::error::{MaptileError, MaptileResult};
-use crate::sources::mvt::proto as mvt_proto;
+use crate::transport::MAX_DECODED_TILE_BYTES;
 use bytes::Bytes;
-use prost::Message;
+use geo_types::{Coord, Geometry, LineString, Polygon};
+use mlt_core::fast_mvt::{MvtReaderRef, MvtTileBuilder, MvtValue, MvtValueRef};
+use mlt_core::{LendingIterator, ParsedLayer, PropValueRef};
+use prost::encoding::{DecodeContext, WireType, decode_key, decode_varint, skip_field};
+use std::collections::HashSet;
 
-// ---------------------------------------------------------------------------
-// MVT → MLT
-// ---------------------------------------------------------------------------
+const CONVERSION_WORK_BYTES: usize = 64 * 1024 * 1024;
+
+fn check_tile_size(size: usize) -> MaptileResult<()> {
+    if size > MAX_DECODED_TILE_BYTES {
+        return Err(MaptileError::PayloadTooLarge {
+            limit: MAX_DECODED_TILE_BYTES,
+        });
+    }
+    Ok(())
+}
+
+fn charge(remaining: &mut usize, cost: usize) -> MaptileResult<()> {
+    *remaining = remaining.checked_sub(cost).ok_or_else(|| {
+        MaptileError::Resource("vector tile exceeds the transcoding work budget".into())
+    })?;
+    Ok(())
+}
+
+fn transcode_error(error: impl std::fmt::Display) -> MaptileError {
+    MaptileError::Transcode(error.to_string())
+}
+
+fn take_frame<'a>(input: &mut &'a [u8]) -> MaptileResult<&'a [u8]> {
+    let length = decode_varint(input).map_err(transcode_error)?;
+    let length = usize::try_from(length).map_err(transcode_error)?;
+    let Some((frame, rest)) = input.split_at_checked(length) else {
+        return Err(transcode_error("truncated vector tile frame"));
+    };
+    *input = rest;
+    Ok(frame)
+}
+
+fn protobuf_fields(
+    mut input: &[u8],
+    mut message: impl FnMut(u32, &[u8]) -> MaptileResult<()>,
+) -> MaptileResult<()> {
+    while !input.is_empty() {
+        let (tag, wire) = decode_key(&mut input).map_err(transcode_error)?;
+        if wire == WireType::LengthDelimited {
+            message(tag, take_frame(&mut input)?)?;
+        } else {
+            skip_field(wire, tag, &mut input, DecodeContext::default()).map_err(transcode_error)?;
+        }
+    }
+    Ok(())
+}
+
+fn check_mvt_wire(bytes: &[u8], mut remaining: usize) -> MaptileResult<()> {
+    // The borrowed protobuf reader still allocates repeated objects and packed integers.
+    charge(&mut remaining, bytes.len().saturating_mul(4))?;
+    protobuf_fields(bytes, |tag, layer| {
+        if tag == 3 {
+            charge(&mut remaining, 256)?;
+            protobuf_fields(layer, |tag, _| match tag {
+                2 => charge(&mut remaining, 256), // feature
+                3 => charge(&mut remaining, 32),  // key
+                4 => charge(&mut remaining, 192), // value
+                _ => Ok(()),
+            })?;
+        }
+        Ok(())
+    })
+}
+
+fn check_mvt_work(bytes: &[u8], mut remaining: usize) -> MaptileResult<()> {
+    let reader = MvtReaderRef::new(bytes).map_err(transcode_error)?;
+    for layer in reader.layers() {
+        let features = layer.feature_count();
+        charge(
+            &mut remaining,
+            256usize.saturating_add(features.saturating_mul(128)),
+        )?;
+        let mut columns = HashSet::new();
+        for feature in layer.features() {
+            charge(
+                &mut remaining,
+                feature.geometry_commands().len().saturating_mul(16),
+            )?;
+            for property in feature.properties() {
+                let (key, value) = property.map_err(transcode_error)?;
+                let string_bytes = match value {
+                    MvtValueRef::String(text) => text.len(),
+                    _ => 0,
+                };
+                charge(&mut remaining, 32usize.saturating_add(string_bytes))?;
+                if columns.insert(key) {
+                    // mlt-core allocates a typed property slot even for an absent value.
+                    charge(
+                        &mut remaining,
+                        key.len().saturating_add(
+                            features.saturating_mul(size_of::<mlt_core::PropValue>()),
+                        ),
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
 
 /// Encode an uncompressed MVT tile to MLT bytes.
 pub fn mvt_to_mlt(mvt_bytes: &[u8]) -> MaptileResult<Bytes> {
-    let layers = mlt_core::mvt::mvt_to_tile_layers(mvt_bytes)
-        .map_err(|e| MaptileError::Transcode(format!("mvt parse: {e}")))?;
-    let mut output = Vec::with_capacity(mvt_bytes.len());
+    check_tile_size(mvt_bytes.len())?;
+    check_mvt_wire(mvt_bytes, CONVERSION_WORK_BYTES)?;
+    check_mvt_work(mvt_bytes, CONVERSION_WORK_BYTES)?;
+    let layers = mlt_core::mvt::mvt_to_tile_layers(mvt_bytes).map_err(transcode_error)?;
+    let mut output = Vec::new();
     for layer in layers {
         let encoded = layer
             .encode(mlt_core::encoder::EncoderConfig::default())
-            .map_err(|e| MaptileError::Transcode(format!("mlt layer encode: {e}")))?;
+            .map_err(transcode_error)?;
+        check_tile_size(output.len().saturating_add(encoded.len()))?;
         output.extend_from_slice(&encoded);
     }
     Ok(Bytes::from(output))
 }
 
-// ---------------------------------------------------------------------------
-// MLT → MVT
-// ---------------------------------------------------------------------------
-
 /// Decode an MLT tile to MVT (protobuf) bytes.
 pub fn mlt_to_mvt(mlt_bytes: &[u8]) -> MaptileResult<Bytes> {
+    check_tile_size(mlt_bytes.len())?;
     let mut parser = mlt_core::Parser::default();
-    let layers = parser
-        .parse_layers(mlt_bytes)
-        .map_err(|e| MaptileError::Transcode(format!("mlt parse: {e}")))?;
-
-    let mut dec = mlt_core::Decoder::default();
-    let parsed: Vec<_> = layers
-        .into_iter()
-        .map(|layer| {
-            layer
-                .decode_all(&mut dec)
-                .map_err(|e| MaptileError::Transcode(format!("mlt decode layer: {e}")))
-        })
-        .collect::<MaptileResult<_>>()?;
-
-    let fc = mlt_core::geojson::FeatureCollection::from_layers(parsed)
-        .map_err(|e| MaptileError::Transcode(format!("mlt -> features: {e}")))?;
-
-    let mvt_tile = feature_collection_to_mvt(&fc);
-    Ok(Bytes::from(mvt_tile.encode_to_vec()))
-}
-
-fn feature_collection_to_mvt(fc: &mlt_core::geojson::FeatureCollection) -> mvt_proto::Tile {
-    use std::collections::HashMap;
-
-    let mut mvt_layers: Vec<mvt_proto::Layer> = Vec::with_capacity(8);
-    let mut layer_map: HashMap<&str, Vec<&mlt_core::geojson::Feature>> = HashMap::with_capacity(8);
-    for feature in &fc.features {
-        let layer_name = feature
-            .properties
-            .get("_layer")
-            .and_then(|v| v.as_str())
-            .unwrap_or("default");
-        layer_map.entry(layer_name).or_default().push(feature);
-    }
-
-    for (layer_name, features) in &layer_map {
-        let extent = features
+    let mut decoder = mlt_core::Decoder::default();
+    let mut remaining = CONVERSION_WORK_BYTES;
+    let mut tile = MvtTileBuilder::new();
+    let mut input = mlt_bytes;
+    while !input.is_empty() {
+        let start = input;
+        let frame = take_frame(&mut input)?;
+        let tag = *frame
             .first()
-            .and_then(|f| f.properties.get("_extent"))
-            .and_then(|v| v.as_u64())
-            .map(|v| v as u32)
-            .unwrap_or(4096);
-
-        let mut keys: Vec<String> = Vec::with_capacity(32);
-        let mut values: Vec<mvt_proto::Value> = Vec::with_capacity(features.len() * 4);
-        let mut key_index: HashMap<String, u32> = HashMap::with_capacity(32);
-        let mut value_index: HashMap<String, u32> = HashMap::with_capacity(features.len() * 4);
-        let mut mvt_features: Vec<mvt_proto::Feature> = Vec::with_capacity(features.len());
-
-        for feature in features {
-            let (geom_type, geometry) = encode_geometry_to_mvt(&feature.geometry);
-
-            let mut tags = Vec::with_capacity(feature.properties.len() * 2);
-            for (key, val) in &feature.properties {
-                if key.starts_with('_') {
-                    continue;
-                }
-                let key_idx = *key_index.entry(key.clone()).or_insert_with(|| {
-                    let idx = keys.len() as u32;
-                    keys.push(key.clone());
-                    idx
-                });
-                let val_str = val.to_string();
-                let val_idx = *value_index.entry(val_str.clone()).or_insert_with(|| {
-                    let idx = values.len() as u32;
-                    values.push(json_value_to_mvt(val));
-                    idx
-                });
-                tags.push(key_idx);
-                tags.push(val_idx);
-            }
-
-            mvt_features.push(mvt_proto::Feature {
-                id: feature.id,
-                tags,
-                r#type: Some(geom_type as i32),
-                geometry,
-            });
+            .ok_or_else(|| transcode_error("empty MLT frame"))?;
+        charge(&mut remaining, 128)?;
+        if tag != 1 {
+            continue;
         }
-
-        mvt_layers.push(mvt_proto::Layer {
-            version: 2,
-            name: layer_name.to_string(),
-            features: mvt_features,
-            keys,
-            values,
-            extent: Some(extent),
-        });
-    }
-
-    mvt_proto::Tile { layers: mvt_layers }
-}
-
-// ---------------------------------------------------------------------------
-// Geometry encoding
-// ---------------------------------------------------------------------------
-
-fn encode_geometry_to_mvt(geometry: &geo_types::Geometry<i32>) -> (mvt_proto::GeomType, Vec<u32>) {
-    use geo_types::Geometry;
-
-    match geometry {
-        Geometry::Point(point) => {
-            let commands = encode_point(point.x(), point.y());
-            (mvt_proto::GeomType::Point, commands)
-        }
-        Geometry::MultiPoint(mp) => {
-            let points = mp.0.as_slice();
-            let mut commands = Vec::with_capacity(points.len() * 3);
-            commands.push(command_integer(1, points.len() as u32));
-            let mut cx = 0i32;
-            let mut cy = 0i32;
-            for point in points {
-                let dx = point.x() - cx;
-                let dy = point.y() - cy;
-                commands.push(zigzag_encode(dx));
-                commands.push(zigzag_encode(dy));
-                cx = point.x();
-                cy = point.y();
-            }
-            (mvt_proto::GeomType::Point, commands)
-        }
-        Geometry::LineString(ls) => {
-            let commands = encode_linestring(&ls.0, false);
-            (mvt_proto::GeomType::Linestring, commands)
-        }
-        Geometry::MultiLineString(mls) => {
-            let mut commands = Vec::with_capacity(mls.0.len() * 8);
-            for line in &mls.0 {
-                commands.extend(encode_linestring(&line.0, false));
-            }
-            (mvt_proto::GeomType::Linestring, commands)
-        }
-        Geometry::Polygon(poly) => {
-            let mut commands = Vec::with_capacity(poly.exterior().0.len() * 2 + 4);
-            commands.extend(encode_linestring(&poly.exterior().0, true));
-            for ring in poly.interiors() {
-                commands.extend(encode_linestring(&ring.0, true));
-            }
-            (mvt_proto::GeomType::Polygon, commands)
-        }
-        Geometry::MultiPolygon(mp) => {
-            let mut commands = Vec::with_capacity(mp.0.len() * 16);
-            for polygon in &mp.0 {
-                commands.extend(encode_linestring(&polygon.exterior().0, true));
-                for ring in polygon.interiors() {
-                    commands.extend(encode_linestring(&ring.0, true));
-                }
-            }
-            (mvt_proto::GeomType::Polygon, commands)
-        }
-        _ => (mvt_proto::GeomType::Unknown, Vec::new()),
-    }
-}
-
-fn encode_point(x: i32, y: i32) -> Vec<u32> {
-    vec![command_integer(1, 1), zigzag_encode(x), zigzag_encode(y)]
-}
-
-fn encode_linestring(coords: &[geo_types::Coord<i32>], close_path: bool) -> Vec<u32> {
-    if coords.is_empty() {
-        return Vec::new();
-    }
-
-    let mut commands = Vec::with_capacity(coords.len() * 2 + 4);
-    let mut cx = 0i32;
-    let mut cy = 0i32;
-
-    commands.push(command_integer(1, 1));
-    let dx = coords[0].x - cx;
-    let dy = coords[0].y - cy;
-    commands.push(zigzag_encode(dx));
-    commands.push(zigzag_encode(dy));
-    cx = coords[0].x;
-    cy = coords[0].y;
-
-    let line_count = if close_path {
-        coords.len().saturating_sub(2)
-    } else {
-        coords.len() - 1
-    };
-
-    if line_count > 0 {
-        commands.push(command_integer(2, line_count as u32));
-        let end = if close_path {
-            coords.len() - 1
-        } else {
-            coords.len()
+        let layer = parser
+            .parse_layers(&start[..start.len() - input.len()])
+            .map_err(transcode_error)?
+            .pop()
+            .ok_or_else(|| transcode_error("missing MLT layer"))?;
+        let ParsedLayer::Tag01(layer) = layer.decode_all(&mut decoder).map_err(transcode_error)?
+        else {
+            continue;
         };
-        for coord in &coords[1..end] {
-            let dx = coord.x - cx;
-            let dy = coord.y - cy;
-            commands.push(zigzag_encode(dx));
-            commands.push(zigzag_encode(dy));
-            cx = coord.x;
-            cy = coord.y;
+        let count = layer.feature_count();
+        let mut names = Vec::new();
+        for name in layer.iterate_prop_names() {
+            let name = name.to_string();
+            charge(
+                &mut remaining,
+                name.len().saturating_add(size_of::<String>()),
+            )?;
+            names.push(name);
         }
+        charge(
+            &mut remaining,
+            count.saturating_mul(128usize.saturating_add(names.len().saturating_mul(8))),
+        )?;
+        let mut output = tile
+            .layer_with_capacity(layer.name(), count)
+            .map_err(transcode_error)?;
+        output.extent(layer.extent().into());
+        let mut features = layer.iter_features();
+        while let Some(feature) = features.next() {
+            let feature = feature.map_err(transcode_error)?;
+            let vertices = check_geometry(feature.geometry())?;
+            charge(&mut remaining, vertices.saturating_mul(24))?;
+            let mut builder = output
+                .feature(feature.geometry())
+                .map_err(transcode_error)?;
+            builder.id(feature.id());
+            for (key, value) in names.iter().zip(feature.iter_all_properties()) {
+                let Some(value) = value else { continue };
+                let text_len = match value {
+                    PropValueRef::Str(text) => text.len(),
+                    _ => 0,
+                };
+                charge(
+                    &mut remaining,
+                    64usize.saturating_add(key.len()).saturating_add(text_len),
+                )?;
+                builder
+                    .tag(key, mvt_value(value))
+                    .map_err(transcode_error)?;
+            }
+            output = builder.end();
+        }
+        tile = output.end();
     }
-
-    if close_path {
-        commands.push(command_integer(7, 1));
-    }
-    commands
+    check_tile_size(tile.encoded_len())?;
+    Ok(Bytes::from(tile.encode()))
 }
 
-#[inline]
-fn command_integer(id: u32, count: u32) -> u32 {
-    (id & 0x7) | (count << 3)
-}
-
-#[inline]
-fn zigzag_encode(n: i32) -> u32 {
-    ((n << 1) ^ (n >> 31)) as u32
-}
-
-fn json_value_to_mvt(val: &serde_json::Value) -> mvt_proto::Value {
-    match val {
-        serde_json::Value::String(s) => mvt_proto::Value {
-            string_value: Some(s.clone()),
-            ..Default::default()
-        },
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                mvt_proto::Value {
-                    int_value: Some(i),
-                    ..Default::default()
-                }
-            } else if let Some(u) = n.as_u64() {
-                mvt_proto::Value {
-                    uint_value: Some(u),
-                    ..Default::default()
-                }
-            } else if let Some(f) = n.as_f64() {
-                mvt_proto::Value {
-                    double_value: Some(f),
-                    ..Default::default()
-                }
-            } else {
-                mvt_proto::Value::default()
+fn check_geometry(geometry: &Geometry<i32>) -> MaptileResult<usize> {
+    let mut cursor = Coord { x: 0i32, y: 0i32 };
+    let mut count = 0usize;
+    let mut visit = |point: Coord<i32>| {
+        if point.x.checked_sub(cursor.x).is_none() || point.y.checked_sub(cursor.y).is_none() {
+            return Err(transcode_error(
+                "geometry has an unrepresentable MVT coordinate delta",
+            ));
+        }
+        cursor = point;
+        count += 1;
+        Ok(())
+    };
+    match geometry {
+        Geometry::Point(point) => visit(point.0)?,
+        Geometry::MultiPoint(points) => points
+            .0
+            .iter()
+            .map(|point| point.0)
+            .try_for_each(&mut visit)?,
+        Geometry::LineString(line) => line.0.iter().copied().try_for_each(&mut visit)?,
+        Geometry::MultiLineString(lines) => lines
+            .0
+            .iter()
+            .flat_map(|line| &line.0)
+            .copied()
+            .try_for_each(&mut visit)?,
+        Geometry::Polygon(polygon) => check_polygon(polygon, &mut visit)?,
+        Geometry::MultiPolygon(polygons) => {
+            for polygon in &polygons.0 {
+                check_polygon(polygon, &mut visit)?;
             }
         }
-        serde_json::Value::Bool(b) => mvt_proto::Value {
-            bool_value: Some(*b),
-            ..Default::default()
-        },
-        _ => mvt_proto::Value::default(),
+        _ => return Err(transcode_error("geometry has no MVT representation")),
+    }
+    Ok(count)
+}
+
+fn check_polygon(
+    polygon: &Polygon<i32>,
+    visit: &mut impl FnMut(Coord<i32>) -> MaptileResult<()>,
+) -> MaptileResult<()> {
+    for (index, LineString(points)) in std::iter::once(polygon.exterior())
+        .chain(polygon.interiors())
+        .enumerate()
+    {
+        let points = if points.len() >= 2 && points.first() == points.last() {
+            &points[..points.len() - 1]
+        } else {
+            points.as_slice()
+        };
+        let mut area = 0i64;
+        for (a, b) in points.iter().zip(points.iter().cycle().skip(1)) {
+            let cross = i64::from(a.x) * i64::from(b.y) - i64::from(a.y) * i64::from(b.x);
+            area = area
+                .checked_add(cross)
+                .ok_or_else(|| transcode_error("polygon area exceeds the MVT encoder range"))?;
+        }
+        // Match fast-mvt's winding normalization when checking cursor deltas.
+        if area != 0 && (area > 0) != (index == 0) {
+            points.iter().rev().copied().try_for_each(&mut *visit)?;
+        } else {
+            points.iter().copied().try_for_each(&mut *visit)?;
+        }
+    }
+    Ok(())
+}
+
+fn mvt_value(value: PropValueRef<'_>) -> MvtValue {
+    match value {
+        PropValueRef::Bool(value) => MvtValue::Bool(value),
+        PropValueRef::I8(value) => MvtValue::SInt(value.into()),
+        PropValueRef::I32(value) => MvtValue::SInt(value.into()),
+        PropValueRef::I64(value) => MvtValue::SInt(value),
+        PropValueRef::U8(value) => MvtValue::UInt(value.into()),
+        PropValueRef::U32(value) => MvtValue::UInt(value.into()),
+        PropValueRef::U64(value) => MvtValue::UInt(value),
+        PropValueRef::F32(value) => MvtValue::Float(value),
+        PropValueRef::F64(value) => MvtValue::Double(value),
+        PropValueRef::Str(value) => MvtValue::String(value.to_owned()),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use geo_types::{LineString, MultiLineString};
 
-    fn empty_mvt_layer(name: &str) -> mvt_proto::Layer {
-        mvt_proto::Layer {
-            version: 2,
-            name: name.into(),
-            features: vec![],
-            keys: vec![],
-            values: vec![],
-            extent: Some(4096),
-        }
-    }
-
-    fn point_feature(x: i32, y: i32, props: &[(&str, &str)]) -> mvt_proto::Feature {
-        let mut keys: Vec<String> = Vec::new();
-        let mut values: Vec<mvt_proto::Value> = Vec::new();
-        let mut tags: Vec<u32> = Vec::new();
-        for (i, (k, v)) in props.iter().enumerate() {
-            keys.push((*k).into());
-            values.push(mvt_proto::Value {
-                string_value: Some((*v).into()),
-                ..Default::default()
-            });
-            tags.push(i as u32);
-            tags.push(i as u32);
-        }
-        let _ = (keys, values);
-        mvt_proto::Feature {
-            id: Some(1),
-            tags,
-            r#type: Some(mvt_proto::GeomType::Point as i32),
-            geometry: vec![command_integer(1, 1), zigzag_encode(x), zigzag_encode(y)],
-        }
+    #[test]
+    fn validates_consecutive_mvt_deltas_instead_of_the_total_extent() {
+        let bridged = Geometry::LineString(LineString::from(vec![(i32::MIN, 0), (-1, 0), (1, 0)]));
+        assert_eq!(check_geometry(&bridged).unwrap(), 3);
+        let unrepresentable = Geometry::LineString(LineString::from(vec![(i32::MIN, 0), (1, 0)]));
+        assert!(matches!(
+            check_geometry(&unrepresentable),
+            Err(MaptileError::Transcode(_))
+        ));
     }
 
     #[test]
-    fn zigzag_known_pairs() {
-        assert_eq!(zigzag_encode(0), 0);
-        assert_eq!(zigzag_encode(-1), 1);
-        assert_eq!(zigzag_encode(1), 2);
-        assert_eq!(zigzag_encode(-2), 3);
-    }
-
-    #[test]
-    fn command_integer_packs_id_and_count() {
-        // MoveTo, count=1 -> (1 & 7) | (1 << 3) = 9
-        assert_eq!(command_integer(1, 1), 9);
-        // ClosePath, count=1 -> (7 & 7) | (1 << 3) = 15
-        assert_eq!(command_integer(7, 1), 15);
-        // LineTo, count=3 -> (2 & 7) | (3 << 3) = 26
-        assert_eq!(command_integer(2, 3), 26);
-    }
-
-    #[test]
-    fn single_point_feature_roundtrips_geometry() {
-        let mut layer = empty_mvt_layer("places");
-        layer.features = vec![point_feature(10, 20, &[])];
-        let tile = mvt_proto::Tile {
-            layers: vec![layer],
-        };
-        let bytes = tile.encode_to_vec();
-        let mlt = mvt_to_mlt(&bytes).expect("mvt -> mlt");
-        let mvt_back = mlt_to_mvt(&mlt).expect("mlt -> mvt");
-        let parsed = mvt_proto::Tile::decode(&mvt_back[..]).unwrap();
-        assert_eq!(parsed.layers.len(), 1);
-        let layer = &parsed.layers[0];
-        assert_eq!(layer.name, "places");
-        assert_eq!(layer.features.len(), 1);
-        let feat = &layer.features[0];
-        assert_eq!(feat.r#type, Some(mvt_proto::GeomType::Point as i32));
-        // Geometry: MoveTo(1) + dx, dy where (dx, dy) zigzag-encode (10, 20).
-        assert_eq!(feat.geometry[0], command_integer(1, 1));
-        assert_eq!(feat.geometry[1], zigzag_encode(10));
-        assert_eq!(feat.geometry[2], zigzag_encode(20));
+    fn multipart_geometry_and_typed_properties_round_trip() {
+        let geometry = Geometry::MultiLineString(MultiLineString(vec![
+            LineString::from(vec![(10, 20), (12, 20)]),
+            LineString::from(vec![(30, 40), (32, 42)]),
+        ]));
+        let mut layer = MvtTileBuilder::new().layer("roads").unwrap();
+        layer.extent(std::num::NonZeroU32::new(1024).unwrap());
+        let mut feature = layer.feature(&geometry).unwrap();
+        feature.id(Some(7));
+        feature
+            .tag("_road", MvtValue::String("north".into()))
+            .unwrap();
+        feature.tag("speed", MvtValue::UInt(45)).unwrap();
+        let original = feature.end().encode();
+        let mlt = mvt_to_mlt(&original).unwrap();
+        let encoded = mlt_to_mvt(&mlt).unwrap();
+        let reader = MvtReaderRef::new(&encoded).unwrap();
+        let layer = reader.layers().next().unwrap();
+        assert_eq!(layer.extent(), 1024);
+        let feature = layer.features().next().unwrap();
+        assert_eq!(feature.id(), Some(7));
+        assert_eq!(feature.geometry().unwrap(), geometry);
+        assert_eq!(
+            feature.properties().collect::<Result<Vec<_>, _>>().unwrap(),
+            vec![
+                ("_road", MvtValueRef::String("north")),
+                ("speed", MvtValueRef::UInt(45)),
+            ]
+        );
+        assert!(matches!(
+            check_mvt_work(&original, 256),
+            Err(MaptileError::Resource(_))
+        ));
+        assert!(matches!(
+            check_mvt_wire(&original, 256),
+            Err(MaptileError::Resource(_))
+        ));
     }
 }

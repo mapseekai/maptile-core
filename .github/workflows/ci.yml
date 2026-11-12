@@ -50,10 +50,31 @@ jobs:
         with:
           toolchain: "1.98.1"
           components: clippy, rustfmt
-      - name: Install native compilation tools
+      - name: Ensure native compilation tools are available
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends build-essential cmake ninja-build libclang-dev pkg-config libssl-dev
+          if command -v cc && command -v c++ && command -v make \
+            && command -v cmake && command -v ninja && command -v pkg-config; then
+            exit 0
+          fi
+          # Use signed Ubuntu repositories independent of the runner's Azure mirror.
+          apt_dir=$(mktemp -d)
+          trap 'rm -rf "$apt_dir"' EXIT
+          chmod 755 "$apt_dir"
+          mkdir "$apt_dir/lists"
+          cat >"$apt_dir/ubuntu.list" <<'EOF'
+          deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://archive.ubuntu.com/ubuntu/ noble main universe
+          deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://archive.ubuntu.com/ubuntu/ noble-updates main universe
+          deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://security.ubuntu.com/ubuntu/ noble-security main universe
+          EOF
+          apt_options=(
+            -o "Dir::Etc::sourcelist=$apt_dir/ubuntu.list"
+            -o Dir::Etc::sourceparts=-
+            -o "Dir::State::lists=$apt_dir/lists"
+            -o Acquire::Retries=2
+            -o Acquire::https::Timeout=20
+          )
+          sudo apt-get "${apt_options[@]}" -o APT::Update::Error-Mode=any update
+          sudo apt-get "${apt_options[@]}" install --yes --no-install-recommends build-essential cmake ninja-build pkg-config
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |

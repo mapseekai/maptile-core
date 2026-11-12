@@ -1,11 +1,6 @@
 //! Integration tests for `HttpPmtilesSource`.
 //!
-//! **Range-request fallback**: wiremock 0.6 returns 200 for every request and
-//! does not interpret `Range:` headers, but the pmtiles 0.19 HTTP backend
-//! *requires* a 206 Partial Content response and returns
-//! `PmtError::RangeRequestsUnsupported` otherwise.  We therefore hand-roll a
-//! tiny `tokio::net::TcpListener` server that honours `Range:` headers and
-//! responds with 206, keeping the rest of the test infrastructure in-process.
+//! Serve real byte ranges from an in-process HTTP server.
 
 use maptile_core::sources::pmtiles::{HttpPmtilesSource, PmtilesConfig};
 use maptile_core::sources::{TileCoord, TileFormat, TileSource};
@@ -64,6 +59,7 @@ async fn handle_connection(stream: tokio::net::TcpStream, data: Arc<Vec<u8>>) {
 
     // Parse optional `bytes=X-Y`.
     let total = data.len();
+    let mut content_range = String::new();
     let (status, slice): (&str, &[u8]) = if let Some(ref r) = range_header {
         // Strip "bytes=" prefix.
         let r = r.trim_start_matches("bytes=");
@@ -71,6 +67,7 @@ async fn handle_connection(stream: tokio::net::TcpStream, data: Arc<Vec<u8>>) {
             let start: usize = start_s.parse().unwrap_or(0);
             let end: usize = end_s.parse().unwrap_or(total.saturating_sub(1));
             let end = end.min(total.saturating_sub(1));
+            content_range = format!("Content-Range: bytes {start}-{end}/{total}\r\n");
             ("206 Partial Content", &data[start..=end])
         } else {
             ("200 OK", &data[..])
@@ -84,6 +81,7 @@ async fn handle_connection(stream: tokio::net::TcpStream, data: Arc<Vec<u8>>) {
         "HTTP/1.1 {status}\r\n\
          Content-Type: application/octet-stream\r\n\
          Content-Length: {content_len}\r\n\
+         {content_range}\
          Accept-Ranges: bytes\r\n\
          Connection: close\r\n\
          \r\n"

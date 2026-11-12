@@ -95,7 +95,8 @@ pub struct PostgresTableSource {
     allowed_columns: Arc<std::collections::HashSet<String>>,
     info_meta: TileInfo,
     cache: Option<Arc<TileCache>>,
-    edit_revision: Option<String>,
+    definition_version: crate::cache::ContentVersion,
+    content_version: crate::cache::ContentVersion,
 }
 
 impl std::fmt::Debug for PostgresTableSource {
@@ -106,6 +107,29 @@ impl std::fmt::Debug for PostgresTableSource {
             .field("table", &self.info.table)
             .finish_non_exhaustive()
     }
+}
+
+fn table_definition_version(
+    pool: &PostgresPool,
+    info: &TableInfo,
+    query: &str,
+) -> crate::cache::ContentVersion {
+    let mut hash = blake3::Hasher::new();
+    hash.update(pool.database_identity.as_bytes());
+    for field in [&info.schema, &info.table] {
+        hash.update(&(field.len() as u64).to_le_bytes());
+        hash.update(field.as_bytes());
+    }
+    hash.update(&(query.len() as u64).to_le_bytes());
+    hash.update(query.as_bytes());
+    hash.update(&[u8::from(info.bounds.is_some())]);
+    if let Some(bounds) = info.bounds {
+        for value in bounds {
+            hash.update(&value.to_bits().to_le_bytes());
+        }
+    }
+    hash.update(&[info.derived_min_zoom.unwrap_or(u8::MAX)]);
+    crate::cache::ContentVersion::from_bytes(*hash.finalize().as_bytes())
 }
 
 impl PostgresTableSource {
@@ -133,6 +157,7 @@ impl PostgresTableSource {
             format: TileFormat::Mvt,
             encoding: TileEncoding::Uncompressed,
         };
+        let definition_version = table_definition_version(&pool, &info, &inline_query);
 
         Ok(Self {
             cfg,
@@ -148,7 +173,8 @@ impl PostgresTableSource {
             allowed_columns: Arc::new(std::collections::HashSet::new()),
             info_meta,
             cache: None,
-            edit_revision: None,
+            definition_version,
+            content_version: crate::cache::ContentVersion::new_generation(),
         })
     }
 
@@ -172,7 +198,7 @@ impl PostgresTableSource {
         let sql = compose_filtered_sql(
             &self.base_select_no_where,
             &self.bbox_search_expr,
-            &self.info.geometry_column,
+            &self.info,
             &filter_sql,
             user_bbox,
         );
@@ -281,8 +307,15 @@ impl PostgresTableSource {
             self.tj
                 .other
                 .insert("mapseek_revision".into(), serde_json::json!(value));
+            let mut hash = blake3::Hasher::new();
+            hash.update(self.definition_version.as_bytes());
+            hash.update(value.as_bytes());
+            self.content_version =
+                crate::cache::ContentVersion::from_bytes(*hash.finalize().as_bytes());
+        } else {
+            self.tj.other.remove("mapseek_revision");
+            self.content_version = crate::cache::ContentVersion::new_generation();
         }
-        self.edit_revision = revision;
         self
     }
 
@@ -338,34 +371,15 @@ impl TileSource for PostgresTableSource {
             allowed_columns: self.allowed_columns.clone(),
             info_meta: self.info_meta,
             cache: self.cache.clone(),
-            edit_revision: self.edit_revision.clone(),
+            definition_version: self.definition_version,
+            content_version: self.content_version,
         })
     }
 
     /// The physical table, rendered projection and durable edit revision
     /// identify cached bytes without querying PostgreSQL on a cache hit.
     fn content_version(&self) -> crate::cache::ContentVersion {
-        let mut buf = Vec::with_capacity(self.info.schema.len() + self.info.table.len() + 1);
-        buf.extend_from_slice(self.info.schema.as_bytes());
-        buf.push(0);
-        buf.extend_from_slice(self.info.table.as_bytes());
-        buf.push(0);
-        buf.extend_from_slice(self.inline_query.as_bytes());
-        buf.push(u8::from(self.info.bounds.is_some()));
-        if let Some(bounds) = self.info.bounds {
-            for value in bounds {
-                buf.extend_from_slice(&value.to_bits().to_le_bytes());
-            }
-        }
-        buf.push(u8::from(self.info.derived_min_zoom.is_some()));
-        if let Some(zoom) = self.info.derived_min_zoom {
-            buf.push(zoom);
-        }
-        if let Some(revision) = &self.edit_revision {
-            buf.push(0);
-            buf.extend_from_slice(revision.as_bytes());
-        }
-        crate::cache::ContentVersion::from_input(&buf)
+        self.content_version
     }
 
     async fn get_tile(
@@ -461,7 +475,7 @@ impl TileSource for PostgresTableSource {
             let tile = compose_filtered_sql(
                 &self.batch_base_select_no_where,
                 &self.batch_bbox_search_expr,
-                &self.info.geometry_column,
+                &self.info,
                 &filter,
                 query.and_then(|q| q.bbox),
             );
@@ -805,13 +819,7 @@ fn build_batch_tile_query(
     let coords = ["batch_coords.z", "batch_coords.x", "batch_coords.y"];
     let base = build_base_select_with_coordinates(info, columns, coords);
     let bbox = build_bbox_search_with_coordinates(info, supports_tile_margin, coords);
-    let tile = compose_filtered_sql(
-        &base,
-        &bbox,
-        &info.geometry_column,
-        "batch_coords.enabled",
-        None,
-    );
+    let tile = compose_filtered_sql(&base, &bbox, info, "batch_coords.enabled", None);
     compose_batch_sql(&tile)
 }
 
@@ -945,16 +953,23 @@ fn build_bbox_search_with_coordinates(
 fn compose_filtered_sql(
     base_select_no_where: &str,
     bbox_search: &str,
-    geom_col: &str,
+    info: &TableInfo,
     filter_sql: &str,
     user_bbox: Option<[f64; 4]>,
 ) -> String {
     let mut conds: Vec<String> = Vec::with_capacity(3);
-    let geom_col = pg_escape::quote_identifier(geom_col);
+    let geom_col = pg_escape::quote_identifier(&info.geometry_column);
     conds.push(format!("{geom_col} && {bbox_search}"));
     if let Some([w, s, e, n]) = user_bbox {
+        // Test the geographic bounding box after the indexed tile predicate.
+        // Projecting only the envelope corners can lose matches in curved CRSs.
+        let geometry = if info.srid == 4326 {
+            geom_col
+        } else {
+            format!("ST_Transform({geom_col}::geometry, 4326)").into()
+        };
         conds.push(format!(
-            "{geom_col} && ST_MakeEnvelope({w}, {s}, {e}, {n}, 4326)"
+            "{geometry} && ST_MakeEnvelope({w}, {s}, {e}, {n}, 4326)"
         ));
     }
     if !filter_sql.trim().is_empty() {
@@ -1013,7 +1028,7 @@ mod inline_filter_tests {
         let sql = compose_filtered_sql(
             &base,
             &bbox,
-            &info.geometry_column,
+            &info,
             "(\"class\" = 'highway')",
             Some([10.0, 20.0, 30.0, 40.0]),
         );
@@ -1028,13 +1043,7 @@ mod inline_filter_tests {
         let info = fixture_info();
         let base = build_base_select_no_where(&info, &[]);
         let bbox = build_bbox_search(&info, true);
-        let sql = compose_filtered_sql(
-            &base,
-            &bbox,
-            &info.geometry_column,
-            "(\"class\" = 'highway')",
-            None,
-        );
+        let sql = compose_filtered_sql(&base, &bbox, &info, "(\"class\" = 'highway')", None);
         assert!(sql.contains("\"class\" = 'highway'"));
         assert!(!sql.contains("ST_MakeEnvelope"));
         assert!(sql.contains(" && "));
@@ -1046,13 +1055,7 @@ mod inline_filter_tests {
         let info = fixture_info();
         let base = build_base_select_no_where(&info, &[]);
         let bbox = build_bbox_search(&info, true);
-        let sql = compose_filtered_sql(
-            &base,
-            &bbox,
-            &info.geometry_column,
-            "",
-            Some([10.0, 20.0, 30.0, 40.0]),
-        );
+        let sql = compose_filtered_sql(&base, &bbox, &info, "", Some([10.0, 20.0, 30.0, 40.0]));
         assert!(sql.contains("ST_MakeEnvelope"));
         // No "()" empty filter group.
         assert!(!sql.contains("AND ()"));
@@ -1079,13 +1082,9 @@ mod inline_filter_tests {
     #[test]
     fn filtered_sql_quotes_geometry_identifier() {
         let base = "SELECT 1 FROM \"tenant\".\"table\"";
-        let sql = compose_filtered_sql(
-            base,
-            "bbox",
-            r#"geom"col"#,
-            "",
-            Some([10.0, 20.0, 30.0, 40.0]),
-        );
+        let mut info = fixture_info();
+        info.geometry_column = r#"geom"col"#.into();
+        let sql = compose_filtered_sql(base, "bbox", &info, "", Some([10.0, 20.0, 30.0, 40.0]));
 
         assert!(sql.contains(r#""geom""col" && bbox"#));
         assert!(sql.contains(r#""geom""col" && ST_MakeEnvelope(10, 20, 30, 40, 4326)"#));
@@ -1120,8 +1119,14 @@ async fn check_spatial_index(
     let row = conn
         .query_one(
             "SELECT EXISTS (
-                SELECT 1 FROM pg_indexes
-                WHERE schemaname = $1 AND tablename = $2 AND indexdef LIKE '%USING gist%'
+                SELECT 1
+                FROM pg_catalog.pg_index AS idx
+                JOIN pg_catalog.pg_class AS tbl ON tbl.oid = idx.indrelid
+                JOIN pg_catalog.pg_namespace AS ns ON ns.oid = tbl.relnamespace
+                JOIN pg_catalog.pg_class AS ic ON ic.oid = idx.indexrelid
+                JOIN pg_catalog.pg_am AS am ON am.oid = ic.relam
+                WHERE ns.nspname = $1 AND tbl.relname = $2 AND am.amname = 'gist'
+                  AND idx.indisvalid AND idx.indisready
              )",
             &[&schema, &table],
         )

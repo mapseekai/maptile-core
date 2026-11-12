@@ -116,6 +116,8 @@ GeoParquet 需要预装匹配版本的官方签名 DuckDB 扩展，见[独立使
 
 本地矢量文件入口为 `FlatGeobufSource::open` 和 `import_to_geoparquet`，完整配置及安全边界见[本地矢量文件说明](docs/geoparquet.md#本地-flatgeobuf-与一次性导入)。
 
+PMTiles 的目录和元数据按 4 MiB 限制读取及解压，单瓦片的归档字节上限为 16 MiB。HTTP 源需要支持范围请求。发布新 MBTiles 或 PMTiles 数据后，应重新打开并注册源。独立 DuckDB 源的 SQL 模板接受一条查询，连接等待与执行共享 10 秒期限。
+
 ### 原生依赖
 
 - `agtiff` / `stac`：不使用 GDAL，但启用了 async-geotiff 的原生 PROJ。当前依赖需要系统 PROJ ≥9.6.2，否则尝试 CMake 源码构建；运行时需要匹配的 PROJ 数据。

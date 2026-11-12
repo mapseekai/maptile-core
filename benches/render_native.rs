@@ -1,7 +1,8 @@
 use std::cell::Cell;
+use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use criterion::{BatchSize, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use futures::future::join_all;
 use maptile_core::render::native::{benchmark_lifecycle_counts, reset_benchmark_lifecycle_counts};
 use maptile_core::render::{PoolConfig, RenderFormat, RenderRequest, RenderedImage, RendererPool};

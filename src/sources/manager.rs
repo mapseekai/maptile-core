@@ -276,15 +276,23 @@ impl SourceManager {
                 };
                 (style.tile_size, format_tag)
             });
-            let style_hash = query.and_then(|q| q.style_hash).unwrap_or_else(|| {
-                crate::cache::hashing::canonical_render_hash(
+            let style_hash = match (query.and_then(|q| q.style_hash), effective_selection) {
+                (Some(hash), Some(selection)) => {
+                    let mut hasher = blake3::Hasher::new();
+                    hasher.update(b"mosaic-selection\0");
+                    hasher.update(hash.as_bytes());
+                    hasher.update(&[selection.cache_tag()]);
+                    crate::cache::StyleHash::from_bytes(*hasher.finalize().as_bytes())
+                }
+                (Some(hash), None) => hash,
+                (None, selection) => crate::cache::hashing::canonical_render_hash(
                     render_style,
-                    effective_selection,
+                    selection,
                     tile_size,
                     1,
                     format_tag,
-                )
-            });
+                ),
+            };
             let key = TileCacheKey {
                 source_id: id.into(),
                 content_version: source.content_version(),

@@ -2,6 +2,7 @@
 
 pub mod archive_inspection;
 pub mod composite;
+mod file_stamp;
 pub mod lazy_composite;
 pub mod manager;
 pub mod mbtiles;
@@ -45,6 +46,8 @@ pub fn new_shared_block_cache() -> std::sync::Arc<BlockCache> {
 
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
+#[cfg(any(feature = "duckdb", feature = "geoparquet"))]
+mod duckdb_query;
 #[cfg(feature = "duckdb")]
 pub use self::duckdb::{DuckDbSource, DuckDbSourceConfig};
 
@@ -262,6 +265,28 @@ pub enum MosaicPixelSelection {
 }
 
 impl MosaicPixelSelection {
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "first" => Self::First,
+            "highest" => Self::Highest,
+            "lowest" => Self::Lowest,
+            "mean" => Self::Mean,
+            "median" => Self::Median,
+            _ => return None,
+        })
+    }
+
+    #[cfg(feature = "agtiff")]
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::First => "first",
+            Self::Highest => "highest",
+            Self::Lowest => "lowest",
+            Self::Mean => "mean",
+            Self::Median => "median",
+        }
+    }
+
     #[must_use]
     pub(crate) const fn cache_tag(self) -> u8 {
         match self {
@@ -274,13 +299,25 @@ impl MosaicPixelSelection {
     }
 }
 
-/// Resolve the request override against a mosaic source's persisted fallback.
+/// Resolve the query override, the Raster Style reducer, then the source fallback.
 #[must_use]
 pub fn effective_pixel_selection(
     query: Option<&TileQuery<'_>>,
     fallback: MosaicPixelSelection,
 ) -> MosaicPixelSelection {
-    query.and_then(|q| q.pixel_selection).unwrap_or(fallback)
+    query
+        .and_then(|q| {
+            q.pixel_selection.or_else(|| {
+                let name = q
+                    .style?
+                    .raster_style()
+                    .as_value()
+                    .pointer("/raster:mosaic/pixel_selection")?
+                    .as_str()?;
+                MosaicPixelSelection::from_name(name)
+            })
+        })
+        .unwrap_or(fallback)
 }
 
 #[derive(Debug, Clone, PartialEq)]

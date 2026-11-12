@@ -4,6 +4,7 @@
 //! desktop GIS clients (QGIS, ArcGIS) can register the tileset. The
 //! function is pure — it takes a description and returns a `String`.
 
+use super::types::TILE_SIZE;
 use quick_xml::Writer;
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 
@@ -208,53 +209,26 @@ fn write_tile_matrix_set_limits(writer: &mut Writer<Vec<u8>>, min_zoom: u8, max_
 
 /// `GoogleMapsCompatible` TileMatrixSet (zooms 0..=22).
 ///
-/// Numeric scale denominators / corner coordinates are kept as the
-/// canonical literals from the WMTS profile.
+/// The Web Mercator grid uses the native renderer's tile dimensions.
 fn write_tile_matrix_set(writer: &mut Writer<Vec<u8>>) {
     const TOP_LEFT: &str = "-20037508.3427892 20037508.3427892";
-    /// `(zoom, scale_denominator, matrix_dim)`. Matrix is `dim × dim`.
-    const LEVELS: &[(u8, &str, u32)] = &[
-        (0, "559082264.0287178", 1),
-        (1, "279541132.0143589", 2),
-        (2, "139770566.0071794", 4),
-        (3, "69885283.0035897", 8),
-        (4, "34942641.5017948", 16),
-        (5, "17471320.7508974", 32),
-        (6, "8735660.3754487", 64),
-        (7, "4367830.1877244", 128),
-        (8, "2183915.0938622", 256),
-        (9, "1091957.5469311", 512),
-        (10, "545978.7734655", 1024),
-        (11, "272989.3867328", 2048),
-        (12, "136494.6933664", 4096),
-        (13, "68247.3466832", 8192),
-        (14, "34123.6733416", 16384),
-        (15, "17061.8366708", 32768),
-        (16, "8530.9183354", 65536),
-        (17, "4265.4591677", 131072),
-        (18, "2132.7295838", 262144),
-        (19, "1066.3647919", 524288),
-        (20, "533.1823960", 1048576),
-        (21, "266.5911980", 2097152),
-        (22, "133.2955990", 4194304),
-    ];
+    const WORLD_METRES: f64 = 40_075_016.685_578_4;
+    const PIXEL_METRES: f64 = 0.00028;
+    let size = TILE_SIZE.to_string();
 
     write_event(writer, Event::Start(BytesStart::new("TileMatrixSet")));
     write_text_element(writer, "ows:Title", "GoogleMapsCompatible");
     write_text_element(writer, "ows:Identifier", "GoogleMapsCompatible");
     write_text_element(writer, "ows:SupportedCRS", "urn:ogc:def:crs:EPSG::3857");
-    write_text_element(
-        writer,
-        "WellKnownScaleSet",
-        "urn:ogc:def:wkss:OGC:1.0:GoogleMapsCompatible",
-    );
-    for (zoom, scale, dim) in LEVELS {
+    for zoom in 0..=22 {
+        let dim = 1_u32 << zoom;
+        let scale = WORLD_METRES / (PIXEL_METRES * f64::from(TILE_SIZE) * f64::from(dim));
         write_event(writer, Event::Start(BytesStart::new("TileMatrix")));
         write_text_element(writer, "ows:Identifier", &zoom.to_string());
-        write_text_element(writer, "ScaleDenominator", scale);
+        write_text_element(writer, "ScaleDenominator", &format!("{scale:.7}"));
         write_text_element(writer, "TopLeftCorner", TOP_LEFT);
-        write_text_element(writer, "TileWidth", "256");
-        write_text_element(writer, "TileHeight", "256");
+        write_text_element(writer, "TileWidth", &size);
+        write_text_element(writer, "TileHeight", &size);
         write_text_element(writer, "MatrixWidth", &dim.to_string());
         write_text_element(writer, "MatrixHeight", &dim.to_string());
         write_event(writer, Event::End(BytesEnd::new("TileMatrix")));

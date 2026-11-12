@@ -19,18 +19,26 @@
 //! )
 //! ```
 //!
-//! Concurrency: the wrapped `duckdb::Connection` is `!Send`, so each
-//! request acquires the [`tokio::sync::Mutex`] and executes the query
-//! on a `spawn_blocking` task.
+//! Each query leases the connection asynchronously before starting blocking work.
+//! The deadline includes connection acquisition.
 
+use super::duckdb_query::{FinishQuery, QueryControl};
+use crate::cache::ContentVersion;
 use crate::error::{MaptileError, MaptileResult};
 use crate::sources::tile_math::tile_envelope_4326;
 use crate::sources::{
     TileCoord, TileEncoding, TileFormat, TileInfo, TileQuery, TileResponse, TileSource,
 };
 use bytes::Bytes;
+use duckdb::types::ValueRef;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
+
+const QUERY_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_QUERY_ROWS: usize = 100_000;
+const MAX_GEOMETRY_INPUT_BYTES: usize = 32 * 1024 * 1024;
+const MAX_TILE_BYTES: usize = crate::transport::MAX_DECODED_TILE_BYTES;
 
 #[derive(Debug, Clone)]
 pub struct DuckDbSourceConfig {
@@ -86,6 +94,7 @@ impl Default for DuckDbSourceConfig {
     }
 }
 
+#[derive(Clone)]
 pub struct DuckDbSource {
     id: String,
     tj: tilejson::TileJSON,
@@ -98,6 +107,7 @@ pub struct DuckDbSource {
     geometry_column: Option<String>,
     layer_name: String,
     cache_zoom: crate::cache::CacheZoomRange,
+    content_version: ContentVersion,
 }
 
 impl std::fmt::Debug for DuckDbSource {
@@ -115,16 +125,19 @@ impl DuckDbSource {
     /// alongside async-only sources.
     pub async fn open(cfg: DuckDbSourceConfig) -> MaptileResult<Self> {
         let path = cfg.database_path.clone();
-        let conn = tokio::task::spawn_blocking(move || {
+        let conn = crate::transport::run_blocking(move || {
+            let config = duckdb::Config::default()
+                .max_memory("256MiB")
+                .and_then(|config| config.threads(2))
+                .map_err(MaptileError::backend)?;
             if path == ":memory:" {
-                duckdb::Connection::open_in_memory()
+                duckdb::Connection::open_in_memory_with_flags(config)
             } else {
-                duckdb::Connection::open(&path)
+                duckdb::Connection::open_with_flags(&path, config)
             }
+            .map_err(MaptileError::backend)
         })
-        .await
-        .map_err(|e| MaptileError::BackendMsg(e.to_string()))?
-        .map_err(MaptileError::backend)?;
+        .await?;
 
         let mut tj = tilejson::tilejson! { tiles: vec![] };
         tj.minzoom = Some(cfg.minzoom);
@@ -162,8 +175,37 @@ impl DuckDbSource {
             geometry_column: cfg.geometry_column,
             layer_name: cfg.layer_name,
             cache_zoom,
+            content_version: ContentVersion::new_generation(),
         })
     }
+
+    async fn run_query(
+        &self,
+        query: impl FnOnce(&duckdb::Connection, &QueryControl) -> MaptileResult<Bytes> + Send + 'static,
+    ) -> MaptileResult<Bytes> {
+        let deadline = tokio::time::Instant::now() + QUERY_TIMEOUT;
+        let conn = tokio::time::timeout_at(deadline, self.conn.clone().lock_owned())
+            .await
+            .map_err(|_| query_timeout())?;
+        let running = QueryControl::new(&conn);
+        let _cancellation = running.watch(deadline);
+        let task = tokio::task::spawn_blocking(move || {
+            let conn = conn;
+            let _completion = FinishQuery(running.clone());
+            if running.cancelled() {
+                return Err(query_timeout());
+            }
+            query(&conn, &running)
+        });
+        tokio::time::timeout_at(deadline, task)
+            .await
+            .map_err(|_| query_timeout())?
+            .map_err(MaptileError::backend)?
+    }
+}
+
+fn query_timeout() -> MaptileError {
+    MaptileError::SourceUnavailable("DuckDB query deadline exceeded".into())
 }
 
 #[async_trait::async_trait]
@@ -180,20 +222,11 @@ impl TileSource for DuckDbSource {
     fn cache_zoom(&self) -> crate::cache::CacheZoomRange {
         self.cache_zoom
     }
+    fn content_version(&self) -> ContentVersion {
+        self.content_version
+    }
     fn clone_source(&self) -> Box<dyn TileSource> {
-        // Connection cannot be cheaply cloned; we share it via Arc<Mutex>.
-        Box::new(DuckDbSource {
-            id: self.id.clone(),
-            tj: self.tj.clone(),
-            info: self.info,
-            minzoom: self.minzoom,
-            maxzoom: self.maxzoom,
-            query_template: self.query_template.clone(),
-            conn: self.conn.clone(),
-            geometry_column: self.geometry_column.clone(),
-            layer_name: self.layer_name.clone(),
-            cache_zoom: self.cache_zoom,
-        })
+        Box::new(self.clone())
     }
 
     async fn get_tile(
@@ -212,27 +245,34 @@ impl TileSource for DuckDbSource {
             return self.live_get_tile(xyz, sql, geom_col).await;
         }
 
-        let conn = self.conn.clone();
-        let blob: Vec<u8> = tokio::task::spawn_blocking(move || -> MaptileResult<Vec<u8>> {
-            let conn = conn.blocking_lock();
-            let mut stmt = conn.prepare(&sql).map_err(MaptileError::backend)?;
-            let mut rows = stmt.query([]).map_err(MaptileError::backend)?;
-            let row = rows
-                .next()
-                .map_err(MaptileError::backend)?
-                .ok_or_else(|| MaptileError::TileNotFound(xyz.z, xyz.x, xyz.y))?;
-            let bytes: Vec<u8> = row.get::<_, Vec<u8>>(0).map_err(MaptileError::backend)?;
-            Ok(bytes)
-        })
-        .await
-        .map_err(|e| MaptileError::BackendMsg(e.to_string()))??;
+        let sql = limit_query(&sql, 1);
+        let blob = self
+            .run_query(move |conn, _| {
+                let mut stmt = conn.prepare(&sql).map_err(MaptileError::backend)?;
+                let mut rows = stmt.query([]).map_err(MaptileError::backend)?;
+                let row = rows
+                    .next()
+                    .map_err(MaptileError::backend)?
+                    .ok_or_else(|| MaptileError::TileNotFound(xyz.z, xyz.x, xyz.y))?;
+                let value = row.get_ref(0).map_err(MaptileError::backend)?;
+                let bytes = value
+                    .as_blob()
+                    .map_err(|error| MaptileError::BackendMsg(error.to_string()))?;
+                if bytes.len() > MAX_TILE_BYTES {
+                    return Err(MaptileError::PayloadTooLarge {
+                        limit: MAX_TILE_BYTES,
+                    });
+                }
+                Ok(Bytes::copy_from_slice(bytes))
+            })
+            .await?;
 
         if blob.is_empty() {
             return Err(MaptileError::TileNotFound(xyz.z, xyz.x, xyz.y));
         }
 
         Ok(TileResponse {
-            data: Bytes::from(blob),
+            data: blob,
             info: self.info,
             last_modified: None,
         })
@@ -246,64 +286,91 @@ impl DuckDbSource {
         sql: String,
         geometry_column: String,
     ) -> MaptileResult<TileResponse> {
-        let conn = self.conn.clone();
         let layer_name = self.layer_name.clone();
         let info = self.info;
         let env = tile_envelope_4326(xyz.z, xyz.x, xyz.y);
 
-        let mvt: Bytes = tokio::task::spawn_blocking(move || -> MaptileResult<Bytes> {
-            let conn = conn.blocking_lock();
-            let mut stmt = conn.prepare(&sql).map_err(MaptileError::backend)?;
+        let sql = limit_query(&sql, MAX_QUERY_ROWS + 1);
+        let mvt = self
+            .run_query(move |conn, control| {
+                let mut stmt = conn.prepare(&sql).map_err(MaptileError::backend)?;
 
-            // duckdb-rs 1.10505 exposes result-column metadata only after
-            // execution. Asking the unexecuted statement panics, including
-            // for valid live-geometry queries.
-            let mut rows = stmt.query([]).map_err(MaptileError::backend)?;
-            let col_names = rows
-                .as_ref()
-                .expect("fresh query retains its statement")
-                .column_names();
-            let geom_idx = col_names
-                .iter()
-                .position(|n| n == &geometry_column)
-                .ok_or_else(|| {
-                    MaptileError::Config(format!(
-                        "duckdb live-geometry: column {geometry_column:?} not in result set"
-                    ))
-                })?;
+                // duckdb-rs 1.10505 exposes result-column metadata only after
+                // execution. Asking the unexecuted statement panics, including
+                // for valid live-geometry queries.
+                let mut rows = stmt.query([]).map_err(MaptileError::backend)?;
+                let col_names = rows
+                    .as_ref()
+                    .expect("fresh query retains its statement")
+                    .column_names();
+                let geom_idx = col_names
+                    .iter()
+                    .position(|n| n == &geometry_column)
+                    .ok_or_else(|| {
+                        MaptileError::Config(format!(
+                            "duckdb live-geometry: column {geometry_column:?} not in result set"
+                        ))
+                    })?;
 
-            let mut features: Vec<crate::wkb_mvt::WkbFeature> = Vec::new();
-            while let Some(row) = rows.next().map_err(MaptileError::backend)? {
-                let wkb: Vec<u8> = match row.get::<_, Vec<u8>>(geom_idx) {
-                    Ok(v) => v,
-                    Err(_) => continue, // null geometry → skip
-                };
-                if wkb.is_empty() {
-                    continue;
-                }
-
-                let mut props = serde_json::Map::with_capacity(col_names.len() - 1);
-                for (i, name) in col_names.iter().enumerate() {
-                    if i == geom_idx {
+                let mut features: Vec<crate::wkb_mvt::WkbFeature> = Vec::new();
+                let mut remaining = MAX_GEOMETRY_INPUT_BYTES;
+                let mut row_count = 0usize;
+                while let Some(row) = rows.next().map_err(MaptileError::backend)? {
+                    if control.cancelled() {
+                        return Err(query_timeout());
+                    }
+                    row_count += 1;
+                    if row_count > MAX_QUERY_ROWS {
+                        return Err(MaptileError::Resource(format!(
+                            "DuckDB query exceeds {MAX_QUERY_ROWS} rows"
+                        )));
+                    }
+                    let geometry = row.get_ref(geom_idx).map_err(MaptileError::backend)?;
+                    let wkb = match geometry {
+                        ValueRef::Blob(bytes) | ValueRef::Geometry(bytes) => bytes,
+                        _ => continue,
+                    };
+                    if wkb.is_empty() {
                         continue;
                     }
-                    let v: duckdb::types::Value = row
-                        .get::<_, duckdb::types::Value>(i)
-                        .map_err(MaptileError::backend)?;
-                    props.insert(name.clone(), duckdb_value_to_json(&v));
+
+                    charge(&mut remaining, 128usize.saturating_add(wkb.len()))?;
+                    let mut props = serde_json::Map::new();
+                    for (i, name) in col_names.iter().enumerate() {
+                        if i == geom_idx {
+                            continue;
+                        }
+                        let value = row.get_ref(i).map_err(MaptileError::backend)?;
+                        charge(&mut remaining, name.len().saturating_add(128))?;
+                        if property_copy_bound(value) > remaining {
+                            return Err(query_input_limit());
+                        }
+                        let value = duckdb_value_to_json(&value.to_owned());
+                        if let Some(text) = value.as_str() {
+                            charge(&mut remaining, text.len())?;
+                        }
+                        props.insert(name.clone(), value);
+                    }
+
+                    features.push(crate::wkb_mvt::WkbFeature {
+                        id: None,
+                        wkb: Bytes::copy_from_slice(wkb),
+                        properties: props,
+                    });
                 }
 
-                features.push(crate::wkb_mvt::WkbFeature {
-                    id: None,
-                    wkb: Bytes::from(wkb),
-                    properties: props,
-                });
-            }
-
-            crate::wkb_mvt::encode_features_to_mvt(&layer_name, features, env, 4096)
-        })
-        .await
-        .map_err(|e| MaptileError::BackendMsg(e.to_string()))??;
+                drop(rows);
+                drop(stmt);
+                let tile =
+                    crate::wkb_mvt::encode_features_to_mvt(&layer_name, features, env, 4096)?;
+                if tile.len() > MAX_TILE_BYTES {
+                    return Err(MaptileError::PayloadTooLarge {
+                        limit: MAX_TILE_BYTES,
+                    });
+                }
+                Ok(tile)
+            })
+            .await?;
 
         Ok(TileResponse {
             data: mvt,
@@ -311,6 +378,42 @@ impl DuckDbSource {
             last_modified: None,
         })
     }
+}
+
+fn limit_query(sql: &str, limit: usize) -> String {
+    let query = sql.replace('\'', "''");
+    format!("SELECT * FROM query('{query}') LIMIT {limit}")
+}
+
+fn query_input_limit() -> MaptileError {
+    MaptileError::PayloadTooLarge {
+        limit: MAX_GEOMETRY_INPUT_BYTES,
+    }
+}
+
+fn charge(remaining: &mut usize, bytes: usize) -> MaptileResult<()> {
+    *remaining = remaining.checked_sub(bytes).ok_or_else(query_input_limit)?;
+    Ok(())
+}
+
+fn property_copy_bound(value: ValueRef<'_>) -> usize {
+    use duckdb::arrow::array::Array;
+    use duckdb::types::{EnumType, ListType};
+    let nested = match value {
+        ValueRef::Text(text) => return text.len(),
+        ValueRef::Blob(bytes) | ValueRef::Geometry(bytes) => return bytes.len().saturating_mul(6),
+        ValueRef::List(ListType::Regular(array), _) => array.get_array_memory_size(),
+        ValueRef::List(ListType::Large(array), _) => array.get_array_memory_size(),
+        ValueRef::Array(array, _) => array.get_array_memory_size(),
+        ValueRef::Struct(array, _) => array.get_array_memory_size(),
+        ValueRef::Map(array, _) => array.get_array_memory_size(),
+        ValueRef::Union(array, _) => array.get_array_memory_size(),
+        ValueRef::Enum(EnumType::UInt8(array), _) => array.get_array_memory_size(),
+        ValueRef::Enum(EnumType::UInt16(array), _) => array.get_array_memory_size(),
+        ValueRef::Enum(EnumType::UInt32(array), _) => array.get_array_memory_size(),
+        _ => return 0,
+    };
+    nested.saturating_mul(8)
 }
 
 fn duckdb_value_to_json(v: &duckdb::types::Value) -> serde_json::Value {
@@ -371,6 +474,25 @@ mod tests {
         let b = tile_to_web_mercator_bbox(0, 0, 0);
         assert!((b[0] - (-WEB_MERCATOR_EXTENT)).abs() < 1e-6);
         assert!((b[2] - WEB_MERCATOR_EXTENT).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn preencoded_query_accepts_quoted_literals_and_trailing_comments() {
+        let source = DuckDbSource::open(DuckDbSourceConfig {
+            query_template: "SELECT unhex('AABB') AS tile; -- retain valid DuckDB syntax".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let response = source
+            .get_tile(TileCoord { z: 0, x: 0, y: 0 }, None)
+            .await
+            .unwrap();
+        assert_eq!(response.data.as_ref(), [0xaa, 0xbb]);
+        assert_eq!(
+            source.content_version(),
+            source.clone_source().content_version()
+        );
     }
 
     #[test]

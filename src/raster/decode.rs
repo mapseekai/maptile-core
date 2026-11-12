@@ -5,7 +5,8 @@
 //! GDAL buffers see the `from_gdal_buffer` constructor on `RasterImage`.
 
 use crate::error::{MaptileError, MaptileResult};
-use crate::raster::image::RasterImage;
+use crate::raster::image::{MAX_IMAGE_WORKING_BYTES, RasterImage, rgba_len};
+use image::ImageDecoder;
 
 /// Decode `bytes` into a [`RasterImage`] by sniffing the format from the
 /// magic bytes. Falls back to `MaptileError::Render` if the format cannot
@@ -24,19 +25,29 @@ pub fn from_bytes(bytes: &[u8]) -> MaptileResult<RasterImage> {
 ///
 /// **Blocking**: image decode is CPU-bound. See [`from_bytes`] note.
 pub fn from_bytes_format(bytes: &[u8], format: image::ImageFormat) -> MaptileResult<RasterImage> {
-    let dyn_img = image::load_from_memory_with_format(bytes, format)
-        .map_err(|e| MaptileError::Render(format!("decode {format:?}: {e}")))?;
-    let rgba = dyn_img.to_rgba8();
-    let (w, h) = rgba.dimensions();
+    let decode_error = |e| MaptileError::Render(format!("decode {format:?}: {e}"));
+    let mut reader = image::ImageReader::with_format(std::io::Cursor::new(bytes), format);
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(MAX_IMAGE_WORKING_BYTES as u64);
+    reader.limits(limits);
+    let decoder = reader.into_decoder().map_err(decode_error)?;
+    let (w, h) = decoder.dimensions();
+    let rgba_bytes = rgba_len(w, h)?;
+    if decoder.total_bytes() > (MAX_IMAGE_WORKING_BYTES - rgba_bytes) as u64 {
+        return Err(MaptileError::PayloadTooLarge {
+            limit: MAX_IMAGE_WORKING_BYTES,
+        });
+    }
+    let rgba = image::DynamicImage::from_decoder(decoder)
+        .map_err(decode_error)?
+        .into_rgba8();
     RasterImage::from_rgba8(rgba.as_raw(), w, h)
 }
 
 /// Async wrapper for [`from_bytes`] that runs the CPU-bound image
-/// decode on a `tokio::task::spawn_blocking` thread.
+/// decode on a bounded blocking worker.
 pub async fn from_bytes_async(bytes: bytes::Bytes) -> MaptileResult<RasterImage> {
-    tokio::task::spawn_blocking(move || from_bytes(&bytes))
-        .await
-        .map_err(|e| MaptileError::Render(format!("decode task: {e}")))?
+    crate::transport::run_blocking(move || from_bytes(&bytes)).await
 }
 
 #[cfg(test)]
@@ -79,6 +90,15 @@ mod tests {
     fn from_bytes_invalid_returns_render_error() {
         let res = from_bytes(b"this is not an image");
         assert!(matches!(res, Err(MaptileError::Render(_))));
+    }
+
+    #[test]
+    fn rgba_budget_accounts_for_float_planes_before_conversion() {
+        assert!(matches!(
+            RasterImage::from_rgba8(&[], 8192, 8192),
+            Err(MaptileError::PayloadTooLarge { .. })
+        ));
+        assert_eq!(rgba_len(512, 512).unwrap(), 512 * 512 * 4);
     }
 
     #[test]

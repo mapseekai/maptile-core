@@ -7,7 +7,7 @@ use bytes::Bytes;
 use serde_json::{Map, Value};
 use tilejson::{TileJSON, tilejson};
 
-use crate::cache::{CacheZoomRange, TileCache, TileCacheKey};
+use crate::cache::{CacheZoomRange, ContentVersion, TileCache, TileCacheKey};
 use crate::error::{MaptileError, MaptileResult};
 use crate::sources::{
     TileCoord, TileEncoding, TileFormat, TileInfo, TileQuery, TileResponse, TileSource,
@@ -36,6 +36,7 @@ pub struct PostgresFunctionSource {
     supports_url_query: bool,
     tj: TileJSON,
     info: TileInfo,
+    content_version: ContentVersion,
     cache: Option<Arc<TileCache>>,
 }
 
@@ -52,8 +53,9 @@ impl std::fmt::Debug for PostgresFunctionSource {
 
 impl PostgresFunctionSource {
     pub async fn open(pool: Arc<PostgresPool>, cfg: PostgresFunctionConfig) -> MaptileResult<Self> {
-        let supports_url_query = probe_signature(&pool, &cfg.schema, &cfg.function).await?;
-        let sql = build_sql(&cfg.schema, &cfg.function, supports_url_query);
+        let query_type = probe_signature(&pool, &cfg.schema, &cfg.function).await?;
+        let supports_url_query = query_type.is_some();
+        let sql = build_sql(&cfg.schema, &cfg.function, query_type);
 
         let mut tj: TileJSON = tilejson! { tiles: vec![] };
         if let Some(d) = cfg.description.as_ref() {
@@ -81,6 +83,7 @@ impl PostgresFunctionSource {
             supports_url_query,
             tj,
             info,
+            content_version: ContentVersion::new_generation(),
             cache: None,
         })
     }
@@ -112,7 +115,11 @@ impl PostgresFunctionSource {
     }
 }
 
-async fn probe_signature(pool: &PostgresPool, schema: &str, function: &str) -> MaptileResult<bool> {
+async fn probe_signature(
+    pool: &PostgresPool,
+    schema: &str,
+    function: &str,
+) -> MaptileResult<Option<&'static str>> {
     let conn = pool.get().await?;
     let row = conn
         .query_opt(
@@ -136,21 +143,20 @@ async fn probe_signature(pool: &PostgresPool, schema: &str, function: &str) -> M
 
     let normalized: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     match normalized.as_slice() {
-        ["integer", "integer", "integer"] => Ok(false),
-        ["integer", "integer", "integer", "json"] | ["integer", "integer", "integer", "jsonb"] => {
-            Ok(true)
-        }
+        ["integer", "integer", "integer"] => Ok(None),
+        ["integer", "integer", "integer", "json"] => Ok(Some("json")),
+        ["integer", "integer", "integer", "jsonb"] => Ok(Some("jsonb")),
         other => Err(MaptileError::Config(format!(
             "function {schema}.{function} has unsupported signature: {other:?}"
         ))),
     }
 }
 
-fn build_sql(schema: &str, function: &str, with_query: bool) -> String {
+fn build_sql(schema: &str, function: &str, query_type: Option<&'static str>) -> String {
     let s = pg_escape::quote_identifier(schema);
     let f = pg_escape::quote_identifier(function);
-    if with_query {
-        format!("SELECT {s}.{f}($1::int, $2::int, $3::int, $4::json)")
+    if let Some(query_type) = query_type {
+        format!("SELECT {s}.{f}($1::int, $2::int, $3::int, $4::{query_type})")
     } else {
         format!("SELECT {s}.{f}($1::int, $2::int, $3::int)")
     }
@@ -202,6 +208,10 @@ impl TileSource for PostgresFunctionSource {
         &self.cfg.id
     }
 
+    fn content_version(&self) -> ContentVersion {
+        self.content_version
+    }
+
     fn tilejson(&self) -> &TileJSON {
         &self.tj
     }
@@ -236,6 +246,7 @@ impl TileSource for PostgresFunctionSource {
             supports_url_query: self.supports_url_query,
             tj: self.tj.clone(),
             info: self.info,
+            content_version: self.content_version,
             cache: self.cache.clone(),
         })
     }
@@ -311,14 +322,18 @@ impl PostgresFunctionSource {
         let z = i32::from(xyz.z);
         let x = xyz.x as i32;
         let y = xyz.y as i32;
+        let stmt = conn
+            .prepare_cached(&self.sql)
+            .await
+            .map_err(MaptileError::backend)?;
 
         let row_opt = if self.supports_url_query {
             let json = build_query_payload(query);
-            conn.query_opt(&self.sql, &[&z, &x, &y, &json])
+            conn.query_opt(&stmt, &[&z, &x, &y, &json])
                 .await
                 .map_err(MaptileError::backend)?
         } else {
-            conn.query_opt(&self.sql, &[&z, &x, &y])
+            conn.query_opt(&stmt, &[&z, &x, &y])
                 .await
                 .map_err(MaptileError::backend)?
         };
