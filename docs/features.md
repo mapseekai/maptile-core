@@ -25,7 +25,7 @@
 | --- | --- | --- |
 | `cloud` | 对象存储中的 PMTiles | 使用 `object_store`，由应用注入存储客户端 |
 | `duckdb` | DuckDB SQL 瓦片源；预编码 BLOB 或 WGS84 WKB 动态切片 | 编译 bundled DuckDB，准备 C/C++ 工具链 |
-| `geoparquet` | GeoParquet 瓦片归档、本地及远程几何动态切片 | Arrow/Parquet 与 bundled DuckDB；几何查询配置 Spatial 扩展，远程查询同时配置 HTTPFS |
+| `geoparquet` | GeoParquet 瓦片归档、本地及远程几何动态切片 | Arrow/Parquet 与 bundled DuckDB；Spatial 执行几何查询，HTTPFS 直接读取 HTTP/S3，无本机 HTTP 桥 |
 | `local-vector` | FlatGeobuf 直接切片，GeoJSON 与 ZIP Shapefile 导入 GeoParquet | 包含 `geoparquet`，使用 DuckDB Spatial 中的矢量驱动 |
 | `agtiff` | async-geotiff COG 切片、栅格样式和原始像元查询 | 使用原生 PROJ 进行坐标变换 |
 | `raster` | GDAL 栅格处理、覆盖导出、镶嵌源和 PostGIS OutDB | 包含 `agtiff`，准备 GDAL 与 PROJ |

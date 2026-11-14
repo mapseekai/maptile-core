@@ -1,5 +1,4 @@
-//! On-demand, bounded GeoParquet queries over local files or source-scoped
-//! range readers. DuckDB sees no remote credentials or user URL query strings.
+//! On-demand, bounded GeoParquet queries over local files or DuckDB HTTPFS.
 
 use super::duckdb_query::{FinishQuery, QueryControl};
 use super::file_stamp::FileStamp;
@@ -15,7 +14,7 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
 use super::TileCoord;
 use super::geoparquet::GeoParquetSourceConfig;
-use super::geoparquet_remote::RemoteFile;
+use super::geoparquet_remote::{RemoteLocation, configure_httpfs_connection, remote_error};
 use crate::error::{MaptileError, MaptileResult};
 
 /// Per-source execution budget, shared by all clones. DuckDB's memory limit is
@@ -63,6 +62,7 @@ pub(super) struct GeometrySource {
     pool: Arc<QueryPool>,
     sql: Arc<str>,
     local: Option<(PathBuf, FileStamp)>,
+    remote: bool,
     options: GeoParquetQueryOptions,
     pub bounds: Option<[f64; 4]>,
     pub fields: BTreeMap<String, String>,
@@ -94,15 +94,17 @@ impl GeometrySource {
 
     pub fn open_remote(
         cfg: &GeoParquetSourceConfig,
-        remote: Arc<RemoteFile>,
+        remote: &RemoteLocation,
+        deadline: tokio::time::Instant,
     ) -> MaptileResult<Self> {
         Self::open_input(
             cfg,
-            &remote.url.clone(),
+            &remote.url,
             None,
-            Some(remote),
+            Some((remote, deadline)),
             InputKind::GeoParquet,
         )
+        .map_err(remote_error)
     }
 
     #[cfg(feature = "local-vector")]
@@ -126,7 +128,7 @@ impl GeometrySource {
         cfg: &GeoParquetSourceConfig,
         location: &str,
         local: Option<(PathBuf, FileStamp)>,
-        remote: Option<Arc<RemoteFile>>,
+        remote: Option<(&RemoteLocation, tokio::time::Instant)>,
         input: InputKind,
     ) -> MaptileResult<Self> {
         cfg.query_options.validate()?;
@@ -137,12 +139,13 @@ impl GeometrySource {
             return Err(config("layer_name must be nonempty and contain no NUL"));
         }
         let conn = spatial_connection(&cfg.query_options)?;
-        if remote.is_some() {
-            conn.execute_batch("LOAD httpfs").map_err(|e| MaptileError::BackendMsg(format!(
-                "cannot load DuckDB httpfs extension; run the explicit geoparquet_extensions preparation command: {e}"
-            )))?;
-            conn.execute_batch(&format!("SET http_proxy = ''; SET http_retries = 0; SET http_timeout = {}; SET http_keep_alive = false; SET force_download = false;", cfg.query_options.timeout_ms.div_ceil(1000)))
-                .map_err(MaptileError::backend)?;
+        let _remote_query = remote.map(|(_, deadline)| {
+            let running = QueryControl::new(&conn);
+            let cancellation = running.watch(deadline);
+            (FinishQuery(running), cancellation)
+        });
+        if let Some((remote, _)) = remote {
+            remote.configure(&conn, cfg.query_options.timeout_ms)?;
         }
         let path_sql = literal(location);
         conn.execute_batch(&format!(
@@ -310,7 +313,11 @@ impl GeometrySource {
         conn.prepare(&sql).map_err(MaptileError::backend)?;
         let mut connections = Vec::with_capacity(cfg.query_options.pool_size);
         for _ in 1..cfg.query_options.pool_size {
-            connections.push(conn.try_clone().map_err(MaptileError::backend)?);
+            let cloned = conn.try_clone().map_err(MaptileError::backend)?;
+            if remote.is_some() {
+                configure_httpfs_connection(&cloned, cfg.query_options.timeout_ms)?;
+            }
+            connections.push(cloned);
         }
         connections.push(conn);
         check_stamp(&local)?;
@@ -324,10 +331,10 @@ impl GeometrySource {
                 }),
                 slots: Arc::new(Semaphore::new(cfg.query_options.pool_size)),
                 idle: Notify::new(),
-                remote,
             }),
             sql: sql.into(),
             local,
+            remote: remote.is_some(),
             options: cfg.query_options.clone(),
             bounds,
             fields,
@@ -411,7 +418,11 @@ impl GeometrySource {
             .map_err(|_| timeout())?
             .map_err(|e| MaptileError::BackendMsg(format!("GeoParquet query task: {e}")))?;
         drop(cancellation);
-        result
+        if self.remote {
+            result.map_err(remote_error)
+        } else {
+            result
+        }
     }
 }
 
@@ -435,9 +446,6 @@ impl GeometrySource {
             }
             idle.await;
         }
-        if let Some(remote) = &self.pool.remote {
-            remote.close().await?;
-        }
         Ok(())
     }
 }
@@ -451,7 +459,6 @@ struct QueryPool {
     state: Mutex<PoolState>,
     slots: Arc<Semaphore>,
     idle: Notify,
-    remote: Option<Arc<RemoteFile>>,
 }
 impl QueryPool {
     fn start_close(&self) {
@@ -465,9 +472,6 @@ impl QueryPool {
             running.cancel();
         }
         state.connections.clear();
-        if let Some(remote) = &self.remote {
-            remote.start_close();
-        }
     }
 }
 struct ConnectionLease {
@@ -1268,26 +1272,44 @@ mod tests {
             .collect();
         let fixture = fixture_points(&points, true);
         let http = TestHttp::start(std::fs::read(&fixture.path).unwrap()).await;
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .unwrap();
-        let remote = Arc::new(
-            RemoteFile::http(
-                &format!("{}?signature=opaque", http.url),
-                client,
-                Duration::from_secs(3),
-            )
-            .await
-            .unwrap(),
-        );
-        let local_url = remote.url.clone();
+        let original_url = format!("{}?signature=opaque", http.url);
+        let remote = RemoteLocation::http(&original_url, BTreeMap::new()).unwrap();
         let cfg = fixture.config();
-        let source = tokio::task::spawn_blocking(move || GeometrySource::open_remote(&cfg, remote))
-            .await
-            .unwrap()
-            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let source = tokio::task::spawn_blocking(move || {
+            GeometrySource::open_remote(&cfg, &remote, deadline)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            source.sql.contains(&original_url),
+            "DuckDB must query the original URL"
+        );
+        {
+            let mut state = source.pool.state.lock().unwrap();
+            for conn in &state.connections {
+                assert!(
+                    conn.query_row(
+                        "SELECT current_setting('http_timeout') = 10
+                        AND current_setting('http_retries') = 0
+                        AND NOT current_setting('force_download')
+                        AND current_setting('force_download_threshold') = 0
+                        AND NOT current_setting('auto_fallback_to_full_download')
+                        AND NOT current_setting('unsafe_disable_etag_checks')
+                        AND NOT current_setting('enable_http_logging')
+                        AND current_setting('enable_server_cert_verification')
+                        AND current_setting('enable_curl_server_cert_verification')",
+                        [],
+                        |r| r.get::<_, bool>(0),
+                    )
+                    .unwrap(),
+                    "every pooled connection must enforce remote read settings"
+                );
+            }
+            // Exercise the cloned connection, not just the one used to open.
+            state.connections.reverse();
+        }
         let opening = http
             .stats
             .transferred
@@ -1326,60 +1348,87 @@ mod tests {
         source.close().await.unwrap();
         assert!(source.pool.state.lock().unwrap().connections.is_empty());
         assert!(source.tile(TILE, None).await.is_err());
-        let url = url::Url::parse(&local_url).unwrap();
-        assert!(
-            tokio::net::TcpStream::connect((url.host_str().unwrap(), url.port().unwrap()))
-                .await
-                .is_err()
-        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn object_reader_is_released_on_explicit_close_even_while_source_clones_exist() {
-        use object_store::{ObjectStoreExt, memory::InMemory, path::Path as ObjectPath};
-        let fixture = fixture_points(&[(10.0, 60.0)], true);
-        let store = Arc::new(InMemory::new());
-        store
-            .put(
-                &ObjectPath::from("data.parquet"),
-                std::fs::read(&fixture.path).unwrap().into(),
-            )
-            .await
-            .unwrap();
-        let weak = Arc::downgrade(&store);
-        let source =
-            GeoParquetSource::open_object_store(fixture.config(), store.clone(), "data.parquet")
-                .await
-                .unwrap();
-        let clone = source.clone();
-        drop(store);
-        assert!(weak.upgrade().is_some());
-        assert!(!source.get_tile(TILE, None).await.unwrap().data.is_empty());
-        source.close().await.unwrap();
-        assert!(
-            weak.upgrade().is_none(),
-            "the source must release its object-store client during close"
-        );
-        assert!(clone.get_tile(TILE, None).await.is_err());
-        clone.close().await.unwrap();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn http_refuses_redirects_ignored_ranges_and_changed_objects() {
+    async fn http_authentication_is_session_scoped_and_errors_are_redacted() {
         use std::sync::atomic::Ordering;
         let fixture = fixture_points(&[(10.0, 60.0)], true);
         let http = TestHttp::start(std::fs::read(&fixture.path).unwrap()).await;
-        http.stats.mode.store(1, Ordering::SeqCst);
-        assert!(
-            GeoParquetSource::open_http(fixture.config(), &http.url)
+        http.stats.mode.store(6, Ordering::SeqCst);
+        let signed_url = format!("{}?signature=private-signature", http.url);
+        let error = GeoParquetSource::open_http(fixture.config(), &signed_url)
+            .await
+            .unwrap_err();
+        assert!(!format!("{error:?}").contains("private-signature"));
+        let headers = BTreeMap::from([("Authorization".into(), "Bearer test-'token".into())]);
+        let source = GeoParquetSource::open_http_with_headers(
+            fixture.config(),
+            &signed_url,
+            headers.clone(),
+        )
+        .await
+        .unwrap();
+        let clone = source.clone();
+        assert!(!source.get_tile(TILE, None).await.unwrap().data.is_empty());
+        let reopened =
+            GeoParquetSource::open_http_with_headers(fixture.config(), &signed_url, headers)
                 .await
-                .is_err()
+                .unwrap();
+        assert_ne!(source.content_version(), reopened.content_version());
+        assert!(
+            GeoParquetSource::open_http(fixture.config(), &signed_url)
+                .await
+                .is_err(),
+            "secrets must not escape the source session"
         );
-        assert_eq!(
-            http.stats.requests.load(Ordering::SeqCst),
-            1,
-            "must not follow redirect"
-        );
+        source.close().await.unwrap();
+        assert!(clone.get_tile(TILE, None).await.is_err());
+        clone.close().await.unwrap();
+        assert!(!reopened.get_tile(TILE, None).await.unwrap().data.is_empty());
+        reopened.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn s3_reads_directly_with_explicit_endpoint_credentials_and_session_token() {
+        use crate::sources::GeoParquetS3Options;
+        use std::sync::atomic::Ordering;
+        let fixture = fixture_points(&[(10.0, 60.0)], true);
+        let http = TestHttp::start(std::fs::read(&fixture.path).unwrap()).await;
+        http.stats.mode.store(7, Ordering::SeqCst);
+        let options = GeoParquetS3Options {
+            endpoint: Some(
+                http.url
+                    .strip_prefix("http://")
+                    .unwrap()
+                    .strip_suffix("/data.parquet")
+                    .unwrap()
+                    .into(),
+            ),
+            access_key_id: "test-key".into(),
+            secret_access_key: "test-secret".into(),
+            session_token: Some("test-session".into()),
+            use_ssl: false,
+            path_style: true,
+            ..Default::default()
+        };
+        let source =
+            GeoParquetSource::open_s3(fixture.config(), "s3://bucket/data.parquet", options)
+                .await
+                .unwrap();
+        let actual = source.get_tile(TILE, None).await.unwrap();
+        let local = GeoParquetSource::open(fixture.config()).unwrap();
+        assert_eq!(actual.data, local.get_tile(TILE, None).await.unwrap().data);
+        assert!(!http.stats.ranges.lock().unwrap().is_empty());
+        source.close().await.unwrap();
+        local.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn http_refuses_full_download_fallback_and_changed_objects() {
+        use std::sync::atomic::Ordering;
+        let fixture = fixture_points(&vec![(10.0, 60.0); 100_000], true);
+        let http = TestHttp::start(std::fs::read(&fixture.path).unwrap()).await;
         http.stats.mode.store(2, Ordering::SeqCst);
         assert!(
             GeoParquetSource::open_http(fixture.config(), &http.url)
@@ -1408,7 +1457,10 @@ mod tests {
             .store(4, std::sync::atomic::Ordering::SeqCst);
         let source = GeoParquetSource::open_http(
             fixture.config(),
-            &format!("{}?signature=get-only", http.url),
+            &format!(
+                "{}?signature=get-only",
+                http.url.replacen("http:", "HTTP:", 1)
+            ),
         )
         .await
         .unwrap();
@@ -1442,58 +1494,34 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn remote_close_waits_for_active_ranges_and_can_be_cancelled_and_retried() {
+    async fn remote_close_waits_for_duckdb_read_and_can_be_cancelled_and_retried() {
         use std::sync::atomic::Ordering;
-        let fixture = fixture_points(&[(10.0, 60.0)], true);
+        let fixture = fixture_points(&vec![(10.0, 60.0); 100_000], true);
         let http = TestHttp::start(std::fs::read(&fixture.path).unwrap()).await;
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .unwrap();
-        let remote = RemoteFile::http(&http.url, client, Duration::from_millis(150))
+        let source = Arc::new(
+            GeoParquetSource::open_http(fixture.config(), &http.url)
+                .await
+                .unwrap(),
+        );
+        http.stats.mode.store(5, Ordering::SeqCst);
+        let reading = source.clone();
+        let request = tokio::spawn(async move { reading.get_tile(TILE, None).await });
+        tokio::time::timeout(Duration::from_secs(2), http.stats.blocked.notified())
             .await
             .unwrap();
-        http.stats.ranges.lock().unwrap().clear();
-        http.stats.mode.store(5, Ordering::SeqCst);
-        let local_url = remote.url.clone();
-        let request = tokio::spawn(async move {
-            reqwest::Client::builder()
-                .no_proxy()
-                .build()
-                .unwrap()
-                .get(local_url)
-                .header("Range", "bytes=0-7")
-                .send()
-                .await
-        });
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while http.stats.ranges.lock().unwrap().is_empty() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
         assert!(
-            tokio::time::timeout(Duration::from_millis(10), remote.close())
+            tokio::time::timeout(Duration::from_millis(10), source.close())
                 .await
                 .is_err()
         );
-        tokio::time::timeout(Duration::from_secs(1), remote.close())
+        http.stats.resume.close();
+        tokio::time::timeout(Duration::from_secs(2), source.close())
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(
-            request.await.unwrap().unwrap().status(),
-            reqwest::StatusCode::BAD_GATEWAY
-        );
-        let url = url::Url::parse(&remote.url).unwrap();
-        assert!(
-            tokio::net::TcpStream::connect((url.host_str().unwrap(), url.port().unwrap()))
-                .await
-                .is_err()
-        );
-        remote.close().await.unwrap();
+        assert!(request.await.unwrap().is_err());
+        assert!(source.get_tile(TILE, None).await.is_err());
+        source.close().await.unwrap();
     }
 
     struct HttpStats {
@@ -1502,6 +1530,8 @@ mod tests {
         transferred: std::sync::atomic::AtomicU64,
         requests: std::sync::atomic::AtomicUsize,
         mode: std::sync::atomic::AtomicU8,
+        blocked: Notify,
+        resume: Semaphore,
     }
     struct TestHttp {
         url: String,
@@ -1516,11 +1546,17 @@ mod tests {
                 transferred: 0.into(),
                 requests: 0.into(),
                 mode: 0.into(),
+                blocked: Notify::new(),
+                resume: Semaphore::new(0),
             });
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let url = format!("http://{}/data.parquet", listener.local_addr().unwrap());
             let app = axum::Router::new()
                 .route("/data.parquet", axum::routing::any(test_http_request))
+                .route(
+                    "/bucket/data.parquet",
+                    axum::routing::any(test_http_request),
+                )
                 .with_state(stats.clone());
             let task = tokio::spawn(async move {
                 axum::serve(listener, app).await.unwrap();
@@ -1543,10 +1579,25 @@ mod tests {
         use std::sync::atomic::Ordering;
         stats.requests.fetch_add(1, Ordering::SeqCst);
         let mode = stats.mode.load(Ordering::SeqCst);
-        if mode == 1 {
+        if (mode == 6
+            && headers
+                .get(header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                != Some("Bearer test-'token"))
+            || (mode == 7
+                && (!headers
+                    .get(header::AUTHORIZATION)
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|v| {
+                        v.starts_with("AWS4-HMAC-SHA256 ") && v.contains("Credential=test-key/")
+                    })
+                    || headers
+                        .get("x-amz-security-token")
+                        .and_then(|v| v.to_str().ok())
+                        != Some("test-session")))
+        {
             return Response::builder()
-                .status(StatusCode::FOUND)
-                .header(header::LOCATION, "http://127.0.0.1:1/forbidden")
+                .status(StatusCode::FORBIDDEN)
                 .body(Body::empty())
                 .unwrap();
         }
@@ -1567,11 +1618,12 @@ mod tests {
         let range = headers
             .get(header::RANGE)
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| super::super::geoparquet_remote::parse_range(v, stats.bytes.len() as u64))
+            .and_then(|v| test_range(v, stats.bytes.len() as u64))
             .expect("every data GET must carry a valid Range");
         stats.ranges.lock().unwrap().push(range.clone());
         if mode == 5 {
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            stats.blocked.notify_one();
+            let _ = stats.resume.acquire().await;
         }
         if mode == 2 {
             return response.body(Body::from(stats.bytes.clone())).unwrap();
@@ -1595,6 +1647,20 @@ mod tests {
                 stats.bytes.slice(range.start as usize..range.end as usize),
             ))
             .unwrap()
+    }
+
+    fn test_range(value: &str, size: u64) -> Option<std::ops::Range<u64>> {
+        let (start, end) = value.strip_prefix("bytes=")?.split_once('-')?;
+        if start.is_empty() {
+            return Some(size.saturating_sub(end.parse().ok()?)..size);
+        }
+        let start = start.parse::<u64>().ok()?;
+        let end = if end.is_empty() {
+            size
+        } else {
+            end.parse::<u64>().ok()?.checked_add(1)?.min(size)
+        };
+        (start < end).then_some(start..end)
     }
 
     struct Fixture {

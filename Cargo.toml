@@ -11,7 +11,6 @@ publish = false
 
 [dependencies]
 async-trait = "0.1"
-axum = { version = "0.8", default-features = false, features = ["http1", "tokio"], optional = true }
 async-geotiff = { version = "=0.13.0", default-features = false, features = ["proj", "mosaic", "stac", "webp"], optional = true }
 base64 = "0.23"
 blake3 = "1.8"
@@ -35,7 +34,6 @@ prost = "0.14"
 quick-xml = "0.42"
 regex = "1.13"
 raster-style = "=0.4.0"
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"], optional = true }
 deadpool-postgres = { version = "0.14", features = ["rt_tokio_1"] }
 duckdb = { version = "~1.10506.1", features = ["bundled"], optional = true }
 gdal = { version = "0.19", optional = true }
@@ -76,7 +74,7 @@ zip = { version = "9.5.1", default-features = false, features = ["deflate-flate2
 default = []
 cloud = ["dep:object_store", "dep:url", "pmtiles/object-store"]
 duckdb = ["dep:duckdb"]
-geoparquet = ["dep:parquet", "dep:arrow-array", "dep:arrow-schema", "dep:duckdb", "duckdb/parquet", "dep:axum", "dep:reqwest", "dep:object_store", "dep:url"]
+geoparquet = ["dep:parquet", "dep:arrow-array", "dep:arrow-schema", "dep:duckdb", "duckdb/parquet", "dep:url"]
 local-vector = ["geoparquet", "dep:tempfile", "dep:zip"]
 metrics    = ["dep:prometheus"]
 mlt        = ["dep:mlt-core", "dep:geo-types"]
@@ -94,6 +92,7 @@ render-opengl = ["render", "maplibre_native/opengl"]
 stac = ["agtiff"]
 
 [dev-dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 criterion = { version = "0.8", default-features = false, features = ["plotters", "cargo_bench_support"] }
 futures = "0.3"
 # PROJ currently links libsqlite3-sys <0.36; rusqlite 0.40 conflicts.
@@ -120,6 +119,10 @@ undocumented_unsafe_blocks = "warn"
 
 [[example]]
 name = "geoparquet_extensions"
+required-features = ["geoparquet"]
+
+[[example]]
+name = "geoparquet_remote"
 required-features = ["geoparquet"]
 
 [[example]]

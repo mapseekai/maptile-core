@@ -57,7 +57,9 @@ mod geoparquet_geometry;
 #[cfg(feature = "geoparquet")]
 mod geoparquet_remote;
 #[cfg(feature = "geoparquet")]
-pub use geoparquet::{GeoParquetColumns, GeoParquetSource, GeoParquetSourceConfig};
+pub use geoparquet::{
+    GeoParquetColumns, GeoParquetS3Options, GeoParquetSource, GeoParquetSourceConfig,
+};
 
 #[cfg(feature = "local-vector")]
 pub mod local_vector;

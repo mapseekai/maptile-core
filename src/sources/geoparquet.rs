@@ -5,13 +5,14 @@
 use super::file_stamp::FileStamp;
 pub use super::geoparquet_geometry::GeoParquetQueryOptions;
 use super::geoparquet_geometry::{GeometrySource, valid_bounds};
-use super::geoparquet_remote::RemoteFile;
+pub use super::geoparquet_remote::GeoParquetS3Options;
+use super::geoparquet_remote::RemoteLocation;
 use crate::error::{MaptileError, MaptileResult};
 use crate::sources::{
     TileCoord, TileEncoding, TileFormat, TileInfo, TileQuery, TileResponse, TileSource,
 };
 use bytes::Bytes;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -166,65 +167,49 @@ impl GeoParquetSource {
         Self::from_opened(cfg, tiles, geometry, content_version)
     }
 
-    /// Open one HTTP(S) GeoParquet object with bounded Range requests. The
-    /// caller must authorize the destination; server callers additionally pin
-    /// validated DNS addresses. Redirects and ambient proxies are disabled.
+    /// Read one HTTP(S) GeoParquet file directly through DuckDB HTTPFS.
+    /// Use an immutable URL on a trusted Range-capable endpoint. The application
+    /// must enforce network egress policy, including redirects and DNS changes.
     pub async fn open_http(cfg: GeoParquetSourceConfig, url: &str) -> MaptileResult<Self> {
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .no_gzip()
-            .no_brotli()
-            .no_zstd()
-            .no_deflate()
-            .pool_max_idle_per_host(cfg.query_options.pool_size)
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_millis(cfg.query_options.timeout_ms))
-            .build()
-            .map_err(MaptileError::backend)?;
-        Self::open_http_with_client(cfg, url, client).await
+        Self::open_http_with_headers(cfg, url, BTreeMap::new()).await
     }
 
-    /// Use a caller-controlled HTTP transport, including DNS and egress policy.
-    pub async fn open_http_with_client(
+    /// Authenticate direct HTTPFS reads with session-local HTTP headers.
+    /// Transport headers such as Range and Host cannot be overridden. This does
+    /// not accept a Rust HTTP client; DuckDB owns the network connections.
+    pub async fn open_http_with_headers(
         cfg: GeoParquetSourceConfig,
         url: &str,
-        client: reqwest::Client,
+        headers: BTreeMap<String, String>,
     ) -> MaptileResult<Self> {
         validate_remote_config(&cfg)?;
-        let remote = RemoteFile::http(
-            url,
-            client,
-            Duration::from_millis(cfg.query_options.timeout_ms),
-        )
-        .await?;
-        Self::open_remote(cfg, remote).await
+        Self::open_remote(cfg, RemoteLocation::http(url, headers)?).await
     }
 
-    /// Open one object through an existing S3-compatible or other object store.
-    /// This performs range reads, not an upfront download to a local cache.
-    pub async fn open_object_store(
+    /// Read one immutable `s3://bucket/key` directly through DuckDB HTTPFS.
+    /// Explicit credentials are scoped to this file and discarded on close.
+    /// Custom endpoints must be trusted and support HTTP Range requests.
+    pub async fn open_s3(
         cfg: GeoParquetSourceConfig,
-        store: Arc<dyn object_store::ObjectStore>,
-        key: &str,
+        url: &str,
+        options: GeoParquetS3Options,
     ) -> MaptileResult<Self> {
         validate_remote_config(&cfg)?;
-        let remote = RemoteFile::object(
-            store,
-            key,
-            Duration::from_millis(cfg.query_options.timeout_ms),
-        )
-        .await?;
-        Self::open_remote(cfg, remote).await
+        Self::open_remote(cfg, RemoteLocation::s3(url, options)?).await
     }
 
-    async fn open_remote(cfg: GeoParquetSourceConfig, remote: RemoteFile) -> MaptileResult<Self> {
-        let identity = format!("{cfg:?}:{}", remote.identity);
-        let version = crate::cache::ContentVersion::from_input(identity.as_bytes());
-        let timeout = Duration::from_millis(cfg.query_options.timeout_ms);
-        tokio::time::timeout(
-            timeout,
+    async fn open_remote(
+        cfg: GeoParquetSourceConfig,
+        remote: RemoteLocation,
+    ) -> MaptileResult<Self> {
+        // Reopening never reuses tiles from a previous remote session.
+        let version = crate::cache::ContentVersion::new_generation();
+        let deadline =
+            tokio::time::Instant::now() + Duration::from_millis(cfg.query_options.timeout_ms);
+        tokio::time::timeout_at(
+            deadline,
             tokio::task::spawn_blocking(move || {
-                let geometry = Arc::new(GeometrySource::open_remote(&cfg, Arc::new(remote))?);
+                let geometry = Arc::new(GeometrySource::open_remote(&cfg, &remote, deadline)?);
                 Self::from_opened(cfg, HashMap::new(), Some(geometry), version)
             }),
         )

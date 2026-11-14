@@ -4,6 +4,12 @@
 
 ## 未发布
 
+### GeoParquet 远程直读
+
+远程几何查询直接使用 DuckDB HTTPFS 读取 HTTP(S) 或 S3 文件，移除回环 HTTP 服务及 GeoParquet 对 axum/reqwest 的生产依赖。空间查询、MVT 编码、连接池和关闭接口继续使用 DuckDB。`geoparquet` 不再启用 Rust `object_store`；其他数据源的存储接口不变。
+
+`open_http` 保持签名；移除 `open_http_with_client` 与 `open_object_store`，分别使用 `open_http_with_headers` 或 `open_s3`/`GeoParquetS3Options` 接入认证。此为公共 API 破坏性调整。HTTPFS 自行处理网络，应用需在部署网络层控制 DNS、重定向和出口；不再继承 Rust 客户端的网络策略。远程源每次打开分配新的缓存内容代次。迁移说明见[矢量文件指南](geoparquet.md#从回环桥接接口迁移)。
+
 ### WKB 输入校验
 
 WKB→MVT 与 `wkb_bbox` 在调用 geozero 前，先以无分配的结构预检验证完整载荷、计数、子类型和维度。保留 16 MiB 输入上限，最多接受 64 层几何嵌套；截断、尾随字节、虚假大计数及会触发上游容量下溢的空环会返回错误或 `None`，不进入大容量预分配。有效 OGC/ISO WKB、EWKB、Z/M/ZM、SRID 和大小端组合有回归覆盖。

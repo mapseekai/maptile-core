@@ -9,8 +9,8 @@
 | 数据 | 入口 | 处理方式 | Feature |
 | --- | --- | --- | --- |
 | 本地 GeoParquet 几何文件 | `GeoParquetSource::open`，设置 `geometry_column` | 查询几何、投影、裁剪并生成 MVT | `geoparquet` |
-| HTTP(S) GeoParquet | `open_http` / `open_http_with_client` | 按 Range 读取远程几何文件并生成 MVT | `geoparquet` |
-| S3 兼容或其他对象存储中的 GeoParquet | `open_object_store` | 通过调用方提供的对象存储客户端按范围读取 | `geoparquet` |
+| HTTP(S) GeoParquet | `open_http` / `open_http_with_headers` | 按 Range 读取远程几何文件并生成 MVT | `geoparquet` |
+| S3 兼容对象存储中的 GeoParquet | `open_s3` | DuckDB HTTPFS 直接按范围读取 | `geoparquet` |
 | 本地预编码瓦片归档 | `GeoParquetSource::open`，使用默认 `geometry_column = None` | 从 `(z, x, y, tile)` 列建立内存索引，按坐标返回瓦片 | `geoparquet` |
 | 本地 FlatGeobuf | `FlatGeobufSource::open` | 直接读取几何并生成 MVT | `local-vector` |
 | 本地 GeoJSON、ZIP Shapefile | `import_to_geoparquet` | 一次性转换为 GeoParquet，再通过几何源提供瓦片 | `local-vector` |
@@ -85,7 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 | 字段 | 默认值 | 用途 |
 | --- | --- | --- |
 | `id` | `"geoparquet"` | 源管理器使用的数据源标识 |
-| `path` | 空路径 | 本地文件路径；远程入口通过独立参数接收 URL 或对象 key |
+| `path` | 空路径 | 本地文件路径；远程入口通过独立参数接收 HTTP(S) URL 或 S3 URI |
 | `geometry_column` | `None` | 设置为几何列名时启用动态 MVT；保留默认值时读取瓦片归档 |
 | `layer_name` | `"data"` | 动态 MVT 内部的图层名 |
 | `srid` | `None` | 显式 EPSG 覆盖值，默认读取文件的 CRS 信息 |
@@ -103,19 +103,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 ## 读取 HTTP 和对象存储中的 GeoParquet
 
-远程入口使用几何模式，在配置中设置非空的 `geometry_column`。应用可以根据网络环境选择默认 HTTP 客户端、自定义客户端或对象存储客户端：
+远程入口使用几何模式，在配置中设置非空的 `geometry_column`。DuckDB HTTPFS 直接读取远程 Parquet，Spatial 在同一查询中完成空间过滤、投影、裁剪和 MVT 编码。核心库不启动本机 HTTP 服务，也不把整个文件预先下载到本地。
 
-| 接口 | 调用方提供 | 读取行为 |
+| 接口 | 调用方提供 | 认证方式 |
 | --- | --- | --- |
-| `open_http(config, url).await` | 单个 HTTP(S) 文件 URL | 使用有界 Range 请求，客户端关闭自动重定向、环境代理和透明解压 |
-| `open_http_with_client(config, url, client).await` | 文件 URL 与 `reqwest::Client` | 复用调用方设置的 DNS、连接和网络出口策略 |
-| `open_object_store(config, store, key).await` | `Arc<dyn object_store::ObjectStore>` 与对象 key | 通过现有客户端读取 S3 兼容或其他对象存储 |
+| `open_http(config, url).await` | 单个 HTTP(S) 文件 URL | 公共 URL 或预签名 URL |
+| `open_http_with_headers(config, url, headers).await` | 文件 URL 与 `BTreeMap<String, String>` | HTTPFS 会话内的 HTTP secret，例如 Authorization 头 |
+| `open_s3(config, uri, options).await` | `s3://bucket/key` 与 `GeoParquetS3Options` | HTTPFS 会话内的 S3 secret，支持自定义 endpoint、临时令牌与 path-style |
 
-HTTP 服务应返回合法的 `206 Partial Content`、`Content-Range` 和 identity 编码，URL 指向一个确定文件。凭据可由预签名查询串或调用方客户端携带。对象存储的凭据、桶和端点由应用配置。
+三个入口只接受单个文件，不接受通配符、目录、userinfo、反斜杠或 fragment；S3 URI 不接受查询串。协议名统一为小写，HTTP 路径和查询串保留原文，以兼容预签名 URL。HTTP 认证头不能覆盖 Range、Host、Content-Length、Accept-Encoding 或对象校验头。`GeoParquetS3Options` 默认使用 `us-east-1`、HTTPS 和虚拟主机寻址；空的 access key/secret key 表示匿名访问，非空时必须同时提供。`endpoint` 只填写主机与可选端口，不包含 scheme 或路径。
 
-应用在打开源前完成目标地址授权，并按部署环境约束私网地址、云元数据地址、DNS 重绑定和网络出口。接收外部用户 URL 的服务应将这些检查纳入数据源创建流程；自定义 HTTP 客户端还应保留 Range 读取所需的重定向与解压策略。
+```rust
+use maptile_core::sources::{
+    GeoParquetSource, GeoParquetSourceConfig, TileCoord, TileSource,
+};
 
-[远程读取器](../src/sources/geoparquet_remote.rs)在 loopback 上为每个源建立带随机会话令牌的范围读取入口。DuckDB HTTPFS 访问这个本机 URL，真实远程地址的签名查询串和对象存储凭据留在传输层。远程文件按需读取，运行进程需要具备绑定 loopback listener 的权限。
+async fn read_remote() -> Result<(), Box<dyn std::error::Error>> {
+    let config = GeoParquetSourceConfig {
+        id: "places".into(),
+        geometry_column: Some("geometry".into()),
+        ..Default::default()
+    };
+    let source = GeoParquetSource::open_http(
+        config, "https://data.example.com/places-v1.parquet",
+    ).await?;
+    let result = source.get_tile(TileCoord { z: 0, x: 0, y: 0 }, None).await;
+    source.close().await?;
+    println!("{} bytes of MVT", result?.data.len());
+    Ok(())
+}
+```
+
+S3 入口使用相同源配置；由应用从自己的配置或凭据系统构造 `GeoParquetS3Options`。认证只保存在该源 DuckDB 实例的内存中，不安装 AWS 扩展、不读取环境凭据链，也不写入持久 secret。临时凭据过期后，应用使用新凭据重新打开并注册源。可运行的 HTTP/S3 接入示例见 [`geoparquet_remote`](../examples/geoparquet_remote.rs)。
+
+HTTP 服务应支持合法的 Range 响应和对象校验标识。库禁用 DuckDB 的主动整文件下载及 Range 失败后的整文件下载回退，并保留 ETag 一致性检查。读取由 DuckDB 管理，若查询无法利用行组统计进行裁剪，累计读取仍可能覆盖整个文件。打开与每次查询受 `query_options.timeout_ms` 限制；在途网络请求的底层超时以 HTTPFS 的整秒超时为准。
+
+应用必须授权远程地址及 S3 endpoint，并在部署网络层限制私网地址、云元数据地址、DNS 重绑定和重定向目标。HTTPFS 可能跟随 HTTP 重定向；本接口不再提供 Rust 客户端的 DNS 固定或自定义网络策略，不应直接接收未授权的用户 URL。库将 DuckDB 文件访问限制为指定输入，但这一限制不能代替网络出口隔离。
+
+预签名 URL 和认证信息会进入该源的 DuckDB 会话。库关闭 HTTP 日志，并将远程后端错误转换为不含原始 URL、SQL 或响应内容的错误信息；数据源 ID 不应包含凭据。
+
+### 从回环桥接接口迁移
+
+`open_http` 保持原签名。`open_http_with_client` 已移除：普通/预签名 URL 改用 `open_http`，认证头改用 `open_http_with_headers`，客户端的 DNS、出口和重定向限制迁移至部署网络策略。`open_object_store` 已移除：S3 兼容存储改用 `open_s3`，其他存储需提供 HTTPFS 可访问的 HTTP(S) URL。任意 Rust `ObjectStore` 实例不会自动转换为 DuckDB 文件系统。
 
 ## 几何、属性与瓦片结果
 
@@ -176,26 +205,26 @@ TileJSON 优先使用显式 `bounds`，也可采用能够安全转换为 WGS84 �
 
 接入 `SourceManager` 时，瓦片还需符合管理器的 16 MiB 单次响应载荷预算，见 [`manager.rs`](../src/sources/manager.rs)。要素数或输出大小超过相应预算时，查询返回错误。应用可以据此调整数据组织、请求级别或预算参数。DuckDB 查询内存由该源的连接共享，进程总 RSS 还包含运行时、读取缓冲和其他分配。
 
-应用应同时限制活跃源数量，因为每个源各自持有连接、文件描述符，以及远程模式使用的 listener。多源资源规划应同时考虑单源预算和源数量。
+应用应同时限制活跃源数量，因为每个源各自持有 DuckDB 连接、文件描述符和远程网络资源。多源资源规划应同时考虑单源预算和源数量。
 
 ## 更新数据与关闭源
 
-使用不可变、带版本的文件路径或对象 URI 管理数据。发布新版本时，先打开新数据源，再用相同 ID 注册到 `SourceManager`；注册过程开始关闭被替换的旧源。GeoParquet 内容版本由源配置及文件或远程对象标识计算，参与管理器缓存键。
+使用不可变、带版本的文件路径或对象 URI 管理数据。发布新版本时，先打开新数据源，再用相同 ID 注册到 `SourceManager`；注册过程开始关闭被替换的旧源。本地 GeoParquet 内容版本由源配置与文件标识计算；远程源每次打开使用新的内容代次，克隆共享同一代次，避免重新注册后复用旧会话的瓦片缓存。
 
-本地几何查询检查文件大小和 mtime；文件变化后需要重新打开源。远程读取通过 ETag、Last-Modified 或对象版本检查内容一致性。应用应让每个版本地址始终对应同一内容，尤其是 HTTP 服务缺少版本校验标识时。热缓存命中可以直接返回已有结果，文件更新应通过明确的版本发布与重新注册流程完成。
+本地几何查询检查文件大小和 mtime；文件变化后需要重新打开源。远程读取由 DuckDB HTTPFS 执行 ETag 一致性检查。应用应让每个版本地址始终对应同一内容，尤其是 HTTP 服务缺少版本校验标识时。热缓存命中可以直接返回已有结果，文件更新应通过明确的版本发布与重新注册流程完成。
 
 关闭方式按资源管理目标选择：
 
 | 操作 | 行为 |
 | --- | --- |
 | `source.start_close()` | 开始关闭所有共享会话的克隆，取消排队和在途查询 |
-| `source.close().await` | 开始关闭并等待查询、连接和远程读取器退出 |
+| `source.close().await` | 开始关闭并等待查询、DuckDB 连接和其网络资源退出 |
 | `manager.close_source(id).await` | 移除源、使该源热缓存失效，并等待关闭完成 |
 | `manager.remove(id)`、标记不可用、替换注册 | 开始关闭被移出的源，并立即返回 |
 
 `close` 可以重复调用。若等待关闭的 future 被取消，可以通过保留的源再次 `await close()`。需要等待旧源完全退出时，在替换前保留旧源引用，再调用它的 `close`；`close_source` 操作的是管理器当前注册的源。
 
-`with_file_lease` 可让源克隆和正在执行的阻塞查询持有调用方的文件生命周期守卫。即使请求被取消，守卫也会保留到对应阻塞查询退出。关闭时会释放当前会话持有的客户端引用，共享客户端的其他使用者继续管理各自引用。远程读取器在最终释放时发起关闭，应用通过显式 `close().await` 确认资源退出。
+`with_file_lease` 可让源克隆和正在执行的阻塞查询持有调用方的文件生命周期守卫。即使请求被取消，守卫也会保留到对应阻塞查询退出。远程源关闭时等待在途 DuckDB 查询结束，然后释放连接和会话认证信息；保留源克隆不会保留已关闭会话的连接。若 `close()` 的等待被取消，可以再次调用并等待完成。
 
 ## 本地 FlatGeobuf 与一次性导入
 

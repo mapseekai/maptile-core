@@ -3809,7 +3809,6 @@ dependencies = [
  "quick-xml 0.42.0",
  "raster-style",
  "regex",
- "reqwest 0.13.5",
  "rusqlite",
  "rustls",
  "rustls-native-certs",

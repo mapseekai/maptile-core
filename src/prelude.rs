@@ -77,7 +77,9 @@ pub use crate::render::{
 pub use crate::sources::{DuckDbSource, DuckDbSourceConfig};
 
 #[cfg(feature = "geoparquet")]
-pub use crate::sources::{GeoParquetColumns, GeoParquetSource, GeoParquetSourceConfig};
+pub use crate::sources::{
+    GeoParquetColumns, GeoParquetS3Options, GeoParquetSource, GeoParquetSourceConfig,
+};
 
 #[cfg(feature = "local-vector")]
 pub use crate::sources::{
