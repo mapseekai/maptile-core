@@ -15,6 +15,9 @@ pub enum MaptileError {
     #[error("source not found: {0}")]
     SourceNotFound(String),
 
+    #[error("style not found: {0}")]
+    StyleNotFound(String),
+
     #[error("source temporarily unavailable: {0}")]
     SourceUnavailable(String),
 

@@ -29,6 +29,9 @@ pub trait StyleStore: Send + Sync + 'static {
 /// Filesystem-backed store. The constructor takes an explicit
 /// `id -> style.json path` mapping (built either from explicit config or
 /// from [`crate::discovery::scan`]).
+///
+/// Unknown IDs return [`MaptileError::StyleNotFound`]. Filesystem and JSON
+/// failures retain their sources as [`MaptileError::Io`] and [`MaptileError::Json`].
 pub struct LocalStyleStore {
     entries: std::collections::HashMap<String, PathBuf>,
 }
@@ -42,12 +45,7 @@ impl LocalStyleStore {
         let mut map = std::collections::HashMap::new();
         for (id, path) in entries {
             let id: String = id.into();
-            if !path.exists() {
-                return Err(MaptileError::Style(format!(
-                    "style {id} path missing: {}",
-                    path.display()
-                )));
-            }
+            std::fs::metadata(&path)?;
             map.insert(id, path);
         }
         Ok(Self { entries: map })
@@ -60,14 +58,11 @@ impl StyleStore for LocalStyleStore {
         let path = self
             .entries
             .get(id)
-            .ok_or_else(|| MaptileError::Style(format!("unknown style: {id}")))?
+            .ok_or_else(|| MaptileError::StyleNotFound(id.to_string()))?
             .clone();
 
-        let raw = tokio::fs::read(&path)
-            .await
-            .map_err(|e| MaptileError::Style(format!("read style {id}: {e}")))?;
-        let value: Value = serde_json::from_slice(&raw)
-            .map_err(|e| MaptileError::Style(format!("parse style {id}: {e}")))?;
+        let raw = tokio::fs::read(&path).await?;
+        let value: Value = serde_json::from_slice(&raw)?;
         let name = value
             .get("name")
             .and_then(|v| v.as_str())
@@ -311,10 +306,66 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_id_is_style_error() {
+    async fn unknown_id_is_style_not_found() {
         let store = LocalStyleStore::new::<Vec<(&str, PathBuf)>, &str>(vec![]).unwrap();
         let res = store.get("nope").await;
-        assert!(matches!(res, Err(MaptileError::Style(_))));
+        assert!(matches!(res, Err(MaptileError::StyleNotFound(id)) if id == "nope"));
+    }
+
+    #[test]
+    fn new_preserves_missing_file_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let result = LocalStyleStore::new([("missing", tmp.path().join("missing.json"))]);
+        assert!(matches!(
+            result,
+            Err(MaptileError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound
+        ));
+    }
+
+    #[tokio::test]
+    async fn get_preserves_file_error_after_registration() {
+        use std::error::Error;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("style.json");
+        write(&path, br#"{"version":8}"#);
+        let store = LocalStyleStore::new([("style", path.clone())]).unwrap();
+        fs::remove_file(path).unwrap();
+
+        let error = store.get("style").await.unwrap_err();
+        assert!(matches!(
+            &error,
+            MaptileError::Io(cause) if cause.kind() == std::io::ErrorKind::NotFound
+        ));
+        assert_eq!(
+            error
+                .source()
+                .unwrap()
+                .downcast_ref::<std::sync::Arc<std::io::Error>>()
+                .unwrap()
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
+
+    #[tokio::test]
+    async fn get_preserves_json_error() {
+        use std::error::Error;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("style.json");
+        write(&path, b"{\n  invalid\n}");
+        let store = LocalStyleStore::new([("style", path)]).unwrap();
+
+        let error = store.get("style").await.unwrap_err();
+        assert!(matches!(&error, MaptileError::Json(cause) if cause.is_syntax()));
+        let cause = error
+            .source()
+            .unwrap()
+            .downcast_ref::<std::sync::Arc<serde_json::Error>>()
+            .unwrap();
+        assert_eq!(cause.line(), 2);
+        assert!(cause.column() > 0);
     }
 
     #[test]

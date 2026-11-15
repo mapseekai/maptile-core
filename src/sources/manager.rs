@@ -151,9 +151,9 @@ impl SourceManager {
 
     /// Reload the registry to match the contents of a `DiscoveryReport`.
     ///
-    /// `factory` is invoked for every newly-discovered source id; sources
-    /// already registered are left in place (no replacement). Sources that
-    /// disappeared from the report are removed. The returned
+    /// `factory` is invoked for every newly-discovered or unavailable source id;
+    /// ready sources are left in place (no replacement). Entries that disappeared
+    /// from the report are removed, including unavailable records. The returned
     /// [`crate::watch::ReloadDelta`] lists the ids that were added /
     /// removed in this call.
     /// All new sources are built before applying changes. A failed or cancelled
@@ -174,12 +174,19 @@ impl SourceManager {
     {
         use std::collections::BTreeSet;
 
-        let current: BTreeSet<String> = self.list_ids().into_iter().collect();
+        let mut current = BTreeSet::new();
+        let mut ready = BTreeSet::new();
+        for entry in &self.sources {
+            current.insert(entry.key().clone());
+            if matches!(entry.value(), SourceState::Ready(_)) {
+                ready.insert(entry.key().clone());
+            }
+        }
         let target: BTreeSet<String> = report.sources.iter().map(|s| s.id.clone()).collect();
 
         let mut pending = PendingSources::default();
         for src in &report.sources {
-            if !current.contains(&src.id) {
+            if !ready.contains(&src.id) {
                 let built = factory(src).await?;
                 pending.0.push(built);
             }
@@ -1148,11 +1155,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reload_removes_absent_unavailable_sources_and_rebuilds_present_ones() {
+        let manager = SourceManager::new();
+        manager.mark_unavailable("gone");
+        manager.mark_unavailable("retry");
+        let (recovered, _) = counting_source("retry");
+
+        let delta = manager
+            .reload_from_discovery(&discovery_report(&["retry"]), |source| {
+                assert_eq!(source.id, "retry");
+                let recovered = recovered.clone();
+                async move { Ok(recovered as Arc<dyn TileSource>) }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(delta.added, ["retry"]);
+        assert_eq!(delta.removed, ["gone"]);
+        assert!(matches!(
+            manager.require("gone"),
+            Err(MaptileError::SourceNotFound(id)) if id == "gone"
+        ));
+        assert!(!manager.is_unavailable("gone"));
+        assert!(!manager.unavailable_retry_due("gone"));
+        assert!(!manager.is_unavailable("retry"));
+        let recovered: Arc<dyn TileSource> = recovered;
+        assert!(Arc::ptr_eq(&manager.require("retry").unwrap(), &recovered));
+    }
+
+    #[tokio::test]
     async fn failed_reload_keeps_registry_and_closes_unpublished_sources() {
         let manager = SourceManager::new();
         let (old, old_closed) = closing_source("obsolete");
         manager.register(old);
         manager.mark_unavailable("good");
+        manager.mark_unavailable("gone");
         let (good, good_closed) = closing_source("good");
         let error = manager
             .reload_from_discovery(&discovery_report(&["good", "bad"]), |source| {
@@ -1171,6 +1208,7 @@ mod tests {
         assert!(matches!(error, MaptileError::InvalidMetadata(_)));
         assert_eq!(manager.list_ids(), ["obsolete"]);
         assert!(manager.is_unavailable("good"));
+        assert!(manager.is_unavailable("gone"));
         assert_eq!(old_closed.load(Ordering::SeqCst), 0);
         assert_eq!(good_closed.load(Ordering::SeqCst), 1);
     }
@@ -1180,6 +1218,7 @@ mod tests {
         let manager = SourceManager::new();
         let (old, old_closed) = closing_source("obsolete");
         manager.register(old);
+        manager.mark_unavailable("gone");
         let (good, good_closed) = closing_source("good");
         let report = discovery_report(&["good", "pending"]);
         {
@@ -1197,6 +1236,7 @@ mod tests {
             assert_eq!(manager.list_ids(), ["obsolete"]);
         }
         assert_eq!(manager.list_ids(), ["obsolete"]);
+        assert!(manager.is_unavailable("gone"));
         assert_eq!(old_closed.load(Ordering::SeqCst), 0);
         assert_eq!(good_closed.load(Ordering::SeqCst), 1);
     }

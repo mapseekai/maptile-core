@@ -395,11 +395,15 @@ impl RendererPool {
         })
     }
 
+    /// Render with a 100 ms queue admission timeout.
+    /// Returns [`MaptileError::CapacityExhausted`] if admission times out.
     pub async fn render(&self, request: RenderRequest) -> MaptileResult<RenderedImage> {
         self.try_render_with_timeout(request, std::time::Duration::from_millis(100))
             .await
     }
 
+    /// Returns [`MaptileError::CapacityExhausted`] if the queue cannot accept
+    /// the request within `admission_timeout`. This does not time out rendering.
     pub async fn try_render_with_timeout(
         &self,
         request: RenderRequest,
@@ -409,6 +413,7 @@ impl RendererPool {
             .await
     }
 
+    /// Like [`Self::try_render_with_timeout`], retaining `keepalive` through execution.
     pub async fn try_render_with_timeout_and_keepalive(
         &self,
         request: RenderRequest,
@@ -443,7 +448,7 @@ async fn submit_with_timeout<O: Send + 'static>(
         sender.send_async(WorkerMessage::Render(job)),
     )
     .await
-    .map_err(|_| MaptileError::Render("render queue admission timed out".into()))?
+    .map_err(|_| MaptileError::CapacityExhausted)?
     .map_err(|_| MaptileError::Render("render queue closed before submission".into()))
 }
 
@@ -915,9 +920,26 @@ mod tests {
 
         control.release();
         drop((first_rx, second_rx));
-        assert!(
-            matches!(error, MaptileError::Render(message) if message.contains("admission timed out"))
-        );
+        assert!(matches!(error, MaptileError::CapacityExhausted));
+    }
+
+    #[tokio::test]
+    async fn timed_submission_to_closed_queue_is_render_error() {
+        let (sender, receiver) = flume::bounded::<WorkerMessage<()>>(1);
+        drop(receiver);
+        let (response, _) = tokio::sync::oneshot::channel();
+        let error = submit_for_test_with_timeout(
+            &sender,
+            RenderJob {
+                request: request(),
+                response,
+                keepalive: None,
+            },
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, MaptileError::Render(_)));
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -76,6 +76,16 @@ bash scripts/ci/maptile-render-cargo.sh run --locked --features render --example
 
 `LocalStyleStore::new` 接收样式 ID 到 JSON 文件路径的映射；`get(id).await` 读取并解析文件，`list().await` 返回排序后的样式 ID。返回的 `Style` 包含 `id`、`name`、JSON 值和源文件路径。应用可通过 `StyleStore` 接口提供自己的存储实现。
 
+调用方可按 `MaptileError` 变体区分失败原因：
+
+| 情况 | 错误 |
+| --- | --- |
+| `get` 请求未注册的样式 ID | `StyleNotFound(id)` |
+| 构造时检查文件失败，或 `get` 读取文件失败 | `Io(error)`，通过 `error.kind()` 区分文件不存在、权限不足等 |
+| `get` 解析 JSON 失败 | `Json(error)`，可读取 `classify()`、`line()`、`column()` |
+
+`Io` 与 `Json` 保留原始错误；应用记录诊断时应附上所请求的样式 ID。已注册样式的文件随后被删除属于文件访问失败，返回 `Io(NotFound)`。
+
 `rewrite_urls(&style, base_url, query_string)` 将以下字段中以 `/` 开头的资源地址转换为绝对 URL：
 
 - `sources[*].url` 与 `sources[*].tiles[*]`。
@@ -127,6 +137,8 @@ bash scripts/ci/maptile-render-cargo.sh run --locked --features render --example
 | `queue_depth_per_worker` | 4 | 每个线程对应的队列容量份额，设置为正整数 |
 
 队列总容量为实际线程数乘以 `queue_depth_per_worker`。`render(request)` 使用 100 毫秒的入队等待期限；`try_render_with_timeout(request, duration)` 可设置这一期限。该参数计量队列接收任务所用的等待时间，完整响应时间还包括任务在队列中的等待和原生渲染执行。定义与实现见 [`render/pool.rs`](../src/render/pool.rs)。
+
+入队等待超时返回 `MaptileError::CapacityExhausted`，应用可据此实施退避或返回繁忙响应。队列已关闭或工作线程丢失响应仍返回 `MaptileError::Render`。
 
 应用需要为某次请求创建独立原生上下文时，可以设置 `request.isolate_native_state = true`。这一选项由可信应用代码决定，适合为请求配置独立的资源访问上下文，字段语义见 [`RenderRequest`](../src/render/types.rs)。
 
