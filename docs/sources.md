@@ -151,6 +151,8 @@ fn register_city_layers(manager: &SourceManager) -> MaptileResult<()> {
 
 这里的 `roads` 和 `buildings` 应预先注册并输出 MVT。查询 `city` 时，组合源按成员配置读取并合并瓦片；`CompositeChild` 可配置图层名前缀。需要在读取时按 ID 解析当前成员的应用，可使用 `LazyCompositeSource`。实现见 [`composite`](../src/sources/composite.rs) 和 [`lazy_composite`](../src/sources/lazy_composite.rs)。
 
+`LazyCompositeSource` 跳过缺失成员；全部成员缺失时，单瓦片读取返回 `TileNotFound`，批量读取保留对应的空瓦片。没有可用成员且存在加载失败记录时返回 `SourceUnavailable`。成员格式错误或管理器已销毁等错误会继续向调用方传播，批量导出也不会将它们当作成功的空结果。
+
 ## 格式与压缩编码
 
 `TileResponse.info.format` 描述数据格式，`info.encoding` 描述本次响应字节的压缩方式。将两者与载荷一起传递，可以让客户端、转码器和组合源使用正确的解码路径。

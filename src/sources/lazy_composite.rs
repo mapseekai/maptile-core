@@ -35,8 +35,8 @@ impl LazyCompositeSource {
     #[must_use]
     pub fn open(id: String, member_ids: Vec<String>, manager: Weak<SourceManager>) -> Self {
         let tj = match snapshot(&id, &member_ids, &manager) {
-            Ok(c) => c.tilejson().clone(),
-            Err(_) => tilejson! { tiles: vec![] },
+            Ok(Some(c)) => c.tilejson().clone(),
+            Ok(None) | Err(_) => tilejson! { tiles: vec![] },
         };
         Self {
             id,
@@ -48,26 +48,34 @@ impl LazyCompositeSource {
 }
 
 /// Resolve present members and build a short-lived [`CompositeSource`].
-/// Returns `Err` when zero members are currently registered (or the
-/// manager has been dropped).
+/// `None` means no members are present; loading, configuration and lifecycle
+/// failures remain errors.
 fn snapshot(
     id: &str,
     member_ids: &[String],
     manager: &Weak<SourceManager>,
-) -> MaptileResult<CompositeSource> {
+) -> MaptileResult<Option<CompositeSource>> {
     let mgr = manager
         .upgrade()
         .ok_or_else(|| MaptileError::Config("source manager dropped".into()))?;
-    let children: Vec<CompositeChild> = member_ids
-        .iter()
-        .filter(|mid| mid.as_str() != id) // self-reference guard
-        .filter_map(|mid| mgr.get(mid))
-        .map(CompositeChild::new)
-        .collect();
-    if children.is_empty() && member_ids.iter().any(|id| mgr.is_unavailable(id)) {
-        return Err(MaptileError::SourceUnavailable(id.into()));
+    let mut children = Vec::new();
+    let mut unavailable = false;
+    for member in member_ids.iter().filter(|member| member.as_str() != id) {
+        match mgr.require(member) {
+            Ok(source) => children.push(CompositeChild::new(source)),
+            Err(MaptileError::SourceNotFound(_)) => {}
+            Err(MaptileError::SourceUnavailable(_)) => unavailable = true,
+            Err(error) => return Err(error),
+        }
     }
-    CompositeSource::new(id, children)
+    if children.is_empty() {
+        return if unavailable {
+            Err(MaptileError::SourceUnavailable(id.into()))
+        } else {
+            Ok(None)
+        };
+    }
+    CompositeSource::new(id, children).map(Some)
 }
 
 #[async_trait::async_trait]
@@ -108,11 +116,8 @@ impl TileSource for LazyCompositeSource {
         xyz: TileCoord,
         query: Option<&TileQuery<'_>>,
     ) -> MaptileResult<TileResponse> {
-        let composite =
-            snapshot(&self.id, &self.member_ids, &self.manager).map_err(|error| match error {
-                MaptileError::SourceUnavailable(_) => error,
-                _ => MaptileError::TileNotFound(xyz.z, xyz.x, xyz.y),
-            })?;
+        let composite = snapshot(&self.id, &self.member_ids, &self.manager)?
+            .ok_or(MaptileError::TileNotFound(xyz.z, xyz.x, xyz.y))?;
         composite.get_tile(xyz, query).await
     }
 
@@ -125,19 +130,15 @@ impl TileSource for LazyCompositeSource {
         if coords.is_empty() {
             return Ok(Vec::new());
         }
-        let composite = match snapshot(&self.id, &self.member_ids, &self.manager) {
-            Ok(composite) => composite,
-            Err(error @ MaptileError::SourceUnavailable(_)) => return Err(error),
-            Err(_) => {
-                return Ok(coords
-                    .iter()
-                    .map(|_| TileResponse {
-                        data: bytes::Bytes::new(),
-                        info: self.tile_info(),
-                        last_modified: None,
-                    })
-                    .collect());
-            }
+        let Some(composite) = snapshot(&self.id, &self.member_ids, &self.manager)? else {
+            return Ok(coords
+                .iter()
+                .map(|_| TileResponse {
+                    data: bytes::Bytes::new(),
+                    info: self.tile_info(),
+                    last_modified: None,
+                })
+                .collect());
         };
         composite.read_tile_batch(coords, query).await
     }
@@ -148,11 +149,8 @@ impl TileSource for LazyCompositeSource {
         query: Option<&TileQuery<'_>>,
         if_none_match: Option<&str>,
     ) -> MaptileResult<TileEtagResponse> {
-        let composite =
-            snapshot(&self.id, &self.member_ids, &self.manager).map_err(|error| match error {
-                MaptileError::SourceUnavailable(_) => error,
-                _ => MaptileError::TileNotFound(xyz.z, xyz.x, xyz.y),
-            })?;
+        let composite = snapshot(&self.id, &self.member_ids, &self.manager)?
+            .ok_or(MaptileError::TileNotFound(xyz.z, xyz.x, xyz.y))?;
         composite
             .get_tile_with_etag(xyz, query, if_none_match)
             .await
@@ -172,6 +170,7 @@ mod tests {
         id: String,
         tj: TileJSON,
         bytes: bytes::Bytes,
+        format: TileFormat,
     }
 
     impl MvtFake {
@@ -201,6 +200,7 @@ mod tests {
                 id: id.into(),
                 tj,
                 bytes,
+                format: TileFormat::Mvt,
             })
         }
     }
@@ -215,7 +215,7 @@ mod tests {
         }
         fn tile_info(&self) -> TileInfo {
             TileInfo {
-                format: TileFormat::Mvt,
+                format: self.format,
                 encoding: TileEncoding::Uncompressed,
             }
         }
@@ -224,6 +224,7 @@ mod tests {
                 id: self.id.clone(),
                 tj: self.tj.clone(),
                 bytes: self.bytes.clone(),
+                format: self.format,
             })
         }
         async fn get_tile(
@@ -313,6 +314,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn configuration_and_lifecycle_errors_are_not_missing_tiles() {
+        for dropped_manager in [false, true] {
+            let mut source = MvtFake::new("member", &["water"]);
+            if !dropped_manager {
+                Arc::get_mut(&mut source).unwrap().format = TileFormat::Png;
+            }
+            let manager = manager_with(vec![source]);
+            let group = LazyCompositeSource::open(
+                "group".into(),
+                vec!["member".into()],
+                Arc::downgrade(&manager),
+            );
+            if dropped_manager {
+                drop(manager);
+            }
+            let xyz = TileCoord { z: 0, x: 0, y: 0 };
+            let expected = if dropped_manager {
+                "manager dropped"
+            } else {
+                "must be Mvt"
+            };
+            for error in [
+                group.get_tile(xyz, None).await.unwrap_err(),
+                group.get_tile_with_etag(xyz, None, None).await.unwrap_err(),
+                group.read_tile_batch(&[xyz], None).await.unwrap_err(),
+            ] {
+                assert!(
+                    matches!(error, MaptileError::Config(ref message) if message.contains(expected)),
+                    "expected configuration/lifecycle error, got {error:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn manager_rejects_mosaic_selection_for_live_group_etag_reads() {
+        let manager = manager_with(vec![MvtFake::new("member", &["water"])]);
+        manager.register(Arc::new(LazyCompositeSource::open(
+            "group".into(),
+            vec!["member".into()],
+            Arc::downgrade(&manager),
+        )));
+        let query = TileQuery {
+            pixel_selection: Some(crate::sources::MosaicPixelSelection::Median),
+            ..Default::default()
+        };
+        let xyz = TileCoord { z: 0, x: 0, y: 0 };
+        assert!(matches!(
+            manager.get_tile("group", xyz, Some(&query)).await,
+            Err(MaptileError::InvalidRequest(_))
+        ));
+        assert!(matches!(
+            manager
+                .get_tile_with_etag("group", xyz, Some(&query), None)
+                .await,
+            Err(MaptileError::InvalidRequest(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn member_registered_after_open_is_picked_up() {
         // Open with an empty manager — snapshot is empty TileJSON.
         let mgr = Arc::new(SourceManager::new());
@@ -399,6 +460,7 @@ mod tests {
         mgr.register(group.clone());
         let xyz = TileCoord { z: 0, x: 0, y: 0 };
         let expected = snapshot("group", &["a".into()], &Arc::downgrade(&mgr))
+            .unwrap()
             .unwrap()
             .get_tile_with_etag(xyz, None, None)
             .await

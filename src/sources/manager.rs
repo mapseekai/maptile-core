@@ -8,15 +8,32 @@
 use crate::cache::{TileCache, TileCacheKey};
 use crate::error::{MaptileError, MaptileResult};
 use crate::sources::{
-    TileCoord, TileEtagResponse, TileQuery, TileResponse, TileSource, effective_pixel_selection,
+    MosaicPixelSelection, TileCoord, TileEtagResponse, TileQuery, TileResponse, TileSource,
+    effective_pixel_selection,
 };
 use std::sync::Arc;
 
+enum SourceState {
+    Ready(Arc<dyn TileSource>),
+    Unavailable(tokio::time::Instant),
+}
+
 #[derive(Default)]
 pub struct SourceManager {
-    sources: dashmap::DashMap<String, Arc<dyn TileSource>>,
-    unavailable: dashmap::DashMap<String, tokio::time::Instant>,
+    sources: dashmap::DashMap<String, SourceState>,
     cache: Option<Arc<TileCache>>,
+}
+
+#[derive(Default)]
+struct PendingSources(Vec<Arc<dyn TileSource>>);
+
+impl Drop for PendingSources {
+    fn drop(&mut self) {
+        // A failed or cancelled factory must not leave unpublished sources running.
+        for source in &self.0 {
+            source.start_close();
+        }
+    }
 }
 
 impl SourceManager {
@@ -45,62 +62,70 @@ impl SourceManager {
     /// registration followed by async event fan-out, so keep it at debug level.
     pub fn register(&self, src: Arc<dyn TileSource>) {
         let id = src.id().to_string();
-        if self.sources.contains_key(&id) {
+        if let Some(SourceState::Ready(previous)) = self
+            .sources
+            .insert(id.clone(), SourceState::Ready(src.clone()))
+        {
             tracing::debug!(
                 source_id = %id,
                 "SourceManager::register replacing an existing source with the same id"
             );
+            if !Arc::ptr_eq(&previous, &src) {
+                previous.start_close();
+            }
         }
-        let current = src.clone();
-        if let Some(previous) = self.sources.insert(id.clone(), src)
-            && !Arc::ptr_eq(&previous, &current)
-        {
-            previous.start_close();
-        }
-        self.unavailable.remove(&id);
     }
 
     pub fn get(&self, id: &str) -> Option<Arc<dyn TileSource>> {
-        self.sources.get(id).map(|r| r.value().clone())
+        self.sources.get(id).and_then(|r| match r.value() {
+            SourceState::Ready(source) => Some(source.clone()),
+            SourceState::Unavailable(_) => None,
+        })
     }
 
     /// Keep a failed active source distinct from a source that does not exist.
     pub fn mark_unavailable(&self, id: &str) {
-        self.unavailable
-            .insert(id.to_string(), tokio::time::Instant::now());
-        if let Some((_, source)) = self.sources.remove(id) {
+        if let Some(SourceState::Ready(source)) = self.sources.insert(
+            id.to_string(),
+            SourceState::Unavailable(tokio::time::Instant::now()),
+        ) {
             source.start_close();
         }
     }
 
     pub fn is_unavailable(&self, id: &str) -> bool {
-        self.unavailable.contains_key(id)
+        self.sources
+            .get(id)
+            .is_some_and(|r| matches!(r.value(), SourceState::Unavailable(_)))
     }
 
     /// Foreground recovery shares a short failure backoff; authoritative events
     /// and explicit fresh registration do not use this throttle.
     pub fn unavailable_retry_due(&self, id: &str) -> bool {
-        self.unavailable
-            .get(id)
-            .is_some_and(|failed| failed.elapsed() >= std::time::Duration::from_secs(1))
+        self.sources.get(id).is_some_and(|r| match r.value() {
+            SourceState::Unavailable(failed) => {
+                failed.elapsed() >= std::time::Duration::from_secs(1)
+            }
+            SourceState::Ready(_) => false,
+        })
     }
 
     /// Resolve the current source, preserving a retryable loading failure.
     pub fn require(&self, id: &str) -> MaptileResult<Arc<dyn TileSource>> {
-        self.get(id).ok_or_else(|| {
-            if self.is_unavailable(id) {
-                MaptileError::SourceUnavailable(id.into())
-            } else {
-                MaptileError::SourceNotFound(id.into())
-            }
-        })
+        match self.sources.get(id).as_deref() {
+            Some(SourceState::Ready(source)) => Ok(source.clone()),
+            Some(SourceState::Unavailable(_)) => Err(MaptileError::SourceUnavailable(id.into())),
+            None => Err(MaptileError::SourceNotFound(id.into())),
+        }
     }
 
     pub fn remove(&self, id: &str) -> Option<Arc<dyn TileSource>> {
-        self.unavailable.remove(id);
-        self.sources.remove(id).map(|(_, source)| {
-            source.start_close();
-            source
+        self.sources.remove(id).and_then(|(_, state)| match state {
+            SourceState::Ready(source) => {
+                source.start_close();
+                Some(source)
+            }
+            SourceState::Unavailable(_) => None,
         })
     }
 
@@ -117,7 +142,11 @@ impl SourceManager {
     }
 
     pub fn list_ids(&self) -> Vec<String> {
-        self.sources.iter().map(|r| r.key().clone()).collect()
+        self.sources
+            .iter()
+            .filter(|r| matches!(r.value(), SourceState::Ready(_)))
+            .map(|r| r.key().clone())
+            .collect()
     }
 
     /// Reload the registry to match the contents of a `DiscoveryReport`.
@@ -127,6 +156,9 @@ impl SourceManager {
     /// disappeared from the report are removed. The returned
     /// [`crate::watch::ReloadDelta`] lists the ids that were added /
     /// removed in this call.
+    /// All new sources are built before applying changes. A failed or cancelled
+    /// build starts closing unpublished sources and leaves this call's changes
+    /// unapplied. The apply phase is not a transaction across concurrent writers.
     ///
     /// Pair with [`crate::watch::SourceWatcher`] to drive a reload loop:
     /// re-run [`crate::discovery::scan`] on each `WatchEvent`, then call
@@ -145,14 +177,17 @@ impl SourceManager {
         let current: BTreeSet<String> = self.list_ids().into_iter().collect();
         let target: BTreeSet<String> = report.sources.iter().map(|s| s.id.clone()).collect();
 
-        let mut delta = crate::watch::ReloadDelta::default();
-
+        let mut pending = PendingSources::default();
         for src in &report.sources {
             if !current.contains(&src.id) {
                 let built = factory(src).await?;
-                self.register(built);
-                delta.added.push(src.id.clone());
+                pending.0.push(built);
             }
+        }
+        let mut delta = crate::watch::ReloadDelta::default();
+        for source in pending.0.drain(..) {
+            delta.added.push(source.id().to_string());
+            self.register(source);
         }
         for id in current.difference(&target) {
             self.remove(id);
@@ -220,6 +255,7 @@ impl SourceManager {
     ) -> MaptileResult<TileEtagResponse> {
         let source = self.require(id)?;
         if source.cache_zoom().is_disabled() {
+            validate_pixel_selection(id, query, source.mosaic_pixel_selection())?;
             // Dynamic sources retain their own one-snapshot validator semantics.
             let response = source.get_tile_with_etag(xyz, query, if_none_match).await?;
             if let TileEtagResponse::Fresh { resp, .. } = &response {
@@ -245,13 +281,8 @@ impl SourceManager {
         xyz: TileCoord,
         query: Option<&TileQuery<'_>>,
     ) -> MaptileResult<TileResponse> {
-        let requested_selection = query.and_then(|q| q.pixel_selection);
         let selection_fallback = source.mosaic_pixel_selection();
-        if requested_selection.is_some() && selection_fallback.is_none() {
-            return Err(MaptileError::InvalidRequest(format!(
-                "source {id:?} does not support mosaic pixel_selection"
-            )));
-        }
+        validate_pixel_selection(id, query, selection_fallback)?;
         let effective_selection =
             selection_fallback.map(|fallback| effective_pixel_selection(query, fallback));
 
@@ -337,7 +368,10 @@ impl SourceManager {
     pub fn snapshot_tilejson(&self) -> Vec<tilejson::TileJSON> {
         self.sources
             .iter()
-            .map(|r| r.value().tilejson().clone())
+            .filter_map(|r| match r.value() {
+                SourceState::Ready(source) => Some(source.tilejson().clone()),
+                SourceState::Unavailable(_) => None,
+            })
             .collect()
     }
 
@@ -355,13 +389,13 @@ impl SourceManager {
         let mut sources: Vec<CatalogSource> = self
             .sources
             .iter()
-            .map(|r| {
-                let src = r.value();
-                CatalogSource {
+            .filter_map(|r| match r.value() {
+                SourceState::Ready(src) => Some(CatalogSource {
                     id: src.id().to_string(),
                     info: src.tile_info(),
                     tilejson: src.tilejson().clone(),
-                }
+                }),
+                SourceState::Unavailable(_) => None,
             })
             .collect();
         sources.sort_by(|a, b| a.id.cmp(&b.id));
@@ -375,6 +409,19 @@ impl SourceManager {
             styles: style_infos,
         })
     }
+}
+
+fn validate_pixel_selection(
+    id: &str,
+    query: Option<&TileQuery<'_>>,
+    fallback: Option<MosaicPixelSelection>,
+) -> MaptileResult<()> {
+    if query.is_some_and(|q| q.pixel_selection.is_some()) && fallback.is_none() {
+        return Err(MaptileError::InvalidRequest(format!(
+            "source {id:?} does not support mosaic pixel_selection"
+        )));
+    }
+    Ok(())
 }
 
 fn check_tile_size(tile: &TileResponse) -> MaptileResult<()> {
@@ -428,6 +475,7 @@ mod tests {
         calls: Arc<AtomicUsize>,
         mosaic_selection: Option<MosaicPixelSelection>,
         seen_selection: Arc<Mutex<Vec<Option<MosaicPixelSelection>>>>,
+        on_close: Option<Arc<dyn Fn() + Send + Sync>>,
     }
 
     #[async_trait]
@@ -451,7 +499,13 @@ mod tests {
                 calls: self.calls.clone(),
                 mosaic_selection: self.mosaic_selection,
                 seen_selection: self.seen_selection.clone(),
+                on_close: self.on_close.clone(),
             })
+        }
+        fn start_close(&self) {
+            if let Some(on_close) = &self.on_close {
+                on_close();
+            }
         }
         fn mosaic_pixel_selection(&self) -> Option<MosaicPixelSelection> {
             self.mosaic_selection
@@ -485,6 +539,7 @@ mod tests {
             calls: calls.clone(),
             mosaic_selection: None,
             seen_selection: Arc::new(Mutex::new(Vec::new())),
+            on_close: None,
         });
         (src, calls)
     }
@@ -495,6 +550,9 @@ mod tests {
         let (source, _) = counting_source("recovering");
         manager.register(source.clone());
         manager.mark_unavailable("recovering");
+        assert!(manager.get("recovering").is_none());
+        assert!(manager.list_ids().is_empty());
+        assert!(manager.snapshot_tilejson().is_empty());
         assert!(matches!(
             manager.require("recovering"),
             Err(MaptileError::SourceUnavailable(_))
@@ -507,6 +565,54 @@ mod tests {
             manager.require("recovering"),
             Err(MaptileError::SourceNotFound(_))
         ));
+    }
+
+    #[test]
+    fn registration_cannot_erase_a_concurrent_unavailable_state() {
+        use std::sync::mpsc;
+
+        let manager = Arc::new(SourceManager::new());
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let resume_rx = Mutex::new(resume_rx);
+        let (mut old, _) = counting_source("same");
+        Arc::get_mut(&mut old).unwrap().on_close = Some(Arc::new(move || {
+            entered_tx.send(()).unwrap();
+            resume_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+        }));
+        manager.register(old);
+
+        let writer = {
+            let manager = manager.clone();
+            std::thread::spawn(move || manager.register(counting_source("same").0))
+        };
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (done_tx, done_rx) = mpsc::channel();
+        let failure = {
+            let manager = manager.clone();
+            std::thread::spawn(move || {
+                manager.mark_unavailable("same");
+                done_tx.send(()).unwrap();
+            })
+        };
+        let completed = done_rx.recv_timeout(Duration::from_secs(2));
+        resume_tx.send(()).unwrap();
+        writer.join().unwrap();
+        failure.join().unwrap();
+        assert!(
+            completed.is_ok(),
+            "close callbacks must not hold a registry lock"
+        );
+        assert!(matches!(
+            manager.require("same"),
+            Err(MaptileError::SourceUnavailable(_))
+        ));
+        assert!(manager.is_unavailable("same"));
+        assert!(manager.list_ids().is_empty());
     }
 
     #[derive(Clone)]
@@ -684,6 +790,7 @@ mod tests {
             calls: calls.clone(),
             mosaic_selection: Some(fallback),
             seen_selection: seen_selection.clone(),
+            on_close: None,
         });
         CountingMosaicFixture {
             source: src,
@@ -841,6 +948,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cache_disabled_etag_reads_reject_selection_before_reading_or_matching() {
+        let cache = Arc::new(TileCache::new(1, None, None).unwrap());
+        let manager = SourceManager::new().with_cache(cache.clone());
+        let (inner, calls) = counting_source("live");
+        manager.register(Arc::new(SourceCached {
+            inner,
+            cache,
+            data: None,
+            cache_zoom: crate::cache::CacheZoomRange::disabled(),
+        }));
+        let xyz = TileCoord { z: 0, x: 0, y: 0 };
+        let query = TileQuery {
+            pixel_selection: Some(MosaicPixelSelection::Median),
+            ..Default::default()
+        };
+        assert!(matches!(
+            manager.get_tile("live", xyz, Some(&query)).await,
+            Err(MaptileError::InvalidRequest(_))
+        ));
+        for etag in [None, Some("\"authoritative\"")] {
+            assert!(matches!(
+                manager
+                    .get_tile_with_etag("live", xyz, Some(&query), etag)
+                    .await,
+                Err(MaptileError::InvalidRequest(_))
+            ));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            manager
+                .get_tile_with_etag("live", xyz, None, None)
+                .await
+                .unwrap(),
+            TileEtagResponse::Fresh { .. }
+        ));
+        assert!(matches!(
+            manager
+                .get_tile_with_etag("live", xyz, None, Some("\"authoritative\""))
+                .await
+                .unwrap(),
+            TileEtagResponse::NotModified
+        ));
+    }
+
+    #[tokio::test]
     async fn styled_query_partitions_cache_by_style_hash() {
         let mgr = SourceManager::new().with_cache(Arc::new(
             TileCache::new(1, Some(Duration::from_secs(3600)), None).unwrap(),
@@ -971,6 +1123,84 @@ mod tests {
         assert!(mgr.get("going").is_none());
     }
 
+    fn closing_source(id: &str) -> (Arc<CountingSource>, Arc<AtomicUsize>) {
+        let (mut source, _) = counting_source(id);
+        let closed = Arc::new(AtomicUsize::new(0));
+        let counter = closed.clone();
+        Arc::get_mut(&mut source).unwrap().on_close = Some(Arc::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }));
+        (source, closed)
+    }
+
+    fn discovery_report(ids: &[&str]) -> crate::discovery::DiscoveryReport {
+        crate::discovery::DiscoveryReport {
+            sources: ids
+                .iter()
+                .map(|id| crate::discovery::DiscoveredSource {
+                    id: (*id).into(),
+                    kind: crate::discovery::DiscoveredSourceKind::PmTiles,
+                    path: format!("/tmp/{id}.pmtiles").into(),
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_reload_keeps_registry_and_closes_unpublished_sources() {
+        let manager = SourceManager::new();
+        let (old, old_closed) = closing_source("obsolete");
+        manager.register(old);
+        manager.mark_unavailable("good");
+        let (good, good_closed) = closing_source("good");
+        let error = manager
+            .reload_from_discovery(&discovery_report(&["good", "bad"]), |source| {
+                let good = good.clone();
+                let fail = source.id == "bad";
+                async move {
+                    if fail {
+                        Err(MaptileError::InvalidMetadata("broken archive".into()))
+                    } else {
+                        Ok(good as Arc<dyn TileSource>)
+                    }
+                }
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, MaptileError::InvalidMetadata(_)));
+        assert_eq!(manager.list_ids(), ["obsolete"]);
+        assert!(manager.is_unavailable("good"));
+        assert_eq!(old_closed.load(Ordering::SeqCst), 0);
+        assert_eq!(good_closed.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_reload_closes_unpublished_sources_without_applying_changes() {
+        let manager = SourceManager::new();
+        let (old, old_closed) = closing_source("obsolete");
+        manager.register(old);
+        let (good, good_closed) = closing_source("good");
+        let report = discovery_report(&["good", "pending"]);
+        {
+            let mut reload = Box::pin(manager.reload_from_discovery(&report, |source| {
+                let good = good.clone();
+                let pending = source.id == "pending";
+                async move {
+                    if pending {
+                        std::future::pending::<()>().await;
+                    }
+                    Ok(good as Arc<dyn TileSource>)
+                }
+            }));
+            assert!(futures_util::poll!(&mut reload).is_pending());
+            assert_eq!(manager.list_ids(), ["obsolete"]);
+        }
+        assert_eq!(manager.list_ids(), ["obsolete"]);
+        assert_eq!(old_closed.load(Ordering::SeqCst), 0);
+        assert_eq!(good_closed.load(Ordering::SeqCst), 1);
+    }
+
     #[tokio::test]
     async fn get_tile_skips_cache_outside_zoom_range() {
         use crate::cache::CacheZoomRange;
@@ -1013,6 +1243,7 @@ mod tests {
             calls: calls.clone(),
             mosaic_selection: None,
             seen_selection: Arc::new(Mutex::new(Vec::new())),
+            on_close: None,
         };
         let gated = ZoomGated {
             inner,

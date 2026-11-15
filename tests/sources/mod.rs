@@ -174,6 +174,31 @@ fn capability_defaults_are_false() {
     let src = MockSource::new("m", b"x");
     assert!(!src.supports_url_query());
     assert!(!src.supports_filter());
+    assert!(!src.supports_raster_coverage());
+    assert!(!src.supports_raster_point());
+}
+
+#[tokio::test]
+async fn unsupported_raster_capabilities_are_invalid_requests() {
+    use maptile_core::error::MaptileError;
+    use maptile_core::sources::RasterPointQuery;
+
+    let source = MockSource::new("vector", b"tile");
+    assert!(matches!(
+        source.raster_coverage(None).await,
+        Err(MaptileError::InvalidRequest(_))
+    ));
+    assert!(matches!(
+        source
+            .query_raster_point(&RasterPointQuery {
+                x: 0.0,
+                y: 0.0,
+                coord_crs: "EPSG:4326".into(),
+                bidx: vec![],
+            })
+            .await,
+        Err(MaptileError::InvalidRequest(_))
+    ));
 }
 
 #[test]

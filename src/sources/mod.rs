@@ -174,11 +174,12 @@ pub trait TileSource: Send + Sync + 'static {
         false
     }
 
+    /// Export native raster coverage, or return `InvalidRequest` if unsupported.
     async fn raster_coverage(
         &self,
         _query: Option<&raster_coverage::CoverageQuery>,
     ) -> MaptileResult<raster_coverage::CoverageResponse> {
-        Err(crate::error::MaptileError::Config(
+        Err(crate::error::MaptileError::InvalidRequest(
             "source does not support native coverage export".into(),
         ))
     }
@@ -188,12 +189,12 @@ pub trait TileSource: Send + Sync + 'static {
     }
 
     /// Query a raw raster pixel value at a coordinate. Vector and non-raster
-    /// sources keep the default unsupported implementation.
+    /// sources return `InvalidRequest` from the default unsupported implementation.
     async fn query_raster_point(
         &self,
         _query: &RasterPointQuery,
     ) -> MaptileResult<RasterPointResponse> {
-        Err(crate::error::MaptileError::Config(format!(
+        Err(crate::error::MaptileError::InvalidRequest(format!(
             "source '{}' does not support raster point queries",
             self.id()
         )))
@@ -353,7 +354,8 @@ pub struct TileQuery<'a> {
     /// Dataset-authoritative hash for a complete typed raster request.
     pub style_hash: Option<crate::cache::StyleHash>,
     /// Per-request mosaic composition. Borrowed query state carries this
-    /// `Copy` value without cloning; non-mosaic sources reject it.
+    /// `Copy` value without cloning; the manager rejects it for non-mosaic sources
+    /// in both ordinary and ETag reads. Direct source callers must check capabilities.
     pub pixel_selection: Option<MosaicPixelSelection>,
 }
 
