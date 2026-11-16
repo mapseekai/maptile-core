@@ -7,8 +7,8 @@
 //!
 //! CQL2 attribute filters use a caller-supplied column allowlist, and geographic
 //! bounding boxes add request-specific predicates. Filtered queries prepare their
-//! SQL for that request. Optional tile caching coalesces concurrent reads for
-//! the same source content and tile coordinate.
+//! SQL for that request. Tile caching and concurrent miss coalescing belong to
+//! [`crate::sources::manager::SourceManager`].
 
 use std::sync::Arc;
 
@@ -18,7 +18,7 @@ use futures_util::TryStreamExt;
 use tilejson::{TileJSON, tilejson};
 use tokio_postgres::types::{ToSql, Type};
 
-use crate::cache::{CacheZoomRange, TileCache, TileCacheKey};
+use crate::cache::CacheZoomRange;
 use crate::error::{MaptileError, MaptileResult};
 use crate::sources::{
     MAX_TILE_BATCH_BYTES, TileCoord, TileEncoding, TileFormat, TileInfo, TileQuery, TileResponse,
@@ -97,7 +97,6 @@ pub struct PostgresTableSource {
     /// through [`Self::with_allowed_columns`] before sharing the source.
     allowed_columns: Arc<std::collections::HashSet<String>>,
     info_meta: TileInfo,
-    cache: Option<Arc<TileCache>>,
     definition_version: crate::cache::ContentVersion,
     content_version: crate::cache::ContentVersion,
 }
@@ -175,7 +174,6 @@ impl PostgresTableSource {
             bbox_search_expr,
             allowed_columns: Arc::new(std::collections::HashSet::new()),
             info_meta,
-            cache: None,
             definition_version,
             content_version: crate::cache::ContentVersion::new_generation(),
         })
@@ -313,16 +311,6 @@ impl PostgresTableSource {
         }
         self
     }
-
-    /// Attach a tile cache before sharing this table source.
-    /// Query-less requests within [`Self::cache_zoom`] use this cache. Manager
-    /// cache fills forward an explicit query and bypass the source-level cache
-    /// to avoid recursively waiting on the same shared cache key.
-    #[must_use]
-    pub fn with_cache(mut self, cache: Arc<crate::cache::TileCache>) -> Self {
-        self.cache = Some(cache);
-        self
-    }
 }
 
 #[async_trait]
@@ -365,7 +353,6 @@ impl TileSource for PostgresTableSource {
             bbox_search_expr: self.bbox_search_expr.clone(),
             allowed_columns: self.allowed_columns.clone(),
             info_meta: self.info_meta,
-            cache: self.cache.clone(),
             definition_version: self.definition_version,
             content_version: self.content_version,
         })
@@ -418,32 +405,6 @@ impl TileSource for PostgresTableSource {
             });
         }
 
-        // Cache path — only safe for query-less requests. `get_or_insert`
-        // coalesces concurrent misses for the same tile into a single PG
-        // query (moka entry API), so a fresh viewport's duplicate requests
-        // don't fan out into identical queries.
-        if query.is_none()
-            && self.cache_zoom().contains(xyz.z)
-            && let Some(cache) = self.cache.as_ref()
-        {
-            let key = TileCacheKey {
-                source_id: self.cfg.id.as_str().into(),
-                content_version: self.content_version(),
-                z: xyz.z,
-                x: xyz.x,
-                y: xyz.y,
-                style_hash: crate::cache::StyleHash::NONE,
-            };
-            return cache
-                .get_or_insert(key, || self.fetch_and_encode(xyz))
-                .await
-                .map_err(|arc_err: std::sync::Arc<MaptileError>| (*arc_err).clone());
-        }
-        tracing::debug!(
-            source = %self.cfg.id,
-            z = xyz.z, x = xyz.x, y = xyz.y,
-            "source-level tile cache bypassed"
-        );
         self.fetch_and_encode(xyz).await
     }
 

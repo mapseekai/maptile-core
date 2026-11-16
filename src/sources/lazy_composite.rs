@@ -12,7 +12,7 @@
 //! registered) before the group exists, so the snapshot is complete; on cold
 //! start the server's preload builds vector_group sources last.
 
-use std::sync::Weak;
+use std::sync::{Arc, Weak};
 
 use tilejson::{TileJSON, tilejson};
 
@@ -35,7 +35,7 @@ impl LazyCompositeSource {
     #[must_use]
     pub fn open(id: String, member_ids: Vec<String>, manager: Weak<SourceManager>) -> Self {
         let tj = match snapshot(&id, &member_ids, &manager) {
-            Ok(Some(c)) => c.tilejson().clone(),
+            Ok(Some((_, c))) => c.tilejson().clone(),
             Ok(None) | Err(_) => tilejson! { tiles: vec![] },
         };
         Self {
@@ -54,7 +54,7 @@ fn snapshot(
     id: &str,
     member_ids: &[String],
     manager: &Weak<SourceManager>,
-) -> MaptileResult<Option<CompositeSource>> {
+) -> MaptileResult<Option<(Arc<SourceManager>, CompositeSource)>> {
     let mgr = manager
         .upgrade()
         .ok_or_else(|| MaptileError::Config("source manager dropped".into()))?;
@@ -75,7 +75,21 @@ fn snapshot(
             Ok(None)
         };
     }
-    CompositeSource::new(id, children).map(Some)
+    CompositeSource::new(id, children).map(|composite| Some((mgr, composite)))
+}
+
+fn read_member<'a>(
+    manager: &'a SourceManager,
+    source: Arc<dyn TileSource>,
+    xyz: TileCoord,
+    query: Option<&'a TileQuery<'a>>,
+) -> futures_util::future::BoxFuture<'a, MaptileResult<TileResponse>> {
+    // Keep recursive live groups out of the larger cache future's polling stack.
+    if !source.cache_zoom().contains(xyz.z) {
+        Box::pin(async move { source.get_tile(xyz, query).await })
+    } else {
+        Box::pin(manager.get_tile_from_source(source, xyz, query))
+    }
 }
 
 #[async_trait::async_trait]
@@ -107,7 +121,7 @@ impl TileSource for LazyCompositeSource {
     fn cache_zoom(&self) -> crate::cache::CacheZoomRange {
         // Member registrations may change between key construction, rendering,
         // and ETag calculation. Preserve one snapshot per request instead of
-        // caching this live group; member sources can still cache their tiles.
+        // caching this live group; the manager caches its snapshotted members.
         crate::cache::CacheZoomRange::disabled()
     }
 
@@ -116,9 +130,13 @@ impl TileSource for LazyCompositeSource {
         xyz: TileCoord,
         query: Option<&TileQuery<'_>>,
     ) -> MaptileResult<TileResponse> {
-        let composite = snapshot(&self.id, &self.member_ids, &self.manager)?
+        let (manager, composite) = snapshot(&self.id, &self.member_ids, &self.manager)?
             .ok_or(MaptileError::TileNotFound(xyz.z, xyz.x, xyz.y))?;
-        composite.get_tile(xyz, query).await
+        composite
+            .get_tile_with(xyz, query, |source, query| {
+                read_member(&manager, source, xyz, query)
+            })
+            .await
     }
 
     async fn read_tile_batch(
@@ -130,7 +148,8 @@ impl TileSource for LazyCompositeSource {
         if coords.is_empty() {
             return Ok(Vec::new());
         }
-        let Some(composite) = snapshot(&self.id, &self.member_ids, &self.manager)? else {
+        let Some((_manager, composite)) = snapshot(&self.id, &self.member_ids, &self.manager)?
+        else {
             return Ok(coords
                 .iter()
                 .map(|_| TileResponse {
@@ -149,11 +168,19 @@ impl TileSource for LazyCompositeSource {
         query: Option<&TileQuery<'_>>,
         if_none_match: Option<&str>,
     ) -> MaptileResult<TileEtagResponse> {
-        let composite = snapshot(&self.id, &self.member_ids, &self.manager)?
+        let (manager, composite) = snapshot(&self.id, &self.member_ids, &self.manager)?
             .ok_or(MaptileError::TileNotFound(xyz.z, xyz.x, xyz.y))?;
-        composite
-            .get_tile_with_etag(xyz, query, if_none_match)
-            .await
+        let resp = composite
+            .get_tile_with(xyz, query, |source, query| {
+                read_member(&manager, source, xyz, query)
+            })
+            .await?;
+        let etag = composite.tile_etag(&resp);
+        if Some(etag.as_str()) == if_none_match {
+            Ok(TileEtagResponse::NotModified)
+        } else {
+            Ok(TileEtagResponse::Fresh { resp, etag })
+        }
     }
 }
 
@@ -161,7 +188,7 @@ impl TileSource for LazyCompositeSource {
 mod tests {
     use super::*;
     use crate::sources::mvt::{self, proto};
-    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tilejson::{TileJSON, VectorLayer, tilejson};
 
     // --- minimal MVT fake (mirrors composite.rs's test fake) ---
@@ -171,6 +198,7 @@ mod tests {
         tj: TileJSON,
         bytes: bytes::Bytes,
         format: TileFormat,
+        calls: Arc<AtomicUsize>,
     }
 
     impl MvtFake {
@@ -201,6 +229,7 @@ mod tests {
                 tj,
                 bytes,
                 format: TileFormat::Mvt,
+                calls: Arc::new(AtomicUsize::new(0)),
             })
         }
     }
@@ -209,6 +238,12 @@ mod tests {
     impl TileSource for MvtFake {
         fn id(&self) -> &str {
             &self.id
+        }
+        fn content_version(&self) -> crate::cache::ContentVersion {
+            crate::cache::ContentVersion::from_input(&self.bytes)
+        }
+        fn supports_filter(&self) -> bool {
+            true
         }
         fn tilejson(&self) -> &TileJSON {
             &self.tj
@@ -225,6 +260,7 @@ mod tests {
                 tj: self.tj.clone(),
                 bytes: self.bytes.clone(),
                 format: self.format,
+                calls: self.calls.clone(),
             })
         }
         async fn get_tile(
@@ -232,6 +268,8 @@ mod tests {
             _xyz: TileCoord,
             _query: Option<&TileQuery<'_>>,
         ) -> MaptileResult<TileResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            tokio::task::yield_now().await;
             Ok(TileResponse {
                 data: self.bytes.clone(),
                 info: self.tile_info(),
@@ -243,7 +281,9 @@ mod tests {
     // --- helpers ---
 
     fn manager_with(sources: Vec<Arc<dyn TileSource>>) -> Arc<SourceManager> {
-        let mgr = Arc::new(SourceManager::new());
+        let mgr = Arc::new(SourceManager::new().with_cache(Arc::new(
+            crate::cache::TileCache::new(1, None, None).unwrap(),
+        )));
         for s in sources {
             mgr.register(s);
         }
@@ -448,6 +488,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_members_share_manager_cache_but_queries_and_batches_bypass_it() {
+        let member = MvtFake::new("member", &["roads"]);
+        let mgr = manager_with(vec![member.clone()]);
+        let group = Arc::new(LazyCompositeSource::open(
+            "group".into(),
+            vec!["member".into()],
+            Arc::downgrade(&mgr),
+        ));
+        mgr.register(group.clone());
+        let xyz = TileCoord { z: 0, x: 0, y: 0 };
+        for _ in 0..2 {
+            mgr.get_tile("member", xyz, None).await.unwrap();
+            mgr.get_tile("group", xyz, None).await.unwrap();
+        }
+        mgr.get_tile("group", xyz, Some(&TileQuery::default()))
+            .await
+            .unwrap();
+        let TileEtagResponse::Fresh { etag, .. } = mgr
+            .get_tile_with_etag("group", xyz, None, None)
+            .await
+            .unwrap()
+        else {
+            panic!("expected fresh group response");
+        };
+        assert!(matches!(
+            mgr.get_tile_with_etag("group", xyz, None, Some(&etag))
+                .await
+                .unwrap(),
+            TileEtagResponse::NotModified
+        ));
+        assert_eq!(member.calls.load(Ordering::SeqCst), 1);
+
+        let filter = crate::filter::parse_cql2("id=1").unwrap();
+        let query = TileQuery {
+            filter: Some(&filter),
+            ..TileQuery::default()
+        };
+        for _ in 0..2 {
+            mgr.get_tile("group", xyz, Some(&query)).await.unwrap();
+        }
+        assert_eq!(member.calls.load(Ordering::SeqCst), 3);
+        group.read_tile_batch(&[xyz], None).await.unwrap();
+        assert_eq!(member.calls.load(Ordering::SeqCst), 4);
+
+        let cold = TileCoord { z: 1, x: 0, y: 0 };
+        let (group, direct) = tokio::join!(
+            mgr.get_tile("group", cold, None),
+            mgr.get_tile("member", cold, None),
+        );
+        group.unwrap();
+        direct.unwrap();
+        assert_eq!(member.calls.load(Ordering::SeqCst), 5);
+    }
+
+    #[tokio::test]
+    async fn cached_member_reads_keep_the_resolved_snapshot_after_replacement() {
+        let old = MvtFake::new("member", &["water"]);
+        let mgr = manager_with(vec![old.clone()]);
+        let xyz = TileCoord { z: 0, x: 0, y: 0 };
+        mgr.get_tile("member", xyz, None).await.unwrap();
+        let (manager, composite) = snapshot("group", &["member".into()], &Arc::downgrade(&mgr))
+            .unwrap()
+            .unwrap();
+        let new = MvtFake::new("member", &["roads"]);
+        mgr.register(new.clone());
+        let resp = composite
+            .get_tile_with(xyz, None, |source, query| {
+                manager.get_tile_from_source(source, xyz, query)
+            })
+            .await
+            .unwrap();
+        assert_eq!(layer_names(&resp), ["water"]);
+        assert_eq!(old.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(new.calls.load(Ordering::SeqCst), 0);
+
+        let group =
+            LazyCompositeSource::open("group".into(), vec!["member".into()], Arc::downgrade(&mgr));
+        assert_eq!(
+            layer_names(&group.get_tile(xyz, None).await.unwrap()),
+            ["roads"]
+        );
+        assert_eq!(new.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn manager_preserves_live_members_and_composite_etag_with_hot_cache() {
         let cache = Arc::new(crate::cache::TileCache::new(1, None, None).unwrap());
         let mgr = Arc::new(SourceManager::new().with_cache(cache));
@@ -459,9 +584,10 @@ mod tests {
         ));
         mgr.register(group.clone());
         let xyz = TileCoord { z: 0, x: 0, y: 0 };
-        let expected = snapshot("group", &["a".into()], &Arc::downgrade(&mgr))
+        let (_, expected_source) = snapshot("group", &["a".into()], &Arc::downgrade(&mgr))
             .unwrap()
-            .unwrap()
+            .unwrap();
+        let expected = expected_source
             .get_tile_with_etag(xyz, None, None)
             .await
             .unwrap();

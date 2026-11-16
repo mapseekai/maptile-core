@@ -12,6 +12,7 @@ static BATCH_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new((
 fn default_settings() -> PoolSettings {
     PoolSettings {
         max_size: 4,
+        batch_concurrency: 2,
         wait_timeout_ms: 5_000,
         create_timeout_ms: 5_000,
         recycle_timeout_ms: 5_000,
@@ -147,6 +148,148 @@ async fn pool_rejects_unreachable_dsn() {
 }
 
 #[tokio::test]
+async fn configured_batch_budgets_are_shared_by_clones_and_isolated_between_pools() {
+    use maptile_core::sources::{
+        TileCoord, TileSource,
+        postgres::{PostgresFunctionConfig, PostgresFunctionSource},
+    };
+    use std::{sync::Arc, time::Duration};
+    let Some(dsn) = common::postgres::pg_dsn() else {
+        return;
+    };
+    let schema = common::postgres::SchemaGuard::create(&dsn).await;
+    let (monitor, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    monitor
+        .batch_execute(&format!(
+            r#"CREATE TABLE "{s}".gate(id integer);
+            INSERT INTO "{s}".gate VALUES(1);
+            CREATE FUNCTION "{s}".budget_batch(z integer,x integer,y integer)
+            RETURNS bytea LANGUAGE plpgsql AS $$ BEGIN
+              PERFORM 1 FROM "{s}".gate FOR SHARE;
+              RETURN decode('1a0c0a05726f6164732880207802','hex');
+            END $$;"#,
+            s = schema.name
+        ))
+        .await
+        .unwrap();
+    let mut groups = Vec::new();
+    let mut names = Vec::new();
+    for limit in [1, 3] {
+        let name = format!("{}_budget_{limit}", schema.name);
+        let separator = if dsn.starts_with("postgres://") || dsn.starts_with("postgresql://") {
+            if dsn.contains('?') { "&" } else { "?" }
+        } else {
+            " "
+        };
+        let pool = PostgresPool::connect(
+            &format!("{dsn}{separator}application_name={name}"),
+            PoolSettings {
+                batch_concurrency: limit,
+                ..default_settings()
+            },
+        )
+        .await
+        .unwrap();
+        let config = PostgresFunctionConfig {
+            id: name.clone(),
+            schema: schema.name.clone(),
+            function: "budget_batch".into(),
+            description: None,
+            minzoom: None,
+            maxzoom: None,
+            bounds: None,
+            cache_zoom: None,
+        };
+        let original = Arc::new(
+            PostgresFunctionSource::open(Arc::new(pool.clone()), config.clone())
+                .await
+                .unwrap(),
+        );
+        let cloned = Arc::new(
+            PostgresFunctionSource::open(Arc::new(pool), config)
+                .await
+                .unwrap(),
+        );
+        groups.push((limit, [original, cloned]));
+        names.push(name);
+    }
+    monitor
+        .batch_execute(&format!(
+            "BEGIN; LOCK TABLE \"{}\".gate IN EXCLUSIVE MODE",
+            schema.name
+        ))
+        .await
+        .unwrap();
+    let mut jobs = Vec::new();
+    for (limit, sources) in groups {
+        for index in 0..=limit {
+            let source = sources[index % 2].clone();
+            jobs.push(tokio::spawn(async move {
+                source
+                    .read_tile_batch(&[TileCoord { z: 0, x: 0, y: 0 }], None)
+                    .await
+            }));
+        }
+    }
+    let counts = "SELECT count(*) FILTER (WHERE application_name=$1),
+                         count(*) FILTER (WHERE application_name=$2)
+                  FROM pg_stat_activity WHERE wait_event_type='Lock'";
+    let saturated = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            // The lock holder's transaction must refresh its statistics snapshot.
+            monitor
+                .batch_execute("SELECT pg_stat_clear_snapshot()")
+                .await
+                .unwrap();
+            let row = monitor
+                .query_one(counts, &[&names[0], &names[1]])
+                .await
+                .unwrap();
+            if (row.get::<_, i64>(0), row.get::<_, i64>(1)) == (1, 3) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    let excess = tokio::time::timeout(Duration::from_millis(150), async {
+        loop {
+            monitor
+                .batch_execute("SELECT pg_stat_clear_snapshot()")
+                .await
+                .unwrap();
+            let row = monitor
+                .query_one(counts, &[&names[0], &names[1]])
+                .await
+                .unwrap();
+            if row.get::<_, i64>(0) > 1 || row.get::<_, i64>(1) > 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    monitor.batch_execute("ROLLBACK").await.unwrap();
+    for job in jobs {
+        tokio::time::timeout(Duration::from_secs(3), job)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+    assert!(
+        saturated.is_ok(),
+        "independent configured budgets did not fill"
+    );
+    assert!(excess.is_err(), "pool clones exceeded their shared budget");
+}
+
+#[tokio::test]
 async fn batch_sql_admission_survives_a_controlled_cancellation_storm() {
     let _batch_test = BATCH_TEST_LOCK.lock().await;
     use maptile_core::sources::{
@@ -200,11 +343,7 @@ async fn batch_sql_admission_survives_a_controlled_cancellation_storm() {
             .await
             .unwrap(),
     );
-    let function_pool = Arc::new(
-        PostgresPool::connect(&named_dsn, default_settings())
-            .await
-            .unwrap(),
-    );
+    let function_pool = table_pool.clone();
     let mut config = PostgresTableConfig::new("storm-table", &schema.name, "storm_batch");
     config.bounds = Some([-180., -85., 180., 85.]);
     config.id_column = Some("id".into());
@@ -575,31 +714,11 @@ async fn batch_admission_waits_for_twelve_second_backend_cleanup() {
     );
 }
 
-#[test]
-fn batch_transport_loss_stops_archive_admission_but_keeps_online_reads() {
+#[tokio::test]
+async fn batch_transport_loss_stops_only_the_affected_pool() {
     let Some(dsn) = common::postgres::pg_dsn() else {
         return;
     };
-    // Fail-closed admission is process-wide; isolate the destructive fault from other tests.
-    if std::env::var_os("MAPTILE_BATCH_TRANSPORT_CHILD").is_none() {
-        let result = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "batch_transport_loss_stops_archive_admission_but_keeps_online_reads",
-                "--nocapture",
-            ])
-            .env("MAPTILE_BATCH_TRANSPORT_CHILD", "1")
-            .status()
-            .unwrap();
-        assert!(result.success(), "transport fault subprocess failed");
-        return;
-    }
-    tokio::runtime::Runtime::new()
-        .unwrap()
-        .block_on(assert_batch_transport_loss(dsn));
-}
-
-async fn assert_batch_transport_loss(dsn: String) {
     use maptile_core::sources::{
         TileCoord, TileSource,
         postgres::{PostgresFunctionConfig, PostgresFunctionSource},
@@ -823,6 +942,11 @@ async fn assert_batch_transport_loss(dsn: String) {
         online_source.get_tile(TileCoord { z: 1, x: 1, y: 0 }, None),
     )
     .await;
+    let independent_batch = tokio::time::timeout(
+        Duration::from_secs(1),
+        online_source.read_tile_batch(&[TileCoord { z: 1, x: 1, y: 0 }], None),
+    )
+    .await;
     monitor
         .query(
             "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name=$1",
@@ -844,5 +968,9 @@ async fn assert_batch_transport_loss(dsn: String) {
     assert!(
         online.unwrap().is_ok(),
         "online get_tile consulted archive admission"
+    );
+    assert!(
+        independent_batch.unwrap().is_ok(),
+        "a failed pool closed an independent pool's batch admission"
     );
 }

@@ -148,23 +148,10 @@ impl TileSource for CompositeSource {
         xyz: TileCoord,
         query: Option<&TileQuery<'_>>,
     ) -> MaptileResult<TileResponse> {
-        let mut reads = stream::iter(0..self.children.len())
-            .map(|index| async move {
-                let child = &self.children[index];
-                let q = if child.source.supports_url_query() || child.source.supports_filter() {
-                    query
-                } else {
-                    None
-                };
-                (child, child.source.get_tile(xyz, q).await)
-            })
-            .buffered(MAX_CHILD_READS);
-        let mut results = Vec::new();
-        let mut remaining = MAX_COMPOSITE_BYTES;
-        while let Some((child, result)) = reads.next().await {
-            retain_tile(child, result, &mut results, &mut remaining)?;
-        }
-        self.merge_tiles(xyz, results).await
+        self.get_tile_with(xyz, query, |source, query| async move {
+            source.get_tile(xyz, query).await
+        })
+        .await
     }
 
     async fn read_tile_batch(
@@ -209,6 +196,36 @@ impl TileSource for CompositeSource {
 }
 
 impl CompositeSource {
+    pub(super) async fn get_tile_with<'a, F, Fut>(
+        &'a self,
+        xyz: TileCoord,
+        query: Option<&'a TileQuery<'a>>,
+        read: F,
+    ) -> MaptileResult<TileResponse>
+    where
+        F: Fn(Arc<dyn TileSource>, Option<&'a TileQuery<'a>>) -> Fut,
+        Fut: std::future::Future<Output = MaptileResult<TileResponse>>,
+    {
+        let mut reads = stream::iter(0..self.children.len())
+            .map(|index| {
+                let child = &self.children[index];
+                let query = if child.source.supports_url_query() || child.source.supports_filter() {
+                    query
+                } else {
+                    None
+                };
+                let tile = read(child.source.clone(), query);
+                async move { (child, tile.await) }
+            })
+            .buffered(MAX_CHILD_READS);
+        let mut results = Vec::new();
+        let mut remaining = MAX_COMPOSITE_BYTES;
+        while let Some((child, result)) = reads.next().await {
+            retain_tile(child, result, &mut results, &mut remaining)?;
+        }
+        self.merge_tiles(xyz, results).await
+    }
+
     async fn merge_tiles(
         &self,
         xyz: TileCoord,

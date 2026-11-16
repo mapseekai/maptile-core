@@ -44,6 +44,8 @@ impl SourceManager {
     /// Attach a shared tile cache. Returns `self` for chaining.
     /// Filter, bbox and URL inputs bypass the cache; style and mosaic selection
     /// partition the cache key. Empty queries remain cacheable.
+    /// Sources must not re-enter this cache for the same key during a miss.
+    /// Custom sources that own a tile cache should disable their manager cache policy.
     #[must_use]
     pub fn with_cache(mut self, cache: Arc<TileCache>) -> Self {
         self.cache = Some(cache);
@@ -249,7 +251,7 @@ impl SourceManager {
     ) -> MaptileResult<TileResponse> {
         let source = self.require(id)?;
 
-        self.get_tile_from_source(id, source, xyz, query).await
+        self.get_tile_from_source(source, xyz, query).await
     }
 
     /// Fetch through the same hot cache while preserving source validators.
@@ -271,7 +273,7 @@ impl SourceManager {
             return Ok(response);
         }
         let resp = self
-            .get_tile_from_source(id, source.clone(), xyz, query)
+            .get_tile_from_source(source.clone(), xyz, query)
             .await?;
         let etag = source.tile_etag(&resp);
         if Some(etag.as_str()) == if_none_match {
@@ -281,13 +283,13 @@ impl SourceManager {
         }
     }
 
-    async fn get_tile_from_source(
+    pub(super) async fn get_tile_from_source(
         &self,
-        id: &str,
         source: Arc<dyn TileSource>,
         xyz: TileCoord,
         query: Option<&TileQuery<'_>>,
     ) -> MaptileResult<TileResponse> {
+        let id = source.id();
         let selection_fallback = source.mosaic_pixel_selection();
         validate_pixel_selection(id, query, selection_fallback)?;
         let effective_selection =
@@ -347,16 +349,14 @@ impl SourceManager {
             let cached_selection = effective_selection;
             return cache
                 .get_or_insert(key, move || async move {
-                    // Some(empty) marks a manager-owned cache fill. PostgreSQL
-                    // source caches only run for query=None, avoiding a recursive
-                    // get_or_insert of this exact same key in the shared cache.
                     let inner = TileQuery {
                         style: cached_style,
                         style_hash: query.and_then(|q| q.style_hash),
                         pixel_selection: cached_selection,
                         ..TileQuery::default()
                     };
-                    let tile = source_for_compute.get_tile(xyz, Some(&inner)).await?;
+                    let inner = (query.is_some() || cached_selection.is_some()).then_some(&inner);
+                    let tile = source_for_compute.get_tile(xyz, inner).await?;
                     check_tile_size(&tile)?;
                     Ok::<_, MaptileError>(tile)
                 })
@@ -623,15 +623,14 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct SourceCached {
+    struct ResponseSource {
         inner: Arc<CountingSource>,
-        cache: Arc<TileCache>,
         data: Option<Bytes>,
         cache_zoom: crate::cache::CacheZoomRange,
     }
 
     #[async_trait]
-    impl TileSource for SourceCached {
+    impl TileSource for ResponseSource {
         fn id(&self) -> &str {
             self.inner.id()
         }
@@ -655,40 +654,25 @@ mod tests {
             xyz: TileCoord,
             query: Option<&TileQuery<'_>>,
         ) -> MaptileResult<TileResponse> {
-            let compute = || async {
-                let mut tile = self.inner.get_tile(xyz, query).await?;
-                if let Some(data) = &self.data {
-                    tile.data = data.clone();
-                }
-                Ok::<_, MaptileError>(tile)
-            };
-            if query.is_none() && self.cache_zoom.contains(xyz.z) {
-                let key = TileCacheKey::new(
-                    self.id().into(),
-                    self.content_version(),
-                    xyz.z,
-                    xyz.x,
-                    xyz.y,
-                    crate::cache::StyleHash::NONE,
-                );
-                return self
-                    .cache
-                    .get_or_insert(key, compute)
-                    .await
-                    .map_err(|e| (*e).clone());
+            assert!(
+                query.is_none() || query.is_some_and(TileQuery::bypasses_cache),
+                "query-less reads must not receive a synthetic cache-control query"
+            );
+            let mut tile = self.inner.get_tile(xyz, query).await?;
+            if let Some(data) = &self.data {
+                tile.data = data.clone();
             }
-            compute().await
+            Ok(tile)
         }
     }
 
     #[tokio::test]
-    async fn etag_cache_coalesces_and_avoids_nested_source_cache_deadlock() {
+    async fn manager_coalesces_etag_reads_without_a_cache_control_query() {
         let cache = Arc::new(TileCache::new(1, None, None).unwrap());
         let mgr = SourceManager::new().with_cache(cache.clone());
         let (inner, calls) = counting_source("nested");
-        mgr.register(Arc::new(SourceCached {
+        mgr.register(Arc::new(ResponseSource {
             inner,
-            cache,
             data: None,
             cache_zoom: crate::cache::CacheZoomRange::default(),
         }));
@@ -700,7 +684,7 @@ mod tests {
             }
             assert!(matches!(mgr.get_tile_with_etag("nested", xyz, None,
                 Some("\"authoritative\"")).await.unwrap(), TileEtagResponse::NotModified));
-        }).await.expect("shared cache must not recursively await its own fill");
+        }).await.expect("manager cache fill must complete");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
         let filter = crate::filter::parse_cql2("population > 0").unwrap();
@@ -723,7 +707,7 @@ mod tests {
         assert_eq!(
             calls.load(Ordering::SeqCst),
             5,
-            "bbox/filter must bypass both cache levels"
+            "bbox/filter must bypass the manager cache"
         );
     }
 
@@ -732,9 +716,8 @@ mod tests {
         let cache = Arc::new(TileCache::new(64, None, None).unwrap());
         let mgr = SourceManager::new().with_cache(cache.clone());
         let (inner, calls) = counting_source("huge");
-        mgr.register(Arc::new(SourceCached {
+        mgr.register(Arc::new(ResponseSource {
             inner,
-            cache: cache.clone(),
             data: Some(Bytes::from(vec![
                 0;
                 crate::transport::MAX_DECODED_TILE_BYTES
@@ -759,9 +742,8 @@ mod tests {
         let cache = Arc::new(TileCache::new(64, None, None).unwrap());
         let mgr = SourceManager::new().with_cache(cache.clone());
         let (inner, _) = counting_source("huge-live");
-        mgr.register(Arc::new(SourceCached {
+        mgr.register(Arc::new(ResponseSource {
             inner,
-            cache: cache.clone(),
             data: Some(Bytes::from(vec![
                 0;
                 crate::transport::MAX_DECODED_TILE_BYTES
@@ -959,9 +941,8 @@ mod tests {
         let cache = Arc::new(TileCache::new(1, None, None).unwrap());
         let manager = SourceManager::new().with_cache(cache.clone());
         let (inner, calls) = counting_source("live");
-        manager.register(Arc::new(SourceCached {
+        manager.register(Arc::new(ResponseSource {
             inner,
-            cache,
             data: None,
             cache_zoom: crate::cache::CacheZoomRange::disabled(),
         }));

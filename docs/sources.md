@@ -128,12 +128,27 @@ async fn read_primary_roads(manager: &SourceManager) -> MaptileResult<TileRespon
 | 字段 | 默认值 | 用途 |
 | --- | --- | --- |
 | `max_size` | `16` | 连接池容量 |
+| `batch_concurrency` | `2` | 每个池的批量查询额度，包含取消后的清理任务 |
 | `wait_timeout_ms` | `5000` | 等待空闲连接的期限 |
 | `create_timeout_ms` | `5000` | 创建连接的期限 |
 | `recycle_timeout_ms` | `5000` | 回收检查的期限 |
 | `pre_warm` | `false` | 启动时按需建连；设为 `true` 时并发预建最多 `max_size` 条连接 |
 
 连接初始化会设置 `jit=off`，并保留 DSN 中其他启动选项；后续扩容和替换连接沿用同一配置。开启预建连接时，根据数据库总连接预算配置池容量，并将这部分建连成本计入启动时间。
+
+`batch_concurrency` 必须为正数且不超过 Tokio 信号量上限。克隆 `PostgresPool` 会共享同一额度；分别 `connect` 得到的池具有独立额度。在线 `get_tile` 不占批量额度，但与批量查询共享连接池。如果 SQL 取消后无法确认后端已经结束，该池停止接受新批量任务；核实数据库残留任务后再重建池。应用还可在启动时通过 `transport::configure_blocking_concurrency` 配置本 crate 的共享阻塞任务额度，见[并发额度](architecture.md#并发额度)。
+
+Postgres 表源和函数源不持有瓦片结果缓存。原先的源级 `with_cache`，以及函数源的 `set_cache` / `cache` 接口已移除；将缓存配置迁移到 `SourceManager::with_cache`，并通过管理器读取。`cache_zoom` 继续控制管理器缓存的层级，直接调用源会重新查询数据库。
+
+```rust
+use maptile_core::sources::postgres::PoolSettings;
+
+let settings = PoolSettings {
+    max_size: 12,
+    batch_concurrency: 3,
+    ..PoolSettings::default()
+};
+```
 
 表源打开和刷新时发现元数据并生成查询模板，SQL 预编译发生在实际使用的连接上。源码依据见 [`pool.rs`](../src/sources/postgres/pool.rs) 和 [`table.rs`](../src/sources/postgres/table.rs)。
 

@@ -716,26 +716,27 @@ async fn edited_revision_bypasses_old_tiles_and_rediscovers_fields() {
     create_simple_table(&dsn, &g.name, "t").await;
     let pool = make_pool(&dsn).await;
     let cache = Arc::new(maptile_core::cache::TileCache::new(1, None, None).unwrap());
+    let manager = maptile_core::sources::manager::SourceManager::new().with_cache(cache);
     let old = PostgresTableSource::open(pool.clone(), cfg_for(&g.name, "t"))
         .await
         .unwrap()
-        .with_edit_revision(Some("before".into()))
-        .with_cache(cache.clone());
+        .with_edit_revision(Some("before".into()));
     let old_version = old.content_version();
+    let id = old.id().to_owned();
+    manager.register(Arc::new(old));
     let coord = TileCoord {
         z: 8,
         x: 128,
         y: 127,
     };
-    let before = old.get_tile(coord, None).await.unwrap();
+    let before = manager.get_tile(&id, coord, None).await.unwrap();
     let conn = pool.get().await.unwrap();
     conn.batch_execute(&format!("ALTER TABLE \"{}\".t ADD COLUMN extra text; UPDATE \"{}\".t SET extra='new'; ALTER TABLE \"{}\".t DROP COLUMN name",g.name,g.name,g.name)).await.unwrap();
     drop(conn);
     let fresh = PostgresTableSource::open(pool, cfg_for(&g.name, "t"))
         .await
         .unwrap()
-        .with_edit_revision(Some("after".into()))
-        .with_cache(cache);
+        .with_edit_revision(Some("after".into()));
     assert_ne!(old_version, fresh.content_version());
     assert_eq!(
         fresh.tilejson().other.get("mapseek_revision"),
@@ -747,7 +748,8 @@ async fn edited_revision_bypasses_old_tiles_and_rediscovers_fields() {
     );
     assert!(fresh.table_info().properties.contains(&"extra".into()));
     assert!(!fresh.table_info().properties.contains(&"name".into()));
-    let after = fresh.get_tile(coord, None).await.unwrap();
+    manager.register(Arc::new(fresh));
+    let after = manager.get_tile(&id, coord, None).await.unwrap();
     assert_ne!(before.data, after.data);
 }
 

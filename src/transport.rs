@@ -21,6 +21,37 @@ use crate::error::{MaptileError, MaptileResult};
 /// Maximum decoded tile payload retained by the transport layer.
 pub const MAX_DECODED_TILE_BYTES: usize = 16 * 1024 * 1024;
 
+static BLOCKING_SLOTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+/// Configure the process-wide budget for this crate's bounded blocking work.
+/// Call once at application startup, before opening sources or running async
+/// decoding, encoding or other bounded CPU work. Without configuration the
+/// budget defaults to available parallelism, capped at 16.
+///
+/// Returns `Config` for zero, values above [`Semaphore::MAX_PERMITS`], or if
+/// the budget was already configured or used. Live jobs are never moved to a
+/// replacement semaphore. Separate processes have independent budgets.
+///
+/// ```
+/// maptile_core::transport::configure_blocking_concurrency(8)?;
+/// # Ok::<(), maptile_core::error::MaptileError>(())
+/// ```
+pub fn configure_blocking_concurrency(limit: usize) -> MaptileResult<()> {
+    if !(1..=Semaphore::MAX_PERMITS).contains(&limit) {
+        return Err(MaptileError::Config(format!(
+            "blocking concurrency must be between 1 and {}",
+            Semaphore::MAX_PERMITS
+        )));
+    }
+    BLOCKING_SLOTS
+        .set(Arc::new(Semaphore::new(limit)))
+        .map_err(|_| {
+            MaptileError::Config(
+                "blocking concurrency is already initialized; configure it before first use".into(),
+            )
+        })
+}
+
 /// Decode a payload with the default output limit. Already decoded bytes
 /// share their allocation; they are checked against the same limit.
 pub fn decode(data: &Bytes, encoding: TileEncoding) -> MaptileResult<Bytes> {
@@ -84,8 +115,7 @@ fn read_decoded(mut reader: impl Read, max_bytes: usize) -> MaptileResult<Bytes>
 pub(crate) async fn run_blocking<T: Send + 'static>(
     work: impl FnOnce() -> MaptileResult<T> + Send + 'static,
 ) -> MaptileResult<T> {
-    static SLOTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
-    let slots = SLOTS.get_or_init(|| {
+    let slots = BLOCKING_SLOTS.get_or_init(|| {
         let parallelism = std::thread::available_parallelism().map_or(1, usize::from);
         Arc::new(Semaphore::new(parallelism.clamp(1, 16)))
     });
@@ -220,6 +250,84 @@ mod tests {
     use super::*;
 
     const SAMPLE: &[u8] = b"hello, maptile-core transport!";
+
+    #[test]
+    fn configured_blocking_budget_is_shared_and_survives_waiter_cancellation() {
+        const CHILD: &str = "MAPTILE_BLOCKING_BUDGET_TEST";
+        let Ok(limit) = std::env::var(CHILD) else {
+            for limit in ["default", "1", "32"] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "transport::tests::configured_blocking_budget_is_shared_and_survives_waiter_cancellation",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, limit)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        };
+        if limit == "default" {
+            tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(run_blocking(|| Ok(())))
+                .unwrap();
+            let expected = std::thread::available_parallelism()
+                .map_or(1, usize::from)
+                .clamp(1, 16);
+            assert_eq!(BLOCKING_SLOTS.get().unwrap().available_permits(), expected);
+            assert!(configure_blocking_concurrency(4).is_err());
+            return;
+        }
+        let limit: usize = limit.parse().unwrap();
+        for invalid in [0, Semaphore::MAX_PERMITS + 1] {
+            assert!(matches!(
+                configure_blocking_concurrency(invalid),
+                Err(MaptileError::Config(_))
+            ));
+        }
+        configure_blocking_concurrency(limit).unwrap();
+        assert!(configure_blocking_concurrency(limit + 1).is_err());
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (started, entered) = tokio::sync::oneshot::channel();
+            let (release, wait) = std::sync::mpsc::channel();
+            let first = tokio::spawn(run_blocking(move || {
+                let _ = started.send(());
+                let _ = wait.recv();
+                Ok(())
+            }));
+            entered.await.unwrap();
+            first.abort();
+            assert!(first.await.unwrap_err().is_cancelled());
+            let slots = BLOCKING_SLOTS.get().unwrap();
+            assert_eq!(slots.available_permits(), limit - 1);
+            let remaining = slots
+                .clone()
+                .acquire_many_owned((limit - 1) as u32)
+                .await
+                .unwrap();
+            let second = run_blocking(|| Ok(42));
+            tokio::pin!(second);
+            assert!(futures_util::poll!(&mut second).is_pending());
+            release.send(()).unwrap();
+            assert_eq!(
+                tokio::time::timeout(std::time::Duration::from_secs(2), second)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                42
+            );
+            drop(remaining);
+            assert_eq!(slots.available_permits(), limit);
+        });
+    }
 
     #[test]
     fn all_decoders_enforce_output_limit() {

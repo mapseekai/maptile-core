@@ -3,6 +3,7 @@
 //! Functions receive integer `(z, x, y)` coordinates and may also accept a
 //! JSON or JSONB parameter object. [`PostgresFunctionSource`] discovers the
 //! signature at open time and forwards tile requests through [`PostgresPool`].
+//! Tile caching belongs to [`crate::sources::manager::SourceManager`].
 
 use std::sync::Arc;
 
@@ -11,7 +12,7 @@ use bytes::Bytes;
 use serde_json::{Map, Value};
 use tilejson::{TileJSON, tilejson};
 
-use crate::cache::{CacheZoomRange, ContentVersion, TileCache, TileCacheKey};
+use crate::cache::{CacheZoomRange, ContentVersion};
 use crate::error::{MaptileError, MaptileResult};
 use crate::sources::{
     TileCoord, TileEncoding, TileFormat, TileInfo, TileQuery, TileResponse, TileSource,
@@ -41,7 +42,6 @@ pub struct PostgresFunctionSource {
     tj: TileJSON,
     info: TileInfo,
     content_version: ContentVersion,
-    cache: Option<Arc<TileCache>>,
 }
 
 impl std::fmt::Debug for PostgresFunctionSource {
@@ -88,30 +88,7 @@ impl PostgresFunctionSource {
             tj,
             info,
             content_version: ContentVersion::new_generation(),
-            cache: None,
         })
-    }
-
-    /// Attach a tile cache for query-less requests within [`Self::cache_zoom`].
-    /// Concurrent misses for the same source content and tile coordinate share
-    /// one function call. Requests carrying a [`TileQuery`] execute directly.
-    /// A shared manager-level cache can also be configured through
-    /// [`crate::sources::manager::SourceManager::with_cache`].
-    #[must_use]
-    pub fn with_cache(mut self, cache: Arc<TileCache>) -> Self {
-        self.cache = Some(cache);
-        self
-    }
-
-    /// Mutating variant for callers holding `&mut Self` (e.g., behind `Arc::get_mut`).
-    pub fn set_cache(&mut self, cache: Arc<TileCache>) {
-        self.cache = Some(cache);
-    }
-
-    /// Reference to the attached cache, if any.
-    #[must_use]
-    pub fn cache(&self) -> Option<&Arc<TileCache>> {
-        self.cache.as_ref()
     }
 }
 
@@ -247,7 +224,6 @@ impl TileSource for PostgresFunctionSource {
             tj: self.tj.clone(),
             info: self.info,
             content_version: self.content_version,
-            cache: self.cache.clone(),
         })
     }
 
@@ -256,28 +232,6 @@ impl TileSource for PostgresFunctionSource {
         xyz: TileCoord,
         query: Option<&TileQuery<'_>>,
     ) -> MaptileResult<TileResponse> {
-        // Cache path — only for query-less requests, since filter/url_query
-        // make the tile bytes depend on inputs not captured by TileCacheKey.
-        // `get_or_insert` coalesces concurrent misses for the same tile into
-        // a single function call (moka entry API).
-        if query.is_none()
-            && self.cache_zoom().contains(xyz.z)
-            && let Some(cache) = self.cache.as_ref()
-        {
-            let key = TileCacheKey {
-                source_id: self.cfg.id.as_str().into(),
-                content_version: self.content_version(),
-                z: xyz.z,
-                x: xyz.x,
-                y: xyz.y,
-                style_hash: crate::cache::StyleHash::NONE,
-            };
-            return cache
-                .get_or_insert(key, || self.fetch_tile(xyz, None))
-                .await
-                .map_err(|arc_err: std::sync::Arc<MaptileError>| (*arc_err).clone());
-        }
-
         self.fetch_tile(xyz, query).await
     }
 
@@ -302,8 +256,7 @@ impl TileSource for PostgresFunctionSource {
 }
 
 impl PostgresFunctionSource {
-    /// Invoke the SQL function for one tile. Shared by the cached
-    /// (coalesced) and direct paths of `get_tile`.
+    /// Invoke the SQL function for one tile.
     async fn fetch_tile(
         &self,
         xyz: TileCoord,
@@ -405,22 +358,6 @@ mod tests {
         };
         let v = build_query_payload(Some(&tq));
         assert!(v["filter"]["expr"].is_object());
-    }
-
-    #[test]
-    fn cache_key_uses_source_id() {
-        // Sanity: verify the key shape matches the manager-level cache so a
-        // single shared cache won't collide across sources.
-        let key = TileCacheKey {
-            source_id: "src-a".into(),
-            content_version: crate::cache::ContentVersion::from_input(b"test"),
-            z: 5,
-            x: 1,
-            y: 2,
-            style_hash: crate::cache::StyleHash::NONE,
-        };
-        assert_eq!(&*key.source_id, "src-a");
-        assert_eq!(key.z, 5);
     }
 
     #[test]

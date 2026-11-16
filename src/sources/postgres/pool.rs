@@ -6,7 +6,7 @@ use deadpool_postgres::{
 use futures_util::{StreamExt, future::join_all};
 use semver::Version;
 use std::str::FromStr;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_postgres::config::SslMode;
@@ -17,12 +17,13 @@ use crate::error::{MaptileError, MaptileResult};
 
 use super::{MINIMUM_POSTGIS_VERSION, MINIMUM_POSTGRES_VERSION, ST_TILE_ENVELOPE_MARGIN_VERSION};
 
-static BATCH_ADMISSION: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(2)));
-
 /// Pool tunables. Defaults aim at small server workloads — tweak per deployment.
 #[derive(Clone, Debug)]
 pub struct PoolSettings {
     pub max_size: usize,
+    /// Maximum active batch operations, including cancellation cleanup, per pool.
+    /// Clones share the budget; separately connected pools have independent budgets.
+    pub batch_concurrency: usize,
     pub wait_timeout_ms: u64,
     pub create_timeout_ms: u64,
     pub recycle_timeout_ms: u64,
@@ -33,6 +34,7 @@ impl Default for PoolSettings {
     fn default() -> Self {
         Self {
             max_size: 16,
+            batch_concurrency: 2,
             wait_timeout_ms: 5_000,
             create_timeout_ms: 5_000,
             recycle_timeout_ms: 5_000,
@@ -44,6 +46,7 @@ impl Default for PoolSettings {
 #[derive(Clone, Debug)]
 pub struct PostgresPool {
     pool: Pool,
+    batch_admission: Arc<Semaphore>,
     postgres_version: Version,
     postgis_version: Version,
     supports_tile_margin: bool,
@@ -53,6 +56,12 @@ pub struct PostgresPool {
 
 impl PostgresPool {
     pub async fn connect(dsn: &str, settings: PoolSettings) -> MaptileResult<Self> {
+        if !(1..=Semaphore::MAX_PERMITS).contains(&settings.batch_concurrency) {
+            return Err(MaptileError::Config(format!(
+                "batch_concurrency must be between 1 and {}",
+                Semaphore::MAX_PERMITS
+            )));
+        }
         let mut pg_config =
             Config::from_str(dsn).map_err(|e| MaptileError::Config(format!("invalid DSN: {e}")))?;
         // JIT compilation costs more than it saves for short tile queries, including on replacement connections.
@@ -105,6 +114,7 @@ impl PostgresPool {
 
         Ok(Self {
             pool,
+            batch_admission: Arc::new(Semaphore::new(settings.batch_concurrency)),
             postgres_version,
             postgis_version,
             supports_tile_margin,
@@ -118,12 +128,12 @@ impl PostgresPool {
     }
 
     pub(crate) async fn get_batch(self: &Arc<Self>) -> MaptileResult<BatchConnection> {
-        let permit = Arc::clone(&BATCH_ADMISSION)
+        let permit = Arc::clone(&self.batch_admission)
             .acquire_owned()
             .await
             .map_err(|_| {
                 MaptileError::BackendMsg(
-                    "archive SQL admission closed after unconfirmed backend completion; verify PostgreSQL and restart this process".into(),
+                    "archive SQL admission closed after unconfirmed backend completion; verify PostgreSQL before recreating this pool".into(),
                 )
             })?;
         Ok(BatchConnection {
@@ -190,7 +200,7 @@ impl Drop for BatchConnection {
         };
         let pool = Arc::clone(&self.pool);
         runtime.spawn(async move {
-            // Each cleanup retains its SQL slot, so at most two can wait in the background.
+            // Cleanup retains its slot and stays within this pool's batch budget.
             let drain = wait_for_ready(&connection);
             tokio::pin!(drain);
             let result = tokio::select! {
@@ -213,7 +223,7 @@ impl Drop for BatchConnection {
 }
 
 // Dropping a socket does not prove the remote SQL stopped. Unknown completion stops
-// archive admission for this process; ordinary online pool access remains available.
+// archive admission for this pool; ordinary online pool access remains available.
 struct BatchPermit {
     permit: OwnedSemaphorePermit,
     ready: bool,
@@ -228,7 +238,7 @@ impl Drop for BatchPermit {
         if !self.ready {
             self.permit.semaphore().close();
             tracing::error!(
-                "archive SQL admission closed: backend completion unconfirmed; verify PostgreSQL and restart this process"
+                "archive SQL admission closed: backend completion unconfirmed; verify PostgreSQL before recreating this pool"
             );
         }
     }
@@ -344,10 +354,29 @@ fn parse_loose_version(raw: &str) -> Option<Version> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BatchPermit, parse_loose_version};
+    use super::{BatchPermit, PoolSettings, PostgresPool, parse_loose_version};
     use semver::Version;
     use std::sync::Arc;
     use tokio::sync::Semaphore;
+
+    #[tokio::test]
+    async fn invalid_batch_concurrency_is_rejected_before_connecting() {
+        for batch_concurrency in [0, Semaphore::MAX_PERMITS + 1] {
+            let error = PostgresPool::connect(
+                "invalid dsn",
+                PoolSettings {
+                    batch_concurrency,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                crate::error::MaptileError::Config(message) if message.starts_with("batch_concurrency")
+            ));
+        }
+    }
 
     #[tokio::test]
     async fn confirmed_batch_permit_restores_capacity() {
