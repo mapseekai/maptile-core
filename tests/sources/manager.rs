@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use bytes::Bytes;
-use maptile_core::error::MaptileResult;
+use maptile_core::error::{MaptileError, MaptileResult};
 use maptile_core::sources::manager::SourceManager;
 use maptile_core::sources::{TileCoord, TileQuery, TileResponse, TileSource};
 use maptile_core::sources::{TileEncoding, TileFormat, TileInfo};
@@ -101,6 +101,65 @@ fn register_overwrites_same_id() {
     m.register(Stub::arc("a"));
     m.register(Stub::arc("a"));
     assert_eq!(m.list_ids().len(), 1);
+}
+
+#[test]
+fn conditional_failure_only_retires_the_observed_instance() {
+    let manager = SourceManager::new();
+    let old = Stub::arc("a");
+    let replacement = Stub::arc("a");
+    assert_eq!(old.content_version(), replacement.content_version());
+    manager.register(old.clone());
+    manager.register(replacement.clone());
+
+    assert!(!manager.mark_unavailable_if_current(&old));
+    assert!(Arc::ptr_eq(&manager.require("a").unwrap(), &replacement));
+    assert!(manager.mark_unavailable_if_current(&replacement));
+    assert!(!manager.mark_unavailable_if_current(&replacement));
+    assert!(matches!(
+        manager.require("a"),
+        Err(MaptileError::SourceUnavailable(_))
+    ));
+    manager.remove("a");
+    assert!(!manager.mark_unavailable_if_current(&old));
+    assert!(!manager.mark_unavailable_if_current(&replacement));
+    assert!(!manager.mark_unavailable_if_current(&Stub::arc("missing")));
+    assert!(matches!(
+        manager.require("a"),
+        Err(MaptileError::SourceNotFound(_))
+    ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn foreground_recovery_invokes_factory_only_for_an_eligible_unavailable_id() {
+    let manager = SourceManager::new();
+    let original = Stub::arc("a");
+    manager.register(original.clone());
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    let factory = || {
+        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        std::future::ready(Ok(Stub::arc("a")))
+    };
+
+    let ready = manager.recover_unavailable("a", factory).await.unwrap();
+    assert!(Arc::ptr_eq(&ready, &original));
+    assert!(matches!(
+        manager.recover_unavailable("missing", factory).await,
+        Err(MaptileError::SourceNotFound(_))
+    ));
+    assert!(manager.mark_unavailable_if_current(&original));
+    assert!(matches!(
+        manager.recover_unavailable("a", factory).await,
+        Err(MaptileError::SourceUnavailable(_))
+    ));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    let recovered = manager.recover_unavailable("a", factory).await.unwrap();
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(Arc::ptr_eq(&manager.require("a").unwrap(), &recovered));
+    assert!(!manager.mark_unavailable_if_current(&original));
+    assert!(!manager.is_unavailable("a"));
 }
 
 #[tokio::test]

@@ -186,3 +186,25 @@ fn register_city_layers(manager: &SourceManager) -> MaptileResult<()> {
 4. 下线一个源时，调用 `close_source(id).await`，完成移除、缓存失效和资源关闭等待。
 
 目录扫描与 `reload_from_discovery` 用于同步新增和删除的源 ID。更新已有 ID 的文件时，使用重新打开和注册流程。缓存键、内容版本和显式关闭的关系见[架构与生命周期](architecture.md)。
+
+异步故障回调应携带实际使用的源引用，调用 `manager.mark_unavailable_if_current(&source)`；按 ID 的 `mark_unavailable` 用于管理操作。请求触发恢复时，直接调用 `recover_unavailable`，由管理器检查退避、协调工厂并校验结果身份：
+
+```rust,no_run
+use maptile_core::prelude::*;
+use maptile_core::sources::mbtiles::{MbtilesConfig, MbtilesSource};
+use std::sync::Arc;
+
+async fn recover_basemap(manager: &SourceManager) -> MaptileResult<Arc<dyn TileSource>> {
+    manager.recover_unavailable("basemap", || async {
+        let source = MbtilesSource::open(MbtilesConfig {
+            id: "basemap".into(),
+            path: "data/basemap.mbtiles".into(),
+            serve_as: None,
+            description: None,
+        }).await?;
+        Ok(Arc::new(source) as Arc<dyn TileSource>)
+    }).await
+}
+```
+
+退避期间或同一注册项已有恢复任务时返回 `SourceUnavailable`，未获准的调用不执行工厂。若源已经就绪，直接返回当前引用；若已删除，返回 `SourceNotFound`。不要把 `unavailable_retry_due` 的观察结果当成独占恢复资格。

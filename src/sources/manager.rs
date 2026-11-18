@@ -15,7 +15,10 @@ use std::sync::Arc;
 
 enum SourceState {
     Ready(Arc<dyn TileSource>),
-    Unavailable(tokio::time::Instant),
+    Unavailable {
+        failed_at: tokio::time::Instant,
+        recovery: Option<Arc<()>>,
+    },
 }
 
 #[derive(Default)]
@@ -24,14 +27,46 @@ pub struct SourceManager {
     cache: Option<Arc<TileCache>>,
 }
 
-#[derive(Default)]
-struct PendingSources(Vec<Arc<dyn TileSource>>);
+struct PendingSources<'a> {
+    sources: Vec<Arc<dyn TileSource>>,
+    manager: &'a SourceManager,
+}
 
-impl Drop for PendingSources {
+impl Drop for PendingSources<'_> {
     fn drop(&mut self) {
         // A failed or cancelled factory must not leave unpublished sources running.
-        for source in &self.0 {
-            source.start_close();
+        for source in &self.sources {
+            if !self
+                .manager
+                .get(source.id())
+                .is_some_and(|registered| Arc::ptr_eq(&registered, source))
+            {
+                source.start_close();
+            }
+        }
+    }
+}
+
+struct RecoveryGuard<'a> {
+    manager: &'a SourceManager,
+    id: &'a str,
+    token: Arc<()>,
+    pending: PendingSources<'a>,
+}
+
+impl Drop for RecoveryGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(mut entry) = self.manager.sources.get_mut(self.id)
+            && let SourceState::Unavailable {
+                failed_at,
+                recovery,
+            } = entry.value_mut()
+            && recovery
+                .as_ref()
+                .is_some_and(|token| Arc::ptr_eq(token, &self.token))
+        {
+            *failed_at = tokio::time::Instant::now();
+            *recovery = None;
         }
     }
 }
@@ -81,42 +116,173 @@ impl SourceManager {
     pub fn get(&self, id: &str) -> Option<Arc<dyn TileSource>> {
         self.sources.get(id).and_then(|r| match r.value() {
             SourceState::Ready(source) => Some(source.clone()),
-            SourceState::Unavailable(_) => None,
+            SourceState::Unavailable { .. } => None,
         })
     }
 
-    /// Keep a failed active source distinct from a source that does not exist.
+    /// Administratively mark an id unavailable, creating the record if absent.
+    /// Repeated marks preserve its backoff and any active recovery. Use
+    /// [`Self::mark_unavailable_if_current`] for failures from an observed source.
     pub fn mark_unavailable(&self, id: &str) {
-        if let Some(SourceState::Ready(source)) = self.sources.insert(
-            id.to_string(),
-            SourceState::Unavailable(tokio::time::Instant::now()),
-        ) {
+        let previous = {
+            let mut entry =
+                self.sources
+                    .entry(id.to_string())
+                    .or_insert_with(|| SourceState::Unavailable {
+                        failed_at: tokio::time::Instant::now(),
+                        recovery: None,
+                    });
+            if matches!(entry.value(), SourceState::Unavailable { .. }) {
+                return;
+            }
+            std::mem::replace(
+                entry.value_mut(),
+                SourceState::Unavailable {
+                    failed_at: tokio::time::Instant::now(),
+                    recovery: None,
+                },
+            )
+        };
+        if let SourceState::Ready(source) = previous {
             source.start_close();
+        }
+    }
+
+    /// Retire only the exact registered instance observed by a failed request.
+    /// Returns false for stale, absent or already unavailable sources without
+    /// changing the registry. Equal content versions do not imply identity.
+    pub fn mark_unavailable_if_current(&self, expected: &Arc<dyn TileSource>) -> bool {
+        let previous = if let Some(mut entry) = self.sources.get_mut(expected.id())
+            && matches!(entry.value(), SourceState::Ready(source) if Arc::ptr_eq(source, expected))
+        {
+            Some(std::mem::replace(
+                entry.value_mut(),
+                SourceState::Unavailable {
+                    failed_at: tokio::time::Instant::now(),
+                    recovery: None,
+                },
+            ))
+        } else {
+            None
+        };
+        if let Some(SourceState::Ready(source)) = previous {
+            source.start_close();
+            true
+        } else {
+            false
         }
     }
 
     pub fn is_unavailable(&self, id: &str) -> bool {
         self.sources
             .get(id)
-            .is_some_and(|r| matches!(r.value(), SourceState::Unavailable(_)))
+            .is_some_and(|r| matches!(r.value(), SourceState::Unavailable { .. }))
     }
 
-    /// Foreground recovery shares a short failure backoff; authoritative events
-    /// and explicit fresh registration do not use this throttle.
+    /// Advisory eligibility after a one-second backoff, false during recovery.
+    /// Only [`Self::recover_unavailable`] reserves a factory invocation.
+    /// Authoritative discovery and registration do not use this throttle.
     pub fn unavailable_retry_due(&self, id: &str) -> bool {
         self.sources.get(id).is_some_and(|r| match r.value() {
-            SourceState::Unavailable(failed) => {
-                failed.elapsed() >= std::time::Duration::from_secs(1)
-            }
+            SourceState::Unavailable {
+                failed_at,
+                recovery,
+            } => recovery.is_none() && failed_at.elapsed() >= std::time::Duration::from_secs(1),
             SourceState::Ready(_) => false,
         })
+    }
+
+    /// Recover an eligible unavailable id with one lazily invoked factory.
+    /// Ready ids return their current source; absent ids return `SourceNotFound`.
+    /// Backoff and active recovery return `SourceUnavailable` without invoking
+    /// or waiting for the factory. Failure, cancellation and unwinding start a
+    /// fresh one-second backoff. The returned source must retain the requested id.
+    ///
+    /// Registration, removal and discovery supersede this attempt. An obsolete
+    /// result is discarded and the current [`Self::require`] result is returned.
+    /// Unpublished outputs start closing unless the same Arc remains registered.
+    /// The returned Arc is a snapshot; subsequent registration may replace it.
+    pub async fn recover_unavailable<F, Fut>(
+        &self,
+        id: &str,
+        factory: F,
+    ) -> MaptileResult<Arc<dyn TileSource>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = MaptileResult<Arc<dyn TileSource>>>,
+    {
+        let token = {
+            let mut entry = self
+                .sources
+                .get_mut(id)
+                .ok_or_else(|| MaptileError::SourceNotFound(id.into()))?;
+            match entry.value_mut() {
+                SourceState::Ready(source) => return Ok(source.clone()),
+                SourceState::Unavailable {
+                    failed_at,
+                    recovery,
+                } => {
+                    if recovery.is_some() || failed_at.elapsed() < std::time::Duration::from_secs(1)
+                    {
+                        return Err(MaptileError::SourceUnavailable(id.into()));
+                    }
+                    let token = Arc::new(());
+                    *recovery = Some(token.clone());
+                    token
+                }
+            }
+        };
+        let mut guard = RecoveryGuard {
+            manager: self,
+            id,
+            token,
+            pending: PendingSources {
+                sources: Vec::new(),
+                manager: self,
+            },
+        };
+        let result = match factory().await {
+            Ok(source) => {
+                guard.pending.sources.push(source.clone());
+                if source.id() == id {
+                    Ok(source)
+                } else {
+                    Err(MaptileError::Config(format!(
+                        "source factory returned a different id for {id}"
+                    )))
+                }
+            }
+            Err(error) => Err(error),
+        };
+        let owned = if let Some(mut entry) = self.sources.get_mut(id)
+            && matches!(entry.value(), SourceState::Unavailable { recovery: Some(token), .. }
+                if Arc::ptr_eq(token, &guard.token))
+        {
+            *entry = match &result {
+                Ok(source) => SourceState::Ready(source.clone()),
+                Err(_) => SourceState::Unavailable {
+                    failed_at: tokio::time::Instant::now(),
+                    recovery: None,
+                },
+            };
+            true
+        } else {
+            false
+        };
+        if owned && result.is_ok() {
+            guard.pending.sources.clear();
+        }
+        drop(guard);
+        if owned { result } else { self.require(id) }
     }
 
     /// Resolve the current source, preserving a retryable loading failure.
     pub fn require(&self, id: &str) -> MaptileResult<Arc<dyn TileSource>> {
         match self.sources.get(id).as_deref() {
             Some(SourceState::Ready(source)) => Ok(source.clone()),
-            Some(SourceState::Unavailable(_)) => Err(MaptileError::SourceUnavailable(id.into())),
+            Some(SourceState::Unavailable { .. }) => {
+                Err(MaptileError::SourceUnavailable(id.into()))
+            }
             None => Err(MaptileError::SourceNotFound(id.into())),
         }
     }
@@ -127,7 +293,7 @@ impl SourceManager {
                 source.start_close();
                 Some(source)
             }
-            SourceState::Unavailable(_) => None,
+            SourceState::Unavailable { .. } => None,
         })
     }
 
@@ -186,15 +352,18 @@ impl SourceManager {
         }
         let target: BTreeSet<String> = report.sources.iter().map(|s| s.id.clone()).collect();
 
-        let mut pending = PendingSources::default();
+        let mut pending = PendingSources {
+            sources: Vec::new(),
+            manager: self,
+        };
         for src in &report.sources {
             if !ready.contains(&src.id) {
                 let built = factory(src).await?;
-                pending.0.push(built);
+                pending.sources.push(built);
             }
         }
         let mut delta = crate::watch::ReloadDelta::default();
-        for source in pending.0.drain(..) {
+        for source in pending.sources.drain(..) {
             delta.added.push(source.id().to_string());
             self.register(source);
         }
@@ -377,7 +546,7 @@ impl SourceManager {
             .iter()
             .filter_map(|r| match r.value() {
                 SourceState::Ready(source) => Some(source.tilejson().clone()),
-                SourceState::Unavailable(_) => None,
+                SourceState::Unavailable { .. } => None,
             })
             .collect()
     }
@@ -402,7 +571,7 @@ impl SourceManager {
                     info: src.tile_info(),
                     tilejson: src.tilejson().clone(),
                 }),
-                SourceState::Unavailable(_) => None,
+                SourceState::Unavailable { .. } => None,
             })
             .collect();
         sources.sort_by(|a, b| a.id.cmp(&b.id));
@@ -620,6 +789,196 @@ mod tests {
         ));
         assert!(manager.is_unavailable("same"));
         assert!(manager.list_ids().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn repeated_failure_marks_preserve_backoff_and_close_the_source_once() {
+        let manager = SourceManager::new();
+        let (source, closed) = closing_source("retry");
+        let source: Arc<dyn TileSource> = source;
+        manager.register(source.clone());
+        assert!(manager.mark_unavailable_if_current(&source));
+        tokio::time::advance(Duration::from_millis(750)).await;
+
+        manager.mark_unavailable("retry");
+        assert!(!manager.mark_unavailable_if_current(&source));
+        assert!(!manager.unavailable_retry_due("retry"));
+        assert_eq!(closed.load(Ordering::SeqCst), 1);
+        tokio::time::advance(Duration::from_millis(250)).await;
+        assert!(manager.unavailable_retry_due("retry"));
+    }
+
+    #[test]
+    fn conditional_retirement_runs_reentrant_close_after_unlocking() {
+        let manager = Arc::new(SourceManager::new());
+        let replacement: Arc<dyn TileSource> = counting_source("same").0;
+        let (mut source, _) = counting_source("same");
+        let weak_manager = Arc::downgrade(&manager);
+        let on_close_replacement = replacement.clone();
+        Arc::get_mut(&mut source).unwrap().on_close = Some(Arc::new(move || {
+            let manager = weak_manager.upgrade().unwrap();
+            assert!(manager.is_unavailable("same"));
+            manager.register(on_close_replacement.clone());
+        }));
+        let source: Arc<dyn TileSource> = source;
+        manager.register(source.clone());
+
+        assert!(manager.mark_unavailable_if_current(&source));
+        assert!(Arc::ptr_eq(&manager.require("same").unwrap(), &replacement));
+        assert!(!manager.mark_unavailable_if_current(&source));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_recovery_admits_one_factory_and_allows_other_ids_to_progress() {
+        use tokio::sync::{Barrier, Notify, mpsc};
+
+        let manager = Arc::new(SourceManager::new());
+        for id in ["busy", "other"] {
+            manager.mark_unavailable(id);
+            if let SourceState::Unavailable { failed_at, .. } =
+                manager.sources.get_mut(id).unwrap().value_mut()
+            {
+                *failed_at -= Duration::from_secs(1);
+            }
+        }
+        let start = Arc::new(Barrier::new(17));
+        let release = Arc::new(Notify::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+        let (finished_tx, mut finished_rx) = mpsc::unbounded_channel();
+        let mut tasks = Vec::new();
+        for _ in 0..16 {
+            let manager = manager.clone();
+            let start = start.clone();
+            let release = release.clone();
+            let calls = calls.clone();
+            let entered_tx = entered_tx.clone();
+            let finished_tx = finished_tx.clone();
+            tasks.push(tokio::spawn(async move {
+                start.wait().await;
+                let result = manager
+                    .recover_unavailable("busy", || {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        assert!(manager.is_unavailable("busy"));
+                        entered_tx.send(()).unwrap();
+                        async move {
+                            release.notified().await;
+                            Ok(counting_source("busy").0 as Arc<dyn TileSource>)
+                        }
+                    })
+                    .await;
+                assert!(finished_tx.send(result).is_ok());
+            }));
+        }
+        start.wait().await;
+        entered_rx.recv().await.unwrap();
+        for _ in 0..15 {
+            let result = tokio::time::timeout(Duration::from_secs(1), finished_rx.recv())
+                .await
+                .expect("non-owner requests must return before the factory finishes")
+                .unwrap();
+            assert!(matches!(result, Err(MaptileError::SourceUnavailable(_))));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        manager.mark_unavailable("busy");
+        assert!(!manager.unavailable_retry_due("busy"));
+        assert!(matches!(
+            manager
+                .recover_unavailable("busy", || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    std::future::ready(Ok(counting_source("busy").0 as Arc<dyn TileSource>))
+                })
+                .await,
+            Err(MaptileError::SourceUnavailable(_))
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let other = manager
+            .recover_unavailable("other", || async {
+                Ok(counting_source("other").0 as Arc<dyn TileSource>)
+            })
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&manager.require("other").unwrap(), &other));
+        manager.register(counting_source("third").0);
+        assert!(manager.remove("third").is_some());
+
+        release.notify_one();
+        let recovered = finished_rx.recv().await.unwrap().unwrap();
+        assert!(Arc::ptr_eq(&manager.require("busy").unwrap(), &recovered));
+        for task in tasks {
+            task.await.unwrap();
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_cancelled_and_panicking_recoveries_release_ownership_with_fresh_backoff() {
+        for failure in ["error", "cancel", "factory_panic", "future_panic"] {
+            let manager = Arc::new(SourceManager::new());
+            manager.mark_unavailable("retry");
+            tokio::time::advance(Duration::from_secs(1)).await;
+            match failure {
+                "error" => {
+                    assert!(matches!(
+                        manager
+                            .recover_unavailable("retry", || async {
+                                Err(MaptileError::InvalidMetadata("broken archive".into()))
+                            })
+                            .await,
+                        Err(MaptileError::InvalidMetadata(_))
+                    ));
+                }
+                "cancel" => {
+                    let mut recovery = Box::pin(manager.recover_unavailable("retry", || {
+                        std::future::pending::<MaptileResult<Arc<dyn TileSource>>>()
+                    }));
+                    assert!(futures_util::poll!(&mut recovery).is_pending());
+                    tokio::time::advance(Duration::from_secs(3)).await;
+                    drop(recovery);
+                }
+                _ => {
+                    let task_manager = manager.clone();
+                    let task = tokio::spawn(async move {
+                        if failure == "factory_panic" {
+                            task_manager
+                                .recover_unavailable(
+                                    "retry",
+                                    || -> std::future::Ready<MaptileResult<Arc<dyn TileSource>>> {
+                                        panic!("synchronous factory panic");
+                                    },
+                                )
+                                .await
+                        } else {
+                            task_manager
+                                .recover_unavailable("retry", || async {
+                                    panic!("factory future panic");
+                                })
+                                .await
+                        }
+                    });
+                    assert!(task.await.is_err_and(|error| error.is_panic()));
+                }
+            }
+            assert!(manager.is_unavailable("retry"), "{failure}");
+            assert!(!manager.unavailable_retry_due("retry"), "{failure}");
+            tokio::time::advance(Duration::from_millis(999)).await;
+            assert!(matches!(
+                manager
+                    .recover_unavailable("retry", || async {
+                        Ok(counting_source("retry").0 as Arc<dyn TileSource>)
+                    })
+                    .await,
+                Err(MaptileError::SourceUnavailable(_))
+            ));
+            tokio::time::advance(Duration::from_millis(1)).await;
+            assert!(manager.unavailable_retry_due("retry"), "{failure}");
+            let recovered = manager
+                .recover_unavailable("retry", || async {
+                    Ok(counting_source("retry").0 as Arc<dyn TileSource>)
+                })
+                .await
+                .unwrap();
+            assert!(Arc::ptr_eq(&manager.require("retry").unwrap(), &recovered));
+        }
     }
 
     #[derive(Clone)]
@@ -1133,6 +1492,217 @@ mod tests {
                 .collect(),
             ..Default::default()
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wrong_recovery_id_closes_only_unregistered_outputs_without_holding_locks() {
+        for registered_alias in [false, true] {
+            let manager = Arc::new(SourceManager::new());
+            manager.mark_unavailable("retry");
+            tokio::time::advance(Duration::from_secs(1)).await;
+            let (mut output, closed) = closing_source("other");
+            let source = Arc::get_mut(&mut output).unwrap();
+            let close = source.on_close.take().unwrap();
+            let weak_manager = Arc::downgrade(&manager);
+            source.on_close = Some(Arc::new(move || {
+                close();
+                let manager = weak_manager.upgrade().unwrap();
+                assert!(manager.is_unavailable("retry"));
+                manager.mark_unavailable("retry");
+            }));
+            let output: Arc<dyn TileSource> = output;
+            if registered_alias {
+                manager.register(output.clone());
+            }
+
+            assert!(matches!(
+                manager
+                    .recover_unavailable("retry", || async { Ok(output.clone()) })
+                    .await,
+                Err(MaptileError::Config(_))
+            ));
+            assert_eq!(
+                closed.load(Ordering::SeqCst),
+                usize::from(!registered_alias)
+            );
+            if registered_alias {
+                assert!(Arc::ptr_eq(&manager.require("other").unwrap(), &output));
+            }
+            assert!(!manager.unavailable_retry_due("retry"));
+            tokio::time::advance(Duration::from_secs(1)).await;
+            assert!(manager.unavailable_retry_due("retry"));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn obsolete_recovery_results_resolve_authoritative_registration_removal_and_reload() {
+        use tokio::sync::oneshot;
+
+        for change in ["register", "remove", "reload", "reload_remove"] {
+            for completion in ["success", "error", "wrong_id"] {
+                let manager = SourceManager::new();
+                manager.mark_unavailable("retry");
+                tokio::time::advance(Duration::from_secs(1)).await;
+                let (finish_tx, finish_rx) = oneshot::channel();
+                let mut recovery = Box::pin(
+                    manager.recover_unavailable("retry", || async { finish_rx.await.unwrap() }),
+                );
+                assert!(futures_util::poll!(&mut recovery).is_pending());
+                let (current, current_closed) = closing_source("retry");
+                let current: Arc<dyn TileSource> = current;
+                match change {
+                    "register" => manager.register(current.clone()),
+                    "remove" => {
+                        manager.remove("retry");
+                    }
+                    _ => {
+                        let ids = if change == "reload" {
+                            vec!["retry"]
+                        } else {
+                            vec![]
+                        };
+                        manager
+                            .reload_from_discovery(&discovery_report(&ids), |_| {
+                                std::future::ready(Ok(current.clone()))
+                            })
+                            .await
+                            .unwrap();
+                    }
+                }
+                let id = if completion == "wrong_id" {
+                    "other"
+                } else {
+                    "retry"
+                };
+                let (output, output_closed) = closing_source(id);
+                let result = if completion == "error" {
+                    Err(MaptileError::InvalidMetadata("obsolete failure".into()))
+                } else {
+                    Ok(output as Arc<dyn TileSource>)
+                };
+                assert!(finish_tx.send(result).is_ok());
+                let result = recovery.await;
+                if matches!(change, "register" | "reload") {
+                    assert!(Arc::ptr_eq(&result.unwrap(), &current));
+                    assert!(Arc::ptr_eq(&manager.require("retry").unwrap(), &current));
+                } else {
+                    assert!(matches!(result, Err(MaptileError::SourceNotFound(_))));
+                    assert!(manager.get("retry").is_none());
+                    assert!(!manager.is_unavailable("retry"));
+                }
+                assert_eq!(
+                    output_closed.load(Ordering::SeqCst),
+                    usize::from(completion != "error")
+                );
+                assert_eq!(current_closed.load(Ordering::SeqCst), 0);
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn obsolete_success_keeps_the_same_arc_registered_by_another_writer_open() {
+        use tokio::sync::oneshot;
+
+        let manager = SourceManager::new();
+        manager.mark_unavailable("retry");
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let (finish_tx, finish_rx) = oneshot::channel();
+        let mut recovery =
+            Box::pin(manager.recover_unavailable("retry", || async { finish_rx.await.unwrap() }));
+        assert!(futures_util::poll!(&mut recovery).is_pending());
+        let (output, closed) = closing_source("retry");
+        let output: Arc<dyn TileSource> = output;
+        manager.register(output.clone());
+        assert!(finish_tx.send(Ok(output.clone())).is_ok());
+
+        assert!(Arc::ptr_eq(&recovery.await.unwrap(), &output));
+        assert!(Arc::ptr_eq(&manager.require("retry").unwrap(), &output));
+        assert_eq!(closed.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn obsolete_completion_or_cancellation_cannot_release_a_new_recovery() {
+        use tokio::sync::oneshot;
+
+        for replace in [false, true] {
+            for completion in ["success", "error", "cancel"] {
+                let manager = SourceManager::new();
+                manager.mark_unavailable("retry");
+                tokio::time::advance(Duration::from_secs(1)).await;
+                let (old_tx, old_rx) = oneshot::channel();
+                let mut old = Box::pin(
+                    manager.recover_unavailable("retry", || async { old_rx.await.unwrap() }),
+                );
+                assert!(futures_util::poll!(&mut old).is_pending());
+                if replace {
+                    manager.register(counting_source("retry").0);
+                } else {
+                    manager.remove("retry");
+                }
+                manager.mark_unavailable("retry");
+                tokio::time::advance(Duration::from_secs(1)).await;
+                let (new_tx, new_rx) = oneshot::channel();
+                let mut new = Box::pin(
+                    manager.recover_unavailable("retry", || async { new_rx.await.unwrap() }),
+                );
+                assert!(futures_util::poll!(&mut new).is_pending());
+                let (output, closed) = closing_source("retry");
+                if completion == "cancel" {
+                    drop(old);
+                } else {
+                    let result = if completion == "error" {
+                        Err(MaptileError::InvalidMetadata("old failure".into()))
+                    } else {
+                        Ok(output as Arc<dyn TileSource>)
+                    };
+                    assert!(old_tx.send(result).is_ok());
+                    assert!(matches!(old.await, Err(MaptileError::SourceUnavailable(_))));
+                }
+                assert_eq!(
+                    closed.load(Ordering::SeqCst),
+                    usize::from(completion == "success")
+                );
+                assert!(!manager.unavailable_retry_due("retry"));
+                tokio::time::advance(Duration::from_secs(2)).await;
+                assert!(matches!(
+                    manager
+                        .recover_unavailable("retry", || async {
+                            Ok(counting_source("retry").0 as Arc<dyn TileSource>)
+                        })
+                        .await,
+                    Err(MaptileError::SourceUnavailable(_))
+                ));
+                let recovered: Arc<dyn TileSource> = counting_source("retry").0;
+                assert!(new_tx.send(Ok(recovered.clone())).is_ok());
+                assert!(Arc::ptr_eq(&new.await.unwrap(), &recovered));
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn obsolete_guard_drop_does_not_reset_a_new_failure_deadline() {
+        let manager = SourceManager::new();
+        manager.mark_unavailable("retry");
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let mut old = Box::pin(manager.recover_unavailable("retry", || {
+            std::future::pending::<MaptileResult<Arc<dyn TileSource>>>()
+        }));
+        assert!(futures_util::poll!(&mut old).is_pending());
+        manager.remove("retry");
+        manager.mark_unavailable("retry");
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(matches!(
+            manager
+                .recover_unavailable("retry", || async {
+                    Err(MaptileError::InvalidMetadata("new failure".into()))
+                })
+                .await,
+            Err(MaptileError::InvalidMetadata(_))
+        ));
+        tokio::time::advance(Duration::from_millis(500)).await;
+        drop(old);
+        tokio::time::advance(Duration::from_millis(500)).await;
+        assert!(manager.unavailable_retry_due("retry"));
     }
 
     #[tokio::test]
