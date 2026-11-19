@@ -1,0 +1,446 @@
+#pragma once
+
+#include <mln/actor/scheduler.hpp>
+#include <mln/gfx/backend_scope.hpp>
+#include <mln/gfx/headless_frontend.hpp>
+#include <mln/gfx/renderer_backend.hpp>
+#include <mln/style/image.hpp>
+#include <mln/style/layer.hpp>
+#include <mln/map/map.hpp>
+#include <mln/map/map_observer.hpp>
+#include <mln/map/map_options.hpp>
+#include <mln/style/style.hpp>
+#include <mln/style/source.hpp>
+#include <mln/util/image.hpp>
+#include <mln/util/run_loop.hpp>
+#include <mln/util/premultiply.hpp>
+#include <mln/util/tile_server_options.hpp>
+#include <mln/util/size.hpp>
+#include <mln/storage/file_source.hpp>
+#include <mln/storage/resource_options.hpp>
+
+#if defined(MLN_WEBGPU_IMPL_FFI)
+#include <mln/webgpu/texture2d.hpp>
+#include <mln/webgpu/renderer_backend.hpp>
+#include <mln/webgpu/headless_backend.hpp>
+#endif
+
+
+#include <cstdint>
+#include <cassert>
+#include <memory>
+#include <optional>
+#include <vector>
+#include <stdexcept>
+#include "rust/cxx.h"
+#include "rust_log_observer.h"
+#include "map_observer.h"
+#include "resource_options.h"
+#include "sources/sources.h"
+
+#if (!defined(__APPLE__) || defined(MLN_DARWIN_USE_LIBUV)) && __has_include(<uv.h>)
+#include <uv.h>
+#elif !defined(__APPLE__) || defined(MLN_DARWIN_USE_LIBUV)
+struct uv_loop_s;
+using uv_loop_t = uv_loop_s;
+enum uv_run_mode { UV_RUN_DEFAULT = 0, UV_RUN_ONCE, UV_RUN_NOWAIT };
+extern "C" int uv_run(uv_loop_t*, uv_run_mode);
+#endif
+
+namespace mln {
+namespace bridge {
+
+struct Texture;
+struct TextureView;
+struct RenderRequestedCallback;
+void render_requested_callback(const RenderRequestedCallback& callback) noexcept;
+
+constexpr size_t BYTES_PER_PIXEL = 4; // rgba
+
+struct BridgeImage;
+class RenderRequest;
+struct FfiCameraOptions;
+struct LatLng;
+struct LatLngBounds;
+struct EdgeInsets;
+namespace geojson {
+class GeoJson;
+}
+
+inline mln::util::RunLoop& threadRunLoop() {
+    // MapLibre Native's RunLoop is thread-affine. Keep one private loop per
+    // renderer-owning thread and share it between renderers on that thread.
+    thread_local mln::util::RunLoop loop(mln::util::RunLoop::Type::New);
+    return loop;
+}
+
+inline void bindThreadRunLoop() {
+    mln::Scheduler::SetCurrent(&threadRunLoop());
+}
+
+inline void currentThreadRunLoopTick() {
+    // Tick can be driven through a Rust handle without constructing a renderer first.
+    bindThreadRunLoop();
+    threadRunLoop().runOnce();
+}
+
+// Blocks the calling thread, advancing the run loop until it is woken by pending
+// work (e.g. a render or style-load completion), without busy-polling. The exact
+// primitive differs by run-loop backend (see below).
+inline void currentThreadRunLoopWait() {
+#if defined(__APPLE__) && !defined(MLN_DARWIN_USE_LIBUV)
+    // Darwin's RunLoop is CoreFoundation-based, not libuv-based: run until a
+    // completion callback calls currentThreadRunLoopStop(). (May process more
+    // than one event before stopping.)
+    bindThreadRunLoop();
+    threadRunLoop().run();
+#else
+    // libuv backend: UV_RUN_ONCE blocks until at least one event is processed,
+    // then returns. (mbgl's RunLoop::runOnce() is UV_RUN_NOWAIT, which would
+    // busy-spin in a wait loop; UV_RUN_DEFAULT would instead wait for *all*
+    // handles to drain, which hangs while network handles stay active.)
+    bindThreadRunLoop();
+    uv_run(static_cast<uv_loop_t*>(mln::util::RunLoop::getLoopHandle()), UV_RUN_ONCE);
+#endif
+}
+
+inline void currentThreadRunLoopStop() {
+#if defined(__APPLE__) && !defined(MLN_DARWIN_USE_LIBUV)
+    threadRunLoop().stop();
+#endif
+}
+
+inline bool run_loop_uses_libuv() noexcept {
+#if defined(__APPLE__) && !defined(MLN_DARWIN_USE_LIBUV)
+    return false;
+#else
+    return true;
+#endif
+}
+
+inline std::unique_ptr<std::string> encodeImage(mln::PremultipliedImage image) {
+    auto unpremultipliedImage = mln::util::unpremultiply(std::move(image));
+
+    const size_t pixelCount = unpremultipliedImage.size.width * unpremultipliedImage.size.height;
+    std::string data;
+    data.reserve(2 * sizeof(uint32_t) + pixelCount * BYTES_PER_PIXEL);
+
+    uint32_t width = unpremultipliedImage.size.width;
+    uint32_t height = unpremultipliedImage.size.height;
+    data.append(reinterpret_cast<const char*>(&width), sizeof(uint32_t));
+    data.append(reinterpret_cast<const char*>(&height), sizeof(uint32_t));
+
+    const char* pixelData = reinterpret_cast<const char*>(unpremultipliedImage.data.get());
+    data.append(pixelData, pixelCount * BYTES_PER_PIXEL);
+
+    return std::make_unique<std::string>(std::move(data));
+}
+
+class HostFrontend final : public mln::HeadlessFrontend {
+public:
+    HostFrontend(mln::Size size, float pixelRatio, bool invalidateOnUpdate)
+        : mln::HeadlessFrontend(size,
+                                 pixelRatio,
+                                 mln::gfx::HeadlessBackend::SwapBehaviour::NoFlush,
+                                 mln::gfx::ContextMode::Unique,
+                                 std::nullopt,
+                                 invalidateOnUpdate) {}
+
+    void setRenderRequestedCallback(rust::Box<RenderRequestedCallback> callback) {
+        renderRequestedCallback = std::move(callback);
+    }
+
+    void update(std::shared_ptr<mln::UpdateParameters> updateParameters) override {
+        mln::HeadlessFrontend::update(std::move(updateParameters));
+        if (renderRequestedCallback) {
+            render_requested_callback(*(*renderRequestedCallback));
+        }
+    }
+
+private:
+    std::optional<rust::Box<RenderRequestedCallback>> renderRequestedCallback;
+};
+
+class MapRenderer {
+public:
+    explicit MapRenderer(mln::MapMode mapMode,
+                         mln::Size size,
+                         float pixelRatio,
+                         const mln::ResourceOptions& resourceOptions)
+        : mapObserverInstance(std::make_shared<MapObserver>()) {
+        bindThreadRunLoop();
+        // Continuous renderers are host-driven.
+        bool invalidateOnUpdate = mapMode != mln::MapMode::Continuous;
+        frontend = std::make_unique<HostFrontend>(size, pixelRatio, invalidateOnUpdate);
+
+        mln::MapOptions mapOptions;
+        mapOptions.withMapMode(mapMode).withSize(size).withPixelRatio(pixelRatio);
+
+        // Set up logging observer for Rust bridge
+        auto logObserver = std::make_unique<mln::bridge::RustLogObserver>();
+        mln::Log::setObserver(std::move(logObserver));
+        databaseFileSource = resource_options::applyMaximumAmbientCacheSize(resourceOptions);
+        map = std::make_unique<mln::Map>(*frontend, *mapObserverInstance, mapOptions, resourceOptions);
+    }
+
+    std::shared_ptr<MapObserver> observer() {
+        return mapObserverInstance;
+    }
+
+    #if defined(MLN_WEBGPU_IMPL_FFI)
+    std::shared_ptr<mln::webgpu::Texture2D> takeTexture() {
+        auto backend = static_cast<mln::webgpu::HeadlessBackend*>(this->frontend->getBackend());
+        auto ptr = std::static_pointer_cast<mln::webgpu::Texture2D>(backend->takeTexture());
+        assert(ptr);
+        return ptr;
+    }
+    #endif
+
+    void style_add_image(rust::Str id,
+                         rust::Slice<const unsigned char> data,
+                         mln::Size size,
+                         float pixel_ratio,
+                         bool signed_distance_field) {
+        mln::PremultipliedImage image(size, data.data(), data.size());
+
+        map->getStyle().addImage(std::make_unique<mln::style::Image>(
+            std::string(id), std::move(image), pixel_ratio, signed_distance_field));
+    }
+
+    void style_remove_image(rust::Str id) {
+        map->getStyle().removeImage(std::string(id));
+    }
+
+    void style_add_source(std::unique_ptr<mln::style::Source> source) {
+        map->getStyle().addSource(std::move(source));
+    }
+
+    std::unique_ptr<mln::bridge::style::sources::SourceHandle> style_get_source_mut(rust::Str id) {
+        auto* source = map->getStyle().getSource(std::string(id));
+        if (!source) {
+            return nullptr;
+        }
+        return std::make_unique<mln::bridge::style::sources::SourceHandle>(source);
+    }
+
+    void style_remove_source(rust::Str id) {
+        map->getStyle().removeSource(std::string(id));
+    }
+
+    void style_add_layer(std::unique_ptr<mln::style::Layer> layer, rust::Str before_id) {
+        // An empty before_id string means no before layer was specified.
+        map->getStyle().addLayer(
+            std::move(layer),
+            before_id.empty() ? std::nullopt : std::optional<std::string>{std::string(before_id)});
+    }
+
+    std::unique_ptr<mln::style::Layer> style_remove_layer(rust::Str id) {
+        return map->getStyle().removeLayer(std::string(id));
+    }
+
+    void style_load_from_url(const rust::Str styleUrl) {
+        map->getStyle().loadURL((std::string)styleUrl);
+    }
+
+    void style_load_from_json(const rust::Str styleJson) {
+        map->getStyle().loadJSON((std::string)styleJson);
+    }
+
+    std::unique_ptr<BridgeImage> readStillImage() {
+        auto image = frontend->readStillImage();
+        auto unpremultipliedImage = mln::util::unpremultiply(std::move(image));
+        return std::make_unique<BridgeImage>(std::move(unpremultipliedImage.data), unpremultipliedImage.size);
+    }
+
+    void render_once() {
+#if !defined(__APPLE__) || defined(MLN_DARWIN_USE_LIBUV)
+        currentThreadRunLoopTick();
+#endif
+        frontend->renderFrame();
+    }
+
+    void setRenderRequestedCallback(rust::Box<RenderRequestedCallback> callback) {
+        frontend->setRenderRequestedCallback(std::move(callback));
+    }
+
+    std::unique_ptr<RenderRequest> submitRender();
+
+    FfiCameraOptions cameraForLatLngBounds(const LatLngBounds& bounds,
+                                           const EdgeInsets& padding,
+                                           double bearing,
+                                           double pitch);
+
+    FfiCameraOptions cameraForLatLngs(rust::Slice<const LatLng> latLngs,
+                                      const EdgeInsets& padding,
+                                      double bearing,
+                                      double pitch);
+
+    FfiCameraOptions cameraForGeoJson(const mln::bridge::geojson::GeoJson& geojson,
+                                      const EdgeInsets& padding,
+                                      double bearing,
+                                      double pitch);
+
+    std::unique_ptr<std::string> readStillImageBytes() {
+        return encodeImage(frontend->readStillImage());
+    }
+
+    void setSize(const mln::Size& size) {
+        if (size.width == 0 || size.height == 0)
+            return;
+        frontend->setSize(size);
+        map->setSize(size);
+    }
+
+    void setDebugFlags(mln::MapDebugOptions debugFlags) {
+        map->setDebug(debugFlags);
+    }
+
+    void jumpTo(const FfiCameraOptions& cameraOptions);
+
+    void moveBy(const mln::ScreenCoordinate& delta) {
+        map->moveBy(delta);
+    }
+
+    void scaleBy(double scale, const mln::ScreenCoordinate& pos) {
+        map->scaleBy(scale, pos);
+    }
+
+    void pitchBy(double pitch) {
+        map->pitchBy(pitch);
+    }
+
+    void rotateBy(const mln::ScreenCoordinate& first, const mln::ScreenCoordinate& second) {
+        map->rotateBy(first, second);
+    }
+
+    // Set the wgpu device and queue required for rendering when using the wgpu ffi backend
+    #if defined(MLN_WEBGPU_IMPL_FFI)
+    void setDeviceAndQueue(WGPUDevice device, WGPUQueue queue) {
+        static_cast<mln::webgpu::RendererBackend*>(frontend->getBackend())->setDevice(device);
+        static_cast<mln::webgpu::RendererBackend*>(frontend->getBackend())->setQueue(queue);
+    }
+    #endif
+public:
+    // CXX bridge helpers below access these directly. Keep them alive here
+    // because the frontend and observer are passed by reference to the map.
+    std::unique_ptr<HostFrontend> frontend;
+    std::shared_ptr<MapObserver> mapObserverInstance;
+    // Declared before `map` so the map never outlives it.
+    std::shared_ptr<mln::FileSource> databaseFileSource;
+    std::unique_ptr<mln::Map> map;
+};
+
+class RenderRequest {
+public:
+    struct State {
+        bool ready = false;
+        std::exception_ptr error;
+        std::unique_ptr<std::string> image;
+    };
+
+    RenderRequest()
+        : state(std::make_shared<State>()) {}
+
+    ~RenderRequest() {
+        // If the request is dropped before completion, drive the run loop here
+        // while the borrowed renderer is still alive, so MapLibre Native returns to
+        // an idle state before the next submitRender.
+        while (!state->ready) {
+            currentThreadRunLoopWait();
+        }
+    }
+
+    std::shared_ptr<State> getState() const {
+        return state;
+    }
+
+    bool isReady() const {
+        return state->ready;
+    }
+
+    bool hasError() const {
+        return static_cast<bool>(state->error);
+    }
+
+    rust::String errorMessage() const {
+        if (!state->error) {
+            return rust::String();
+        }
+
+        try {
+            std::rethrow_exception(state->error);
+        } catch (const std::exception& error) {
+            return rust::String(error.what());
+        } catch (...) {
+            return rust::String("Unknown render error");
+        }
+    }
+
+    std::unique_ptr<std::string> takeImage() {
+        assert(state->ready);
+        assert(!state->error);
+        assert(state->image);
+        assert(!taken);
+        taken = true;
+        return std::move(state->image);
+    }
+
+private:
+    std::shared_ptr<State> state;
+    bool taken = false;
+};
+
+inline std::unique_ptr<RenderRequest> MapRenderer::submitRender() {
+    auto request = std::make_unique<RenderRequest>();
+    auto state = request->getState();
+
+    map->renderStill([this, state](const std::exception_ptr& error) {
+        state->error = error;
+        if (!error) {
+            state->image = readStillImageBytes();
+        }
+        state->ready = true;
+#if defined(__APPLE__) && !defined(MLN_DARWIN_USE_LIBUV)
+        // Wake a thread blocked in currentThreadRunLoopWait() (Darwin non-libuv).
+        currentThreadRunLoopStop();
+#endif
+    });
+
+    return request;
+}
+
+inline std::unique_ptr<MapRenderer> MapRenderer_new(
+            mln::MapMode mapMode,
+            uint32_t width,
+            uint32_t height,
+            float pixelRatio,
+            const mln::ResourceOptions& resourceOptions
+) {
+    mln::Size size = {width, height};
+    return std::make_unique<MapRenderer>(mapMode, size, pixelRatio, resourceOptions);
+}
+
+struct BridgeImage {
+    public:
+        BridgeImage(std::unique_ptr<uint8_t[]> data, mln::Size size): mSize(size), mData(std::move(data)) {}
+
+        const uint8_t* get() const {
+            return mData.get();
+        }
+
+        size_t bufferLength() const {
+            const size_t pixelCount = mSize.width * mSize.height;
+            return pixelCount * BYTES_PER_PIXEL;
+        }
+
+        mln::Size size() const {
+            return mSize;
+        }
+
+    private:
+        mln::Size mSize;
+        std::unique_ptr<uint8_t[]> mData;
+};
+
+} // namespace bridge
+} // namespace mln

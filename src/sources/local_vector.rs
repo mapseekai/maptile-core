@@ -108,14 +108,20 @@ impl FlatGeobufSource {
             cache_zoom: cfg.cache_zoom,
             ..Default::default()
         };
+        let stamp = FileStamp::read(&cfg.path)?;
         let geometry = GeometrySource::open_flatgeobuf(&cfg)?;
-        let meta = std::fs::metadata(&cfg.path).map_err(MaptileError::backend)?;
-        let identity = format!(
-            "flatgeobuf:{cfg:?}:{}:{:?}",
-            meta.len(),
-            meta.modified().map_err(MaptileError::backend)?
+        if FileStamp::read(&cfg.path)? != stamp {
+            return Err(MaptileError::SourceUnavailable(
+                "FlatGeobuf file changed while opening".into(),
+            ));
+        }
+        #[cfg(unix)]
+        let version = crate::cache::ContentVersion::from_input(
+            format!("flatgeobuf:{cfg:?}:{stamp:?}").as_bytes(),
         );
-        let version = crate::cache::ContentVersion::from_input(identity.as_bytes());
+        // Platforms without FileStamp's inode identity must not reuse a reopened generation.
+        #[cfg(not(unix))]
+        let version = crate::cache::ContentVersion::new_generation();
         GeoParquetSource::from_opened(cfg, HashMap::new(), Some(Arc::new(geometry)), version)
             .map(Self)
     }
@@ -919,6 +925,65 @@ mod tests {
         parquet.close().await.unwrap();
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn flatgeobuf_atomic_replacement_changes_manager_cache_generation() {
+        use crate::cache::TileCache;
+        use crate::sources::manager::SourceManager;
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let replacement_dir = tempfile::tempdir().unwrap();
+        let path = write_vector(
+            dir.path(),
+            "places.fgb",
+            "FlatGeobuf",
+            Some(4326),
+            true,
+            POINTS,
+        );
+        let replacement = write_vector(
+            replacement_dir.path(),
+            "places.fgb",
+            "FlatGeobuf",
+            Some(4326),
+            true,
+            &POINTS.replace("ST_Point(10, 60)", "ST_Point(11, 60)"),
+        );
+        let before = std::fs::metadata(&path).unwrap();
+        File::options()
+            .write(true)
+            .open(&replacement)
+            .unwrap()
+            .set_modified(before.modified().unwrap())
+            .unwrap();
+        let after = std::fs::metadata(&replacement).unwrap();
+        assert_eq!(before.len(), after.len());
+        assert_eq!(before.modified().unwrap(), after.modified().unwrap());
+        assert_ne!(before.ino(), after.ino());
+
+        let cfg = fgb_config(path.clone());
+        let old = Arc::new(FlatGeobufSource::open(cfg.clone()).unwrap());
+        let manager =
+            SourceManager::new().with_cache(Arc::new(TileCache::new(8, None, None).unwrap()));
+        manager.register(old.clone());
+        let cached = manager.get_tile(&cfg.id, TILE, None).await.unwrap().data;
+        std::fs::rename(replacement, &path).unwrap();
+        assert!(old.get_tile(TILE, None).await.is_err());
+        let new = Arc::new(FlatGeobufSource::open(cfg.clone()).unwrap());
+        assert_ne!(old.content_version(), new.content_version());
+        assert_eq!(new.content_version(), new.clone_source().content_version());
+        let expected = new.get_tile(TILE, None).await.unwrap().data;
+        assert_ne!(cached, expected);
+        manager.register(new.clone());
+        assert_eq!(
+            manager.get_tile(&cfg.id, TILE, None).await.unwrap().data,
+            expected
+        );
+        old.close().await.unwrap();
+        new.close().await.unwrap();
+    }
+
     #[tokio::test]
     async fn flatgeobuf_keeps_buffer_crossing_and_world_edge_features() {
         let dir = tempfile::tempdir().unwrap();
@@ -1360,6 +1425,20 @@ mod tests {
         let input = dir.path().join("input.geojson");
         let output = dir.path().join("result.parquet");
         std::fs::write(&input, "invalid GeoJSON").unwrap();
+        let control = Arc::new(ImportControl::default());
+        let _finish = FinishImport(control.clone());
+        assert!(
+            import_staged(
+                &input,
+                VectorImportFormat::GeoJson,
+                &output,
+                &VectorImportOptions::default(),
+                &control
+            )
+            .is_err()
+        );
+        assert!(control.interrupt.lock().unwrap().is_none());
+        assert!(!control.done.load(Ordering::Acquire));
         assert!(
             import_to_geoparquet(
                 &input,

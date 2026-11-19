@@ -16,8 +16,10 @@ use crate::cache::{CacheZoomRange, ContentVersion};
 use crate::error::{MaptileError, MaptileResult};
 use crate::sources::{
     TileCoord, TileEncoding, TileFormat, TileInfo, TileQuery, TileResponse, TileSource,
-    read_tile_batch_with, validate_tile_batch,
+    read_tile_batch_with,
 };
+
+use crate::sources::tile_math::validate_tile_request;
 
 use super::PostgresPool;
 
@@ -232,6 +234,7 @@ impl TileSource for PostgresFunctionSource {
         xyz: TileCoord,
         query: Option<&TileQuery<'_>>,
     ) -> MaptileResult<TileResponse> {
+        validate_tile_request(std::slice::from_ref(&xyz), query)?;
         self.fetch_tile(xyz, query).await
     }
 
@@ -240,7 +243,7 @@ impl TileSource for PostgresFunctionSource {
         coords: &[TileCoord],
         query: Option<&TileQuery<'_>>,
     ) -> MaptileResult<Vec<TileResponse>> {
-        validate_tile_batch(coords)?;
+        validate_tile_request(coords, query)?;
         if coords.is_empty() {
             return Ok(Vec::new());
         }

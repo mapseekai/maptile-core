@@ -29,6 +29,8 @@
 
 ## MapLibre Native
 
+本仓库保留了 [`maplibre_native` 0.9.3 的 Rust/C++ 绑定源码](../third_party/maplibre-native-rs/README.md)，用于修正原生构建的 RTTI、`NDEBUG` 和头文件缓存行为。绑定由 Yuri Astrakhan 和 MapLibre contributors 提供，采用 [MIT](../third_party/maplibre-native-rs/LICENSE-MIT) 或 [Apache-2.0](../third_party/maplibre-native-rs/LICENSE-APACHE) 双许可。来源、原始 archive 校验值及本地差异见该目录 README。
+
 `render` 使用 [MapLibre Native](https://github.com/maplibre/maplibre-native)，许可证为 BSD-2-Clause。分发包含该渲染器的产物时，保留适用的版权与许可声明。
 
 发布包还须附带源码构建时由 CMake 生成的 `mbgl-core.license`，其中包含适用的 Boost 等依赖声明。原生构建流程见[开发与构建](development.md#原生渲染构建)。

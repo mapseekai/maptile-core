@@ -83,7 +83,35 @@ cargo test --locked --test postgres_table \
 
 ## 原生渲染构建
 
-[`maptile-render-cargo.sh`](../scripts/ci/maptile-render-cargo.sh)准备固定上游提交及递归子模块，并把 Cargo 构建指向这一份 MapLibre Native 源码。它设置源码构建模式，清理预编译核心、系统核心和 `DOCS_RS` 编译跳过相关环境变量。
+`render` 使用仓库内的 [MapLibre Native Rust 绑定](../third_party/maplibre-native-rs/README.md)。根 manifest 的相对 `path` 依赖将同一份修正传递给通过 Git 或 path 引用本库的应用，无需下游添加 `[patch]`。包版本仍为 `0.9.3`，它是本仓库保留的源码副本，不是新的 registry 发布版；默认 features 仍为空。
+
+### 默认源码构建
+
+在未设置 `MLN_PRECOMPILE`、`MLN_SYSTEM` 和 `DOCS_RS` 的环境中，普通 Cargo 命令会获取 Native 固定提交 `a33d3f00fb9dbf9117ce18edd799aa0ca5bcce5b` 及递归子模块，并编译启用 RTTI 的核心和 C++ 桥接。首次构建需要访问上游 Git 仓库。自动源码缓存位于绑定的 Cargo `OUT_DIR/native-source`，不会写入 `third_party` 或下游只读的依赖源码目录。
+
+```sh
+CARGO_BUILD_JOBS=2 cargo test --locked --features render \
+  --test render_native -- --test-threads=1
+```
+
+独立应用可直接引用完整仓库检出：
+
+```toml
+[dependencies]
+maptile-core = { path = "../maptile-core", default-features = false, features = ["render"] }
+```
+
+应用先用 `cargo build` 生成自己的锁文件，之后用 `cargo build --locked`。Git 依赖也会解析该检出内的相对路径；所选择的 Git revision 必须包含 `third_party` 绑定源码及 manifest 修正。
+
+注册自定义文件源时，沿用本库的公开重导出：
+
+```rust
+use maptile_core::render::maplibre_file_source::{FileSource, ResourceRequest, Response};
+```
+
+同时直接依赖 registry 中的 `maplibre_native` 会引入另一个 Cargo 包身份，其类型和全局文件源注册表与本库使用的绑定不共享。应用只需声明 `maptile-core` 并使用上述路径。
+
+需要独立管理源码缓存的 CI 可继续使用 [`maptile-render-cargo.sh`](../scripts/ci/maptile-render-cargo.sh)。它准备固定上游提交及递归子模块，设置 `MLN_LOCAL_REPOSITORY` 和源码构建模式，并清理预编译核心、系统核心和 `DOCS_RS` 编译跳过相关环境变量。
 
 首次验证选择空的专用输出目录，分别运行 Debug 和 Release：
 
@@ -99,9 +127,24 @@ CARGO_TARGET_DIR=/tmp/maptile-core-native-release \
   --test render_native -- --test-threads=1
 ```
 
-默认源码缓存位于 `.cache/maplibre-native-src/maplibre-native`。自定义 `MAPTILE_MLN_CHECKOUT` 时，使用以 `/maplibre-native` 结尾的专用构建缓存目录；脚本会重置其中的源码与子模块。固定提交和源码地址的默认值以脚本为准。
+该 CI 脚本的源码缓存默认位于 `.cache/maplibre-native-src/maplibre-native`。自定义 `MAPTILE_MLN_CHECKOUT` 时，使用以 `/maplibre-native` 结尾的专用构建缓存目录；脚本会重置其中的源码与子模块。直接设置 `MLN_LOCAL_REPOSITORY` 时也须提供此名称的完整匹配源码检出，并允许构建更新其子模块。
 
-Release 构建需要核心与 C++ 桥接的 `NDEBUG` 一致。串行原生测试验证渲染器生命周期和真实图像输出，应与链接检查一起完成。渲染接口和尺寸配置见[样式与渲染](rendering.md)。
+核心与桥接必须同时启用 RTTI，并保持 `NDEBUG` 一致；默认源码模式会按 Cargo 构建配置匹配两者。串行原生测试验证渲染器生命周期和真实图像输出，应与链接检查一起完成。渲染接口和尺寸配置见[样式与渲染](rendering.md)。
+
+### 显式预编译输入
+
+已有兼容的原生库时，根仓库和独立下游都可使用同一组环境变量：
+
+```sh
+MLN_PRECOMPILE=1 \
+MLN_CORE_LIBRARY_PATH=/path/to/libmaplibre-native-core-amalgam.a \
+MLN_CORE_LIBRARY_HEADERS_PATH=/path/to/maplibre-native-headers.tar.gz \
+CARGO_BUILD_JOBS=2 cargo build --locked --features render
+```
+
+archive 和 headers 必须来自上述同一 Native revision、目标架构及图形后端，核心需 `MLN_WITH_RTTI=ON` 且定义 `NDEBUG`（推荐 Release，RelWithDebInfo 也满足）。预编译模式的桥接即使在 Rust Debug 下也定义 `NDEBUG`。构建脚本无法认证任意用户提供的二进制 ABI，输入配对由提供者负责。使用包含原生依赖的 amalgam archive；本机系统库仍须满足该目标的链接要求。
+
+绑定不再自动下载旧的 0.9.3 原生资产；缺少任一预编译输入时会明确失败。没有兼容二进制时，移除 `MLN_PRECOMPILE` 以采用默认源码构建。仓库不包含原生 archive、headers 包或本机缓存。macOS 使用 Metal；Linux 使用所选后端及相应的原生环境。
 
 分发包含原生渲染器的产物时，附带构建生成的 `mbgl-core.license` 和适用的第三方声明，详见[第三方声明](third-party-notices.md)。
 

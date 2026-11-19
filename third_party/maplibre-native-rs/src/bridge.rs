@@ -1,0 +1,1332 @@
+use std::fmt::Display;
+use std::ops::Sub;
+
+use crate::renderer::callbacks::{
+    camera_did_change_callback, failing_loading_map_callback, finish_rendering_frame_callback,
+    render_requested_callback, void_callback, CameraDidChangeCallback, FailingLoadingMapCallback,
+    FinishRenderingFrameCallback, RenderRequestedCallback, VoidCallback,
+};
+use crate::renderer::file_source::{BoxedFileSource, RequestHandleFfi};
+
+// https://maplibre.org/maplibre-native/docs/book/design/ten-thousand-foot-view.html
+
+/// Enable or disable the internal logging thread
+///
+/// By default, logs are generated asynchronously except for Error level messages.
+/// In crash scenarios, pending async log entries may be lost.
+pub fn set_log_thread_enabled(enable: bool) {
+    ffi::Log_useLogThread(enable);
+}
+
+fn log_from_cpp(severity: ffi::EventSeverity, event: ffi::Event, code: i64, message: &str) {
+    #[cfg(not(feature = "log"))]
+    let _ = (severity, event, code, message);
+
+    #[cfg(feature = "log")]
+    match severity {
+        ffi::EventSeverity::Debug => log::debug!("{event:?} (code={code}) {message}"),
+        ffi::EventSeverity::Info => log::info!("{event:?} (code={code}) {message}"),
+        ffi::EventSeverity::Warning => log::warn!("{event:?} (code={code}) {message}"),
+        ffi::EventSeverity::Error => log::error!("{event:?} (code={code}) {message}"),
+        ffi::EventSeverity { repr } => {
+            log::error!("{event:?} (severity={repr}, code={code}) {message}");
+        }
+    }
+}
+
+/// A position in screen coordinates
+#[repr(C)]
+#[derive(Default, Debug, Clone, Copy, PartialEq)]
+pub struct ScreenCoordinate {
+    /// Horizontal position in screen pixels.
+    pub x: f64,
+    /// Vertical position in screen pixels.
+    pub y: f64,
+}
+
+impl Sub for ScreenCoordinate {
+    type Output = Self;
+    fn sub(self, rhs: Self) -> Self::Output {
+        Self { x: self.x - rhs.x, y: self.y - rhs.y }
+    }
+}
+
+/// A size
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct Size {
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+}
+
+#[cxx::bridge()]
+/// FFI bindings for GeoJSON values.
+pub mod geojson {
+    #[namespace = "mln::bridge::geojson"]
+    unsafe extern "C++" {
+        include!("geojson/geojson.h");
+
+        /// A MapLibre Native GeoJSON value.
+        type GeoJson;
+
+        /// Parses a GeoJSON string into a MapLibre Native GeoJSON value.
+        fn parse(json: &str) -> Result<UniquePtr<GeoJson>>;
+        /// Copies a MapLibre Native GeoJSON value.
+        fn clone(geojson: &GeoJson) -> UniquePtr<GeoJson>;
+        // TODO(maplibre-native#4345): can be restored once the precompiled core exposes
+        // a public GeoJSON serializer
+        // /// Serializes a MapLibre Native GeoJSON value to a JSON string.
+        // fn stringify(geojson: &GeoJson) -> Result<String>;
+    }
+}
+
+impl std::fmt::Debug for geojson::GeoJson {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GeoJson").finish()
+    }
+}
+
+/// FFI bindings for map source operations.
+///
+/// This module provides C++/Rust interoperability for various source types.
+/// Currently supports GeoJSON sources, with extensibility for additional source types.
+#[cxx::bridge()]
+pub mod sources {
+    /// MapLibre style-spec source type.
+    /// Rust mirror of `mln::style::SourceType`.
+    #[derive(Debug)]
+    #[namespace = "mln::style"]
+    enum SourceType {
+        /// Vector tile source.
+        Vector,
+        /// Raster tile source.
+        Raster,
+        /// Raster DEM source.
+        RasterDEM,
+        /// GeoJSON source.
+        GeoJSON,
+        /// Video source.
+        Video,
+        /// Annotations source.
+        Annotations,
+        /// Image source.
+        Image,
+        /// Custom vector source.
+        CustomVector,
+    }
+
+    #[namespace = "mln::style"]
+    extern "C++" {
+        include!("mln/style/source.hpp");
+        include!("mln/style/sources/geojson_source.hpp");
+        include!("mln/style/types.hpp");
+        // Opaque types
+        /// Base class for all MapLibre Native style sources.
+        type Source;
+        /// A GeoJSON source for MapLibre rendering.
+        type GeoJSONSource;
+        /// `mln::style::SourceType`
+        type SourceType;
+    }
+
+    #[namespace = "mln::bridge::geojson"]
+    extern "C++" {
+        include!("geojson/geojson.h");
+
+        /// A MapLibre Native GeoJSON value.
+        #[rust_name = "CxxGeoJson"]
+        type GeoJson = super::geojson::GeoJson;
+    }
+
+    #[namespace = "mln::bridge::style::sources"]
+    unsafe extern "C++" {
+        include!("sources/sources.h");
+
+        /// A non-owning handle to a style-owned source.
+        type SourceHandle;
+        /// A non-owning handle to a style-owned GeoJSON source.
+        type GeoJSONSourceHandle;
+
+        /// Returns the source ID.
+        fn sourceId(self: &SourceHandle) -> String;
+        /// Returns the MapLibre style-spec source type.
+        fn sourceType(self: &SourceHandle) -> SourceType;
+        /// Downcasts this handle to a GeoJSON source handle, if it is one.
+        fn asGeoJson(self: &SourceHandle) -> UniquePtr<GeoJSONSourceHandle>;
+        /// Returns the GeoJSON source ID.
+        fn sourceId(self: &GeoJSONSourceHandle) -> String;
+        /// Sets the GeoJSON data for this source.
+        fn setGeoJson(self: Pin<&mut GeoJSONSourceHandle>, geojson: &CxxGeoJson);
+
+        /// Upcasts a GeoJSON source handle to the base `Source` type.
+        fn geojson_into_source(source: UniquePtr<GeoJSONSource>) -> UniquePtr<Source>;
+    }
+
+    #[namespace = "mln::bridge::style::sources::geojson"]
+    unsafe extern "C++" {
+        include!("sources/sources.h");
+
+        /// Creates a new GeoJSON source with the given ID.
+        fn create(id: &str) -> UniquePtr<GeoJSONSource>;
+        /// Sets the URL for loading GeoJSON data.
+        fn setURL(source: &UniquePtr<GeoJSONSource>, url: &str);
+        /// Sets the GeoJSON data for the source.
+        fn setGeoJson(source: Pin<&mut GeoJSONSource>, geojson: &CxxGeoJson);
+    }
+
+    // Generate `UniquePtr<SourceHandle>` support. cxx emits it only in the
+    // module that uses the type in a signature, but `SourceHandle` is only
+    // returned via the `ffi` module's alias, so request it explicitly here.
+    impl UniquePtr<SourceHandle> {}
+}
+
+impl std::fmt::Debug for sources::GeoJSONSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GeoJSONSource").finish()
+    }
+}
+
+impl std::fmt::Debug for sources::Source {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Source").finish()
+    }
+}
+
+#[cxx::bridge()]
+/// FFI bindings for map layer operations.
+///
+/// This module provides C++/Rust interoperability for various layer types.
+/// Currently supports circle, fill, line, and symbol layers.
+pub mod layers {
+    // Must have the same namespace than on the C++ side
+    #[namespace = "mln::style"]
+    /// Symbol anchor position type.
+    pub enum SymbolAnchorType {
+        /// Center anchor point.
+        Center,
+        /// Left anchor point.
+        Left,
+        /// Right anchor point.
+        Right,
+        /// Top anchor point.
+        Top,
+        /// Bottom anchor point.
+        Bottom,
+        /// Top-left anchor point.
+        TopLeft,
+        /// Top-right anchor point.
+        TopRight,
+        /// Bottom-left anchor point.
+        BottomLeft,
+        /// Bottom-right anchor point.
+        BottomRight,
+    }
+
+    #[namespace = "mln::style"]
+    /// Line cap type.
+    pub enum LineCapType {
+        /// Round line cap.
+        Round,
+        /// Butt line cap.
+        Butt,
+        /// Square line cap.
+        Square,
+    }
+
+    #[namespace = "mln::style"]
+    /// Line join type.
+    pub enum LineJoinType {
+        /// Miter line join.
+        Miter,
+        /// Bevel line join.
+        Bevel,
+        /// Round line join.
+        Round,
+        /// Internal MapLibre Native line join type.
+        FakeRound,
+        /// Internal MapLibre Native line join type.
+        FlipBevel,
+    }
+
+    #[namespace = "mln::style"]
+    extern "C++" {
+        include!("mln/style/layer.hpp");
+        include!("mln/style/layers/circle_layer.hpp");
+        include!("mln/style/layers/fill_layer.hpp");
+        include!("mln/style/layers/line_layer.hpp");
+        include!("mln/style/layers/symbol_layer.hpp");
+        include!("mln/style/types.hpp");
+
+        /// Base class for all MapLibre Native style layers.
+        type Layer;
+        /// A circle layer for rendering point data.
+        type CircleLayer;
+        /// A fill layer for rendering polygon data.
+        type FillLayer;
+        /// A line layer for rendering line data.
+        type LineLayer;
+        /// Line cap type.
+        type LineCapType;
+        /// Line join type.
+        type LineJoinType;
+        // Opaque types
+        /// A symbol layer for rendering labels and icons on the map.
+        type SymbolLayer;
+
+        /// Symbol anchor position type.
+        type SymbolAnchorType;
+    }
+
+    #[namespace = "mln"]
+    extern "C++" {
+        include!("mln/util/color.hpp");
+
+        /// A MapLibre Native premultiplied RGBA color.
+        type Color = crate::style::Color;
+    }
+
+    #[namespace = "mln::bridge::style::layers"]
+    unsafe extern "C++" {
+        include!("layers/layers.h");
+
+        /// Returns the layer's ID (the style-spec `"id"` field).
+        fn layer_id(layer: &UniquePtr<Layer>) -> String;
+        /// Returns the layer's type name (e.g. `"circle"`, `"fill"`).
+        fn layer_type(layer: &UniquePtr<Layer>) -> String;
+
+        /// Upcasts a circle layer handle to the base `Layer` type.
+        #[must_use]
+        fn circle_into_layer(layer: UniquePtr<CircleLayer>) -> UniquePtr<Layer>;
+        /// Upcasts a fill layer handle to the base `Layer` type.
+        #[must_use]
+        fn fill_into_layer(layer: UniquePtr<FillLayer>) -> UniquePtr<Layer>;
+        /// Upcasts a line layer handle to the base `Layer` type.
+        #[must_use]
+        fn line_into_layer(layer: UniquePtr<LineLayer>) -> UniquePtr<Layer>;
+        /// Upcasts a symbol layer handle to the base `Layer` type.
+        #[must_use]
+        fn symbol_into_layer(layer: UniquePtr<SymbolLayer>) -> UniquePtr<Layer>;
+
+        /// Downcasts a base layer handle to a circle layer. Returns null on type mismatch.
+        fn try_into_circle(layer: UniquePtr<Layer>) -> UniquePtr<CircleLayer>;
+        /// Downcasts a base layer handle to a fill layer. Returns null on type mismatch.
+        fn try_into_fill(layer: UniquePtr<Layer>) -> UniquePtr<FillLayer>;
+        /// Downcasts a base layer handle to a line layer. Returns null on type mismatch.
+        fn try_into_line(layer: UniquePtr<Layer>) -> UniquePtr<LineLayer>;
+        /// Downcasts a base layer handle to a symbol layer. Returns null on type mismatch.
+        fn try_into_symbol(layer: UniquePtr<Layer>) -> UniquePtr<SymbolLayer>;
+
+        /// Creates a new circle layer.
+        #[must_use]
+        pub(crate) fn create_circle_layer(
+            layer_id: &str,
+            source_id: &str,
+        ) -> UniquePtr<CircleLayer>;
+        /// Sets the circle color.
+        fn setCircleColor(layer: &UniquePtr<CircleLayer>, color: &Color);
+        /// Sets the circle opacity.
+        fn setCircleOpacity(layer: &UniquePtr<CircleLayer>, opacity: f32);
+        /// Sets the circle radius in pixels.
+        fn setCircleRadius(layer: &UniquePtr<CircleLayer>, radius: f32);
+        /// Sets the circle stroke color.
+        fn setCircleStrokeColor(layer: &UniquePtr<CircleLayer>, color: &Color);
+        /// Sets the circle stroke opacity.
+        fn setCircleStrokeOpacity(layer: &UniquePtr<CircleLayer>, opacity: f32);
+        /// Sets the circle stroke width in pixels.
+        fn setCircleStrokeWidth(layer: &UniquePtr<CircleLayer>, width: f32);
+
+        /// Creates a new fill layer.
+        #[must_use]
+        pub(crate) fn create_fill_layer(layer_id: &str, source_id: &str) -> UniquePtr<FillLayer>;
+        /// Sets the fill color.
+        fn setFillColor(layer: &UniquePtr<FillLayer>, color: &Color);
+        /// Sets the fill opacity.
+        fn setFillOpacity(layer: &UniquePtr<FillLayer>, opacity: f32);
+        /// Sets the fill outline color.
+        fn setFillOutlineColor(layer: &UniquePtr<FillLayer>, color: &Color);
+
+        /// Creates a new line layer.
+        #[must_use]
+        pub(crate) fn create_line_layer(layer_id: &str, source_id: &str) -> UniquePtr<LineLayer>;
+        /// Sets the line color.
+        fn setLineColor(layer: &UniquePtr<LineLayer>, color: &Color);
+        /// Sets the line cap.
+        fn setLineCap(layer: &UniquePtr<LineLayer>, cap: LineCapType);
+        /// Sets the line join.
+        fn setLineJoin(layer: &UniquePtr<LineLayer>, join: LineJoinType);
+        /// Sets the line opacity.
+        fn setLineOpacity(layer: &UniquePtr<LineLayer>, opacity: f32);
+        /// Sets the line width in pixels.
+        fn setLineWidth(layer: &UniquePtr<LineLayer>, width: f32);
+
+        /// Creates a new symbol layer.
+        #[must_use]
+        pub(crate) fn create_symbol_layer(
+            layer_id: &str,
+            source_id: &str,
+        ) -> UniquePtr<SymbolLayer>;
+        /// Sets the icon image for a layer by image ID.
+        fn setIconImage(layer: &UniquePtr<SymbolLayer>, image_id: &str);
+        /// Sets the anchor point for layer icons.
+        fn setIconAnchor(layer: &UniquePtr<SymbolLayer>, anchor: SymbolAnchorType);
+    }
+}
+
+#[cfg(feature = "json")]
+#[cxx::bridge(namespace = "mln::bridge")]
+/// FFI bindings for the style-spec value adapter.
+///
+/// Rust builds a C++ `StyleValue` tree, and MapLibre Native's conversion layer
+/// reads it through `ConversionTraits<const StyleValue*>`.
+pub mod style_value {
+    #[namespace = "mln::style"]
+    extern "C++" {
+        include!("mln/style/layer.hpp");
+        include!("mln/style/source.hpp");
+
+        #[rust_name = "StyleLayer"]
+        type Layer = crate::bridge::layers::Layer;
+        #[rust_name = "StyleSource"]
+        type Source = crate::bridge::sources::Source;
+    }
+
+    unsafe extern "C++" {
+        include!("style_value.h");
+
+        /// Opaque C++ JSON-like value used as input to MapLibre's conversion layer.
+        type StyleValue;
+
+        /// Constructs a null `StyleValue`.
+        #[must_use]
+        fn make_null() -> UniquePtr<StyleValue>;
+        /// Constructs a boolean `StyleValue`.
+        #[must_use]
+        fn make_bool(b: bool) -> UniquePtr<StyleValue>;
+        /// Constructs a numeric `StyleValue`.
+        #[must_use]
+        fn make_number(n: f64) -> UniquePtr<StyleValue>;
+        /// Constructs a string `StyleValue`.
+        #[must_use]
+        fn make_string(s: &str) -> UniquePtr<StyleValue>;
+        /// Constructs an empty array `StyleValue`.
+        #[must_use]
+        fn make_array() -> UniquePtr<StyleValue>;
+        /// Appends a child to an array `StyleValue`.
+        fn array_push(arr: Pin<&mut StyleValue>, child: UniquePtr<StyleValue>);
+        /// Constructs an empty object `StyleValue`.
+        #[must_use]
+        fn make_object() -> UniquePtr<StyleValue>;
+        /// Inserts a child under `key` in an object `StyleValue`.
+        fn object_insert(obj: Pin<&mut StyleValue>, key: &str, child: UniquePtr<StyleValue>);
+
+        /// Parses a style-spec layer object from a `StyleValue` tree.
+        /// On failure, `error_message` is populated and the returned pointer is null.
+        fn layer_from_value(
+            value: &StyleValue,
+            error_message: &mut String,
+        ) -> UniquePtr<StyleLayer>;
+
+        /// Parses a style-spec source object from a `StyleValue` tree.
+        /// On failure, `error_message` is populated and the returned pointer is null.
+        fn source_from_value(
+            id: &str,
+            value: &StyleValue,
+            error_message: &mut String,
+        ) -> UniquePtr<StyleSource>;
+    }
+}
+
+#[cfg(feature = "json")]
+impl std::fmt::Debug for style_value::StyleValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StyleValue").finish()
+    }
+}
+
+impl std::fmt::Debug for layers::CircleLayer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CircleLayer").finish()
+    }
+}
+
+impl std::fmt::Debug for layers::FillLayer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FillLayer").finish()
+    }
+}
+
+impl std::fmt::Debug for layers::LineLayer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LineLayer").finish()
+    }
+}
+
+impl std::fmt::Debug for layers::Layer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Layer").finish()
+    }
+}
+
+impl std::fmt::Debug for layers::LineCapType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::Round => f.write_str("Round"),
+            Self::Butt => f.write_str("Butt"),
+            Self::Square => f.write_str("Square"),
+            _ => f.write_str("LineCapType"),
+        }
+    }
+}
+
+impl std::fmt::Debug for layers::LineJoinType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::Miter => f.write_str("Miter"),
+            Self::Bevel => f.write_str("Bevel"),
+            Self::Round => f.write_str("Round"),
+            Self::FakeRound => f.write_str("FakeRound"),
+            Self::FlipBevel => f.write_str("FlipBevel"),
+            _ => f.write_str("LineJoinType"),
+        }
+    }
+}
+
+impl std::fmt::Debug for layers::SymbolLayer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SymbolLayer").finish()
+    }
+}
+
+impl std::fmt::Debug for layers::SymbolAnchorType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SymbolAnchorType").finish()
+    }
+}
+
+#[cxx::bridge()]
+/// Resource and configuration options for MapLibre.
+pub mod resource_options {
+
+    #[namespace = "mln"]
+    extern "C++" {
+        // Opaque types
+        /// Resource configuration options.
+        type ResourceOptions;
+
+        // The name must be unique but for some reason this is required
+        #[rust_name = "CxxTileServerOptions"]
+        type TileServerOptions = super::tile_server_options::TileServerOptions;
+    }
+
+    #[namespace = "mln::bridge::resource_options"]
+    unsafe extern "C++" {
+        include!("resource_options.h");
+
+        #[rust_name = "new"]
+        fn new_() -> UniquePtr<ResourceOptions>;
+
+        fn withApiKey(obj: Pin<&mut ResourceOptions>, key: &str);
+        fn withAssetPath(obj: Pin<&mut ResourceOptions>, path: &[u8]);
+        fn withCachePath(obj: Pin<&mut ResourceOptions>, path: &[u8]);
+
+        fn withMaximumCacheSize(obj: Pin<&mut ResourceOptions>, max_cache_size: u64);
+        fn withTileServerOptions(
+            obj: Pin<&mut ResourceOptions>,
+            tile_server_options: &CxxTileServerOptions,
+        );
+    }
+}
+
+impl std::fmt::Debug for resource_options::ResourceOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResourceOptions").finish()
+    }
+}
+
+#[cxx::bridge()]
+/// Tile server configuration options.
+pub mod tile_server_options {
+    #[namespace = "mln"]
+    extern "C++" {
+        // Opaque types
+        /// Tile server configuration.
+        type TileServerOptions;
+    }
+
+    #[namespace = "mln::bridge::tile_server_options"]
+    unsafe extern "C++" {
+        include!("tile_server_options.h");
+
+        #[rust_name = "new_tile_server_options"]
+        fn new_() -> UniquePtr<TileServerOptions>;
+
+        fn withBaseUrl(obj: Pin<&mut TileServerOptions>, path: &[u8]);
+        fn withUriSchemeAlias(obj: Pin<&mut TileServerOptions>, path: &[u8]);
+        fn withSourceTemplate(
+            obj: Pin<&mut TileServerOptions>,
+            styleTemplate: &[u8],
+            domainName: &[u8],
+            versionPrefix: &[u8],
+        );
+        fn withSpritesTemplate(
+            obj: Pin<&mut TileServerOptions>,
+            spritesTemplate: &[u8],
+            domainName: &[u8],
+            versionPrefix: &[u8],
+        );
+        fn withGlyphsTemplate(
+            obj: Pin<&mut TileServerOptions>,
+            glyphsTemplate: &[u8],
+            domainName: &[u8],
+            versionPrefix: &[u8],
+        );
+        fn withTileTemplate(
+            obj: Pin<&mut TileServerOptions>,
+            tileTemplate: &[u8],
+            domainName: &[u8],
+            versionPrefix: &[u8],
+        );
+        fn withApiKeyParameterName(obj: Pin<&mut TileServerOptions>, apiKeyParameterName: &[u8]);
+        fn setRequiresApiKey(obj: Pin<&mut TileServerOptions>, apiKeyRequired: bool);
+    }
+}
+
+impl std::fmt::Debug for tile_server_options::TileServerOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TileServerOptions").finish()
+    }
+}
+
+impl Display for map_observer::MapLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match *self {
+            Self::StyleParseError => "Failed parsing style",
+            Self::StyleLoadError => "Failed loading style",
+            Self::NotFoundError => "Style not found",
+            Self::UnknownError => "Unknown error",
+            _ => "Unrecognized error",
+        };
+        write!(f, "{s}")
+    }
+}
+
+impl std::error::Error for map_observer::MapLoadError {}
+
+#[allow(clippy::borrow_as_ptr)]
+#[cxx::bridge(namespace = "mln::bridge")]
+/// Map observer callbacks and related types.
+pub mod map_observer {
+    #[namespace = "mln::bridge"]
+    #[repr(u32)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    /// Camera change mode for map observer callbacks.
+    pub enum MapObserverCameraChangeMode {
+        /// Camera changed immediately without animation.
+        Immediate,
+        /// Camera changed using an animated transition.
+        Animated,
+    }
+
+    #[namespace = "mln"]
+    #[repr(u32)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    /// Map loading error types.
+    pub enum MapLoadError {
+        /// Style parsing error.
+        StyleParseError,
+        /// Style loading error.
+        StyleLoadError,
+        /// Resource not found.
+        NotFoundError,
+        /// Unknown error.
+        UnknownError,
+    }
+
+    #[namespace = "mln"]
+    extern "C++" {
+        include!("mln/map/map_observer.hpp");
+        type MapLoadError;
+    }
+
+    // Declarations for C++ with implementations in Rust
+    extern "Rust" {
+        type VoidCallback;
+        type FinishRenderingFrameCallback;
+        type CameraDidChangeCallback;
+        type FailingLoadingMapCallback;
+
+        fn void_callback(callback: &VoidCallback);
+        fn finish_rendering_frame_callback(
+            callback: &FinishRenderingFrameCallback,
+            needsRepaint: bool,
+            placementChanged: bool,
+        );
+        fn camera_did_change_callback(
+            callback: &CameraDidChangeCallback,
+            mode: MapObserverCameraChangeMode,
+        );
+        fn failing_loading_map_callback(
+            callback: &FailingLoadingMapCallback,
+            error: MapLoadError,
+            what: &str,
+        );
+    }
+
+    // Declarations for Rust with implementations in C++
+    extern "C++" {
+        include!("map_observer.h"); // Required to find functions below
+
+        type MapObserverCameraChangeMode;
+
+        // C++ Opaque types
+        #[rust_name = "CxxMapObserver"]
+        type MapObserver = super::ffi::MapObserver; // Created custom map observer
+    }
+
+    unsafe extern "C++" {
+        // With `self: Pin<&mut MapObserver>` as first argument, it is a non static method of that object.
+        // cxx searches for such a method
+        /// Sets the callback for when loading of the map will start.
+        fn setWillStartLoadingMapCallback(self: &CxxMapObserver, callback: Box<VoidCallback>);
+        /// Sets the callback for when the style has finished loading.
+        fn setFinishLoadingStyleCallback(self: &CxxMapObserver, callback: Box<VoidCallback>);
+        /// Sets the callback for when the map becomes idle.
+        fn setBecomeIdleCallback(self: &CxxMapObserver, callback: Box<VoidCallback>);
+        /// Sets the callback for when loading of the map fails.
+        fn setFailLoadingMapCallback(
+            self: &CxxMapObserver,
+            callback: Box<FailingLoadingMapCallback>,
+        );
+        /// Sets the callback for when a frame finishes rendering.
+        fn setFinishRenderingFrameCallback(
+            self: &CxxMapObserver,
+            callback: Box<FinishRenderingFrameCallback>,
+        );
+        /// Sets the callback for when the camera finishes changing.
+        fn setCameraDidChangeCallback(
+            self: &CxxMapObserver,
+            callback: Box<CameraDidChangeCallback>,
+        );
+    }
+}
+
+#[allow(clippy::borrow_as_ptr, clippy::unnecessary_box_returns, unused_qualifications)]
+#[cxx::bridge(namespace = "mln::bridge")]
+/// Rust-backed FileSource bridge. See `src/cpp/rust_file_source.{h,cpp}`
+/// for the C++ side.
+pub mod file_source {
+    #[namespace = "mln::bridge"]
+    #[repr(u8)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    /// Resource kinds — mirror of `mln::Resource::Kind`.
+    pub enum ResourceKind {
+        /// Unknown / unspecified resource kind.
+        Unknown = 0,
+        /// A style.json.
+        Style = 1,
+        /// A TileJSON / source descriptor.
+        Source = 2,
+        /// A single tile (vector or raster).
+        Tile = 3,
+        /// A glyph PBF range.
+        Glyphs = 4,
+        /// A sprite sheet PNG.
+        SpriteImage = 5,
+        /// A sprite sheet JSON.
+        SpriteJSON = 6,
+        /// A generic image resource.
+        Image = 7,
+    }
+
+    #[namespace = "mln::bridge"]
+    #[repr(u8)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    /// Error reason categories — mirror of `mln::Response::Error::Reason`.
+    pub enum ErrorReason {
+        /// mbgl's "no error" sentinel; not a meaningful error category.
+        Success = 1,
+        /// Resource not found at the requested URL.
+        NotFound = 2,
+        /// Server-side error (5xx and similar).
+        Server = 3,
+        /// Transport-level connection failure.
+        Connection = 4,
+        /// Rate-limit response.
+        RateLimit = 5,
+        /// Any other error.
+        Other = 6,
+    }
+
+    #[namespace = "mln::bridge"]
+    #[repr(u8)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    /// MapLibre Native file source slot a Rust `FileSource` can serve.
+    ///
+    /// Discriminants mirror `mln::FileSourceType`.
+    pub enum FileSourceType {
+        /// Bundled asset source (`asset://`).
+        Asset = 0,
+        /// Database-backed source for cache/offline storage.
+        Database = 1,
+        /// Local filesystem source (`file://`).
+        FileSystem = 2,
+        /// Network (HTTP) source.
+        Network = 3,
+        /// `MBTiles` source.
+        Mbtiles = 4,
+        /// `PMTiles` source.
+        Pmtiles = 5,
+        /// Top-level resource loader.
+        ResourceLoader = 6,
+    }
+
+    /// Flat FFI shape mirroring `mln::Response`. Optional fields use a `has_*`
+    /// flag; timestamps are Unix epoch seconds. Used both for delivering a
+    /// response and for cache `forward`.
+    #[derive(Debug)]
+    pub struct RawResponse {
+        pub has_error: bool,
+        pub error_reason: ErrorReason,
+        pub error_message: String,
+        pub has_retry_after: bool,
+        pub retry_after_epoch_s: i64,
+        pub no_content: bool,
+        pub not_modified: bool,
+        pub must_revalidate: bool,
+        pub has_data: bool,
+        pub data: Vec<u8>,
+        pub has_modified: bool,
+        pub modified_epoch_s: i64,
+        pub has_expires: bool,
+        pub expires_epoch_s: i64,
+        pub has_etag: bool,
+        pub etag: String,
+    }
+
+    /// Flat FFI shape mirroring the mbgl resource request metadata used by
+    /// Rust-backed file sources.
+    #[derive(Debug)]
+    pub struct RawResourceRequest {
+        pub url: String,
+        pub kind: ResourceKind,
+        pub loading_methods: u8,
+        pub is_volatile: bool,
+        pub is_low_priority: bool,
+        pub is_offline: bool,
+        pub has_tile: bool,
+        pub tile_url_template: String,
+        pub tile_pixel_ratio: u8,
+        pub tile_x: i32,
+        pub tile_y: i32,
+        pub tile_z: i8,
+        pub has_data_range: bool,
+        pub data_range_start: u64,
+        pub data_range_end: u64,
+        pub has_prior_modified: bool,
+        pub prior_modified_epoch_s: i64,
+        pub has_prior_expires: bool,
+        pub prior_expires_epoch_s: i64,
+        pub has_prior_etag: bool,
+        pub prior_etag: String,
+        pub has_prior_data: bool,
+        pub prior_data: Vec<u8>,
+        pub minimum_update_interval_ms: i64,
+    }
+
+    extern "Rust" {
+        type BoxedFileSource;
+        type RequestHandleFfi;
+
+        /// Whether this source can serve the resource.
+        fn can_request(self: &BoxedFileSource, request: &RawResourceRequest) -> bool;
+
+        /// Begin a request.
+        fn request(
+            self: &BoxedFileSource,
+            request: &RawResourceRequest,
+            responder: SharedPtr<RequestState>,
+        ) -> Box<RequestHandleFfi>;
+
+        /// Store a response into a cache source (`FileSource::forward`).
+        fn forward(
+            self: &BoxedFileSource,
+            request: &RawResourceRequest,
+            response: &RawResponse,
+            completion: SharedPtr<ForwardState>,
+        );
+
+        /// Run the request's cancellation hook.
+        fn cancel(self: &RequestHandleFfi);
+    }
+
+    unsafe extern "C++" {
+        include!("rust_file_source.h");
+        type ResourceKind;
+        type ErrorReason;
+        type FileSourceType;
+        /// Native per-request state, owned via `SharedPtr` and handed back to C++ on
+        /// completion/cancellation (replaces a raw pointer token).
+        type RequestState;
+        /// Native per-`forward` state, owned via `SharedPtr`.
+        type ForwardState;
+
+        /// Register a Rust file source for `source_type`.
+        fn register_rust_file_source(source_type: FileSourceType, source: Box<BoxedFileSource>);
+
+        /// Deliver a response for `state` (an error response if dropped uncompleted).
+        fn responder_complete(state: SharedPtr<RequestState>, response: &RawResponse);
+
+        /// Cancel `state` without delivering a response.
+        fn responder_cancel(state: SharedPtr<RequestState>);
+
+        #[allow(dead_code)]
+        fn roundtrip_response_for_test(response: &RawResponse) -> RawResponse;
+
+        /// Notify mbgl that a cache `forward` call finished.
+        fn forward_complete(state: SharedPtr<ForwardState>);
+    }
+}
+
+#[allow(clippy::borrow_as_ptr, unused_qualifications)]
+#[cxx::bridge(namespace = "mln::bridge")]
+/// Core FFI definitions and types for the MapLibre bridge.
+pub mod ffi {
+    // CXX validates enum types against the C++ definition during compilation
+
+    // The mbgl enums must be defined in the same namespace than on the C++ side
+    #[namespace = "mln"]
+    #[repr(u32)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    /// Map rendering mode configuration.
+    pub enum MapMode {
+        /// Continually updating map
+        Continuous,
+        /// Once-off still image of an arbitrary viewport
+        Static,
+        /// Once-off still image of a single tile
+        Tile,
+    }
+
+    #[namespace = "mln"]
+    #[repr(u32)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    /// Debug visualization options for map rendering.
+    pub enum MapDebugOptions {
+        /// No debug visualization.
+        NoDebug = 0,
+        /// Edges of tile boundaries are shown as thick, red lines.
+        ///
+        /// Can help diagnose tile clipping issues.
+        TileBorders = 0b0000_0010, // 1 << 1
+        /// Shows tile parsing status information.
+        ParseStatus = 0b0000_0100, // 1 << 2
+        /// Each tile shows a timestamp indicating when it was loaded.
+        Timestamps = 0b0000_1000, // 1 << 3
+        /// Edges of glyphs and symbols are shown as faint, green lines.
+        ///
+        /// Can help diagnose collision and label placement issues.
+        Collision = 0b0001_0000, // 1 << 4
+        /// Each drawing operation is replaced by a translucent fill.
+        ///
+        /// Overlapping drawing operations appear more prominent to help diagnose overdrawing.
+        Overdraw = 0b0010_0000, // 1 << 5
+        /// The stencil buffer is shown instead of the color buffer.
+        ///
+        /// Note: This option does nothing in Release builds of the SDK.
+        StencilClip = 0b0100_0000, // 1 << 6
+        /// The depth buffer is shown instead of the color buffer.
+        ///
+        /// Note: This option does nothing in Release builds of the SDK
+        DepthBuffer = 0b1000_0000, // 1 << 7
+    }
+
+    /// A geographic coordinate.
+    #[derive(Debug, Clone, Copy, PartialEq, Default)]
+    pub struct LatLng {
+        /// Latitude in degrees.
+        pub lat: f64,
+        /// Longitude in degrees.
+        pub lng: f64,
+    }
+
+    /// A geographic bounding box.
+    #[derive(Debug, Clone, Copy, PartialEq, Default)]
+    pub struct LatLngBounds {
+        /// Southwest corner of the bounds.
+        pub southwest: LatLng,
+        /// Northeast corner of the bounds.
+        pub northeast: LatLng,
+    }
+
+    /// Insets from each edge of the renderer viewport.
+    #[derive(Default, Debug, Clone, Copy, PartialEq)]
+    pub struct EdgeInsets {
+        /// Top inset in logical pixels.
+        pub top: f64,
+        /// Left inset in logical pixels.
+        pub left: f64,
+        /// Bottom inset in logical pixels.
+        pub bottom: f64,
+        /// Right inset in logical pixels.
+        pub right: f64,
+    }
+
+    /// FFI representation of partial camera options.
+    #[derive(Debug, Clone, Copy, PartialEq, Default)]
+    pub struct FfiCameraOptions {
+        pub has_center: bool,
+        pub center: LatLng,
+        pub has_center_altitude: bool,
+        pub center_altitude: f64,
+        pub has_padding: bool,
+        pub padding: EdgeInsets,
+        pub has_anchor: bool,
+        pub anchor: ScreenCoordinate,
+        pub has_zoom: bool,
+        pub zoom: f64,
+        pub has_bearing: bool,
+        pub bearing: f64,
+        pub has_pitch: bool,
+        pub pitch: f64,
+        pub has_roll: bool,
+        pub roll: f64,
+        pub has_fov: bool,
+        pub fov: f64,
+    }
+
+    /// MapLibre Native Event Severity levels
+    #[namespace = "mln"]
+    #[repr(u8)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum EventSeverity {
+        /// Debug severity level.
+        Debug = 0,
+        /// Info severity level.
+        Info = 1,
+        /// Warning severity level.
+        Warning = 2,
+        /// Error severity level.
+        Error = 3,
+    }
+
+    /// MapLibre Native Event types
+    #[namespace = "mln"]
+    #[repr(u8)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum Event {
+        /// General event.
+        General = 0,
+        /// Setup event.
+        Setup = 1,
+        /// Shader event.
+        Shader = 2,
+        /// Style parsing event.
+        ParseStyle = 3,
+        /// Tile parsing event.
+        ParseTile = 4,
+        /// Render event.
+        Render = 5,
+        /// Style event.
+        Style = 6,
+        /// Database event.
+        Database = 7,
+        /// HTTP request event.
+        HttpRequest = 8,
+        /// Sprite event.
+        Sprite = 9,
+        /// Image event.
+        Image = 10,
+        /// OpenGL event.
+        OpenGL = 11,
+        /// JNI event.
+        JNI = 12,
+        /// Android event.
+        Android = 13,
+        /// Crash event.
+        Crash = 14,
+        /// Glyph event.
+        Glyph = 15,
+        /// Timing event.
+        Timing = 16,
+    }
+
+    #[namespace = "mln"]
+    extern "C++" {
+        include!("mln/map/mode.hpp");
+
+        type MapMode;
+        type MapDebugOptions;
+        // The name must be unique but for some reason this is required
+        /// Resource configuration options.
+        #[rust_name = "CxxResourceOptions"]
+        type ResourceOptions = super::resource_options::ResourceOptions;
+        /// Event severity enumeration.
+        pub type EventSeverity;
+        /// Event type enumeration.
+        pub type Event;
+    }
+
+    #[namespace = "mln"]
+    extern "C++" {
+        /// Screen coordinate type.
+        type ScreenCoordinate = super::ScreenCoordinate;
+        /// Size type.
+        type Size = super::Size;
+    }
+
+    #[namespace = "mln::style"]
+    extern "C++" {
+        /// Base source opaque type.
+        #[rust_name = "CxxSource"]
+        type Source = super::sources::Source;
+        /// Base layer opaque type.
+        #[rust_name = "CxxLayer"]
+        type Layer = super::layers::Layer;
+    }
+
+    #[namespace = "mln::bridge::style::sources"]
+    extern "C++" {
+        /// Source handle opaque type.
+        #[rust_name = "CxxSourceHandle"]
+        type SourceHandle = super::sources::SourceHandle;
+    }
+
+    #[namespace = "mln::bridge::geojson"]
+    extern "C++" {
+        /// GeoJSON value opaque type.
+        #[rust_name = "FfiGeoJson"]
+        type GeoJson = super::geojson::GeoJson;
+    }
+
+    #[namespace = "mln::webgpu"]
+    extern "C++" {
+        #[cfg(feature = "wgpu")]
+        type Texture2D;
+    }
+
+    #[namespace = ""]
+    extern "C++" {
+        #[cfg(feature = "wgpu")]
+        type WGPUDevice = webgpu_shim::WGPUDeviceWrapper;
+        #[cfg(feature = "wgpu")]
+        type WGPUQueue = webgpu_shim::WGPUQueueWrapper;
+        #[cfg(feature = "wgpu")]
+        type WGPUTexture = webgpu_shim::WGPUTextureWrapper;
+    }
+
+    // Declarations for Rust with implementations in C++
+    unsafe extern "C++" {
+        include!("map_renderer.h");
+
+        // C++ Opaque types
+        /// Bridge image for rendering output.
+        type BridgeImage;
+        /// Map observer for handling map events.
+        type MapObserver; // Created custom map observer
+        /// Map renderer for rendering map content.
+        type MapRenderer;
+        /// In-flight render request.
+        type RenderRequest;
+
+        /// Whether MapLibre Native uses the libuv run-loop backend.
+        fn run_loop_uses_libuv() -> bool;
+        /// Ticks the current thread's MapLibre Native run loop once (non-blocking).
+        fn currentThreadRunLoopTick();
+        /// Blocks the calling thread, advancing the run loop until it is woken by
+        /// pending work (a render or style-load completion), without busy-polling.
+        fn currentThreadRunLoopWait();
+        /// Wakes a thread blocked in `currentThreadRunLoopWait`. Only needed on the
+        /// CoreFoundation (non-libuv) run loop; a no-op on the libuv backend.
+        fn currentThreadRunLoopStop();
+        /// Creates a new map renderer instance.
+        #[allow(clippy::too_many_arguments)]
+        fn MapRenderer_new(
+            mapMode: MapMode,
+            width: u32,
+            height: u32,
+            pixelRatio: f32,
+            resource_options: &CxxResourceOptions,
+        ) -> UniquePtr<MapRenderer>;
+        /// Reads the current still image from the renderer.
+        fn readStillImage(self: Pin<&mut MapRenderer>) -> UniquePtr<BridgeImage>;
+        /// Gets the pixel data pointer from a bridge image.
+        fn get(self: &BridgeImage) -> *const u8;
+        /// Gets the size of a bridge image.
+        fn size(self: &BridgeImage) -> Size;
+        /// Gets the buffer length of a bridge image.
+        fn bufferLength(self: &BridgeImage) -> usize;
+        /// Renders a single frame.
+        fn render_once(self: Pin<&mut MapRenderer>);
+        /// Sets the callback invoked when MapLibre Native requests a frame.
+        fn setRenderRequestedCallback(
+            self: Pin<&mut MapRenderer>,
+            callback: Box<RenderRequestedCallback>,
+        );
+        /// Submits a render request without waiting for completion.
+        fn submitRender(self: Pin<&mut MapRenderer>) -> UniquePtr<RenderRequest>;
+        /// Calculates camera options that fit geographic bounds.
+        fn cameraForLatLngBounds(
+            self: Pin<&mut MapRenderer>,
+            bounds: &LatLngBounds,
+            padding: &EdgeInsets,
+            bearing: f64,
+            pitch: f64,
+        ) -> FfiCameraOptions;
+        /// Calculates camera options that fit geographic coordinates.
+        fn cameraForLatLngs(
+            self: Pin<&mut MapRenderer>,
+            lat_lngs: &[LatLng],
+            padding: &EdgeInsets,
+            bearing: f64,
+            pitch: f64,
+        ) -> FfiCameraOptions;
+        /// Calculates camera options that fit a GeoJSON value's geometry.
+        fn cameraForGeoJson(
+            self: Pin<&mut MapRenderer>,
+            geojson: &FfiGeoJson,
+            padding: &EdgeInsets,
+            bearing: f64,
+            pitch: f64,
+        ) -> FfiCameraOptions;
+        /// Returns whether a render request has completed.
+        fn isReady(self: &RenderRequest) -> bool;
+        /// Returns whether a completed render request failed.
+        fn hasError(self: &RenderRequest) -> bool;
+        /// Returns the native error message for a failed render request.
+        fn errorMessage(self: &RenderRequest) -> String;
+        /// Takes the rendered image bytes from a completed render request.
+        fn takeImage(self: Pin<&mut RenderRequest>) -> UniquePtr<CxxString>;
+        /// Sets debug visualization flags.
+        fn setDebugFlags(self: Pin<&mut MapRenderer>, flags: MapDebugOptions);
+        /// Jumps to the requested camera options.
+        fn jumpTo(self: Pin<&mut MapRenderer>, camera: &FfiCameraOptions);
+        /// Moves the camera by the given delta.
+        fn moveBy(self: Pin<&mut MapRenderer>, delta: &ScreenCoordinate);
+        /// Scales the camera based on the given scale factor.
+        fn scaleBy(self: Pin<&mut MapRenderer>, scale: f64, pos: &ScreenCoordinate);
+        /// Adjusts the camera pitch by the given delta in degrees.
+        fn pitchBy(self: Pin<&mut MapRenderer>, pitch: f64);
+        /// Rotates the camera using two screen coordinates that define the gesture delta.
+        fn rotateBy(
+            self: Pin<&mut MapRenderer>,
+            first: &ScreenCoordinate,
+            second: &ScreenCoordinate,
+        );
+        /// Loads a style from a URL.
+        fn style_load_from_url(self: Pin<&mut MapRenderer>, url: &str);
+        /// Loads a style from a JSON string.
+        fn style_load_from_json(self: Pin<&mut MapRenderer>, json: &str);
+        /// Sets the renderer size.
+        fn setSize(self: Pin<&mut MapRenderer>, size: &Size);
+        /// Gets the map observer.
+        fn observer(self: Pin<&mut MapRenderer>) -> SharedPtr<MapObserver>;
+        /// Adds an image to the style.
+        fn style_add_image(
+            self: Pin<&mut MapRenderer>,
+            id: &str,
+            data: &[u8],
+            size: Size,
+            pixel_ratio: f32,
+            signed_distance_field: bool,
+        ) -> Result<()>;
+        /// Removes an image from the style.
+        fn style_remove_image(self: Pin<&mut MapRenderer>, id: &str);
+        /// Adds a source to the style.
+        fn style_add_source(
+            self: Pin<&mut MapRenderer>,
+            source: UniquePtr<CxxSource>,
+        ) -> Result<()>;
+        /// Gets a mutable reference to a style source by ID.
+        fn style_get_source_mut(
+            self: Pin<&mut MapRenderer>,
+            id: &str,
+        ) -> UniquePtr<CxxSourceHandle>;
+        /// Removes a source from the style by ID.
+        fn style_remove_source(self: Pin<&mut MapRenderer>, id: &str);
+        /// Adds a layer to the style, optionally before an existing layer
+        /// (pass an empty `before_id` to append to the end of the style).
+        fn style_add_layer(
+            self: Pin<&mut MapRenderer>,
+            layer: UniquePtr<CxxLayer>,
+            before_id: &str,
+        ) -> Result<()>;
+        /// Removes a layer from the style by ID and returns it.
+        fn style_remove_layer(self: Pin<&mut MapRenderer>, id: &str) -> UniquePtr<CxxLayer>;
+
+        #[cfg(feature = "wgpu")]
+        fn setDeviceAndQueue(self: Pin<&mut MapRenderer>, device: WGPUDevice, queue: WGPUQueue);
+
+        #[cfg(feature = "wgpu")]
+        fn takeTexture(self: Pin<&mut MapRenderer>) -> SharedPtr<Texture2D>;
+    }
+
+    #[cfg(feature = "wgpu")]
+    #[namespace = "mln::bridge::texture"]
+    unsafe extern "C++" {
+        include!("texture.h");
+
+        fn getWGPUTexture(texture: &SharedPtr<Texture2D>) -> WGPUTexture;
+    }
+
+    // Declarations for C++ with implementations in Rust
+    extern "Rust" {
+        type RenderRequestedCallback;
+
+        fn render_requested_callback(callback: &RenderRequestedCallback);
+
+        /// Bridge logging from C++ to Rust log crate
+        fn log_from_cpp(severity: EventSeverity, event: Event, code: i64, message: &str);
+    }
+
+    unsafe extern "C++" {
+        include!("rust_log_observer.h");
+
+        /// Enables or disables logging from a separate thread.
+        fn Log_useLogThread(enable: bool);
+    }
+}
+
+impl std::fmt::Debug for ffi::BridgeImage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BridgeImage").finish()
+    }
+}
+
+impl std::fmt::Debug for ffi::MapObserver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MapObserver").finish()
+    }
+}
+
+impl std::fmt::Debug for ffi::MapRenderer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MapRenderer").finish()
+    }
+}
+
+unsafe impl cxx::ExternType for Size {
+    type Id = cxx::type_id!("mln::Size");
+    type Kind = cxx::kind::Trivial;
+}
+
+unsafe impl cxx::ExternType for ScreenCoordinate {
+    type Id = cxx::type_id!("mln::ScreenCoordinate");
+    type Kind = cxx::kind::Trivial;
+}
+
+#[cfg(test)]
+mod test {
+    use crate::ScreenCoordinate;
+
+    #[test]
+    fn screen_coordinate_diff() {
+        let s1 = ScreenCoordinate { x: 5., y: -1. };
+        let s2 = ScreenCoordinate { x: 3., y: -10. };
+
+        let res = s1 - s2;
+        assert!((res.x - 2.).abs() < 0.00001);
+        assert!((res.y - 9.).abs() < 0.00001);
+    }
+}

@@ -1,5 +1,5 @@
 mod raster_uint16_e2e {
-    #![cfg(feature = "agtiff")]
+    #![cfg(all(feature = "agtiff", feature = "raster"))]
 
     use gdal::DriverManager;
     use gdal::raster::{Buffer, RasterCreationOptions};

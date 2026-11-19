@@ -1,0 +1,822 @@
+//! File for defining how we download and link against `MapLibre Native`.
+//! Set `MLN_CORE_LIBRARY_PATH` and `MLN_CORE_LIBRARY_HEADERS_PATH` environment variables to use a local version of maplibre.
+//! With `MLN_PRECOMPILE=1`, local cores must use `MLN_WITH_RTTI=ON` and NDEBUG
+//! (Release is recommended; RelWithDebInfo also defines NDEBUG), with headers
+//! from the same source, target and backend.
+//! The precompiled bridge uses RTTI and NDEBUG even in a Rust debug profile.
+//!
+//! Source builds use a non-amalgam core by default and link its dependencies separately.
+//! Set `MLN_CORE_LIBRARY_USE_AMALGAM=1` to build an amalgam core from source.
+//! Precompiled builds (`MLN_PRECOMPILE=1`) always require an amalgam archive via
+//! `MLN_CORE_LIBRARY_PATH` and matching headers via `MLN_CORE_LIBRARY_HEADERS_PATH`.
+//!
+//! Set `MLN_CMAKE_CXX_LAUNCHER` to forward a compiler launcher (e.g. `ccache`/`sccache`) to `CMAKE_CXX_COMPILER_LAUNCHER` when building from source.
+//!
+//! Set `MLN_SANITIZER` to an LLVM sanitizer (e.g. `address`) to instrument the C++ bridge and a from-source MapLibre Native build.
+//!
+//! Required libraries:
+//! Fedora:
+//!     - `sudo dnf install libicu-devel libglslang-devel spirv-tools-devel libpng-devel libjpeg-turbo-devel libuv-devel libwebp-devel`
+//! Ubuntu:
+//!     - `sudo apt install glslang-dev glslang-tools libicu-dev libpng-dev libjpeg-turbo8-dev libuv1-dev libwebp-dev ccache`
+//!
+//! To build the amalgam library [armerge](https://github.com/tux3/armerge) is required:
+//!     - `cargo install armerge`
+//!     - `sudo apt install llvm` llvm-objcopy required
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::{env, fs};
+
+const MLN_REPOSITORY_URL: &str = "https://github.com/maplibre/maplibre-native.git";
+const MLN_COMMIT: &str = "a33d3f00fb9dbf9117ce18edd799aa0ca5bcce5b";
+
+const BRIDGE_RS: &str = "src/bridge.rs";
+const BRIDGE_CPP_DIR: &str = "src/cpp";
+
+const BRIDGE_INCLUDE_DIRS: &[&str] = &["src/cpp"];
+
+/// Supported graphics rendering APIs.
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum GraphicsApi {
+    /// [Apple's Metal API](https://developer.apple.com/metal/) (macOS/iOS only)
+    Metal,
+    /// [OpenGL API](https://www.opengl.org/)
+    OpenGl(OpenGlContext),
+    /// [Vulkan API](https://www.vulkan.org/)
+    Vulkan,
+    /// [WGPU API](https://github.com/gfx-rs/wgpu)
+    #[expect(clippy::upper_case_acronyms)]
+    WGPU,
+}
+
+/// Whether to use a GLX context for Linux OpenGL.
+fn with_glx() -> bool {
+    env::var("CARGO_FEATURE_GLX").is_ok()
+}
+
+/// The OpenGL context/platform mbgl will use, derived from features and target OS.
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum OpenGlContext {
+    /// EGL
+    Egl,
+    /// GLX (Linux, requires X11)
+    Glx,
+    /// Native WGL (Windows).
+    Wgl,
+}
+
+/// Resolves the OpenGL context for the given target OS.
+///
+/// Linux defaults to EGL. Explicit `glx` selects GLX through X11 for
+/// compatibility with the previous Linux OpenGL path.
+fn opengl_context(target_os: &str) -> OpenGlContext {
+    match target_os {
+        "linux" => {
+            if with_glx() {
+                OpenGlContext::Glx
+            } else {
+                OpenGlContext::Egl
+            }
+        }
+        "windows" => OpenGlContext::Wgl,
+        _ => panic!(
+            "the OpenGL backend is currently supported only on Linux and Windows; use `metal` on macOS/iOS"
+        ),
+    }
+}
+
+/// Warns about (or rejects) redundant or unsupported feature combinations.
+fn check_feature_combinations(target_os: &str, precompiled: bool) {
+    // Precompiled cores ship one generic OpenGL amalgam, so the GLX/EGL context
+    // choice (a source-build cmake option) cannot apply. Fail loudly instead of
+    // silently ignoring `glx`.
+    assert!(
+        !(with_glx() && precompiled),
+        "Feature 'glx' is not supported with precompiled cores (MLN_PRECOMPILE): the OpenGL context is fixed by the prebuilt artifact. Build from source to use GLX, or drop the 'glx' feature."
+    );
+    if with_glx() && target_os != "linux" {
+        println!("cargo::warning=Feature 'glx' currently only affects Linux OpenGL builds.");
+    }
+}
+
+impl GraphicsApi {
+    /// Selects the rendering API based on enabled cargo features and platform.
+    ///
+    /// - If one feature is enabled, it is used.
+    /// - If none are enabled, defaults to Metal on macOS/iOS, Vulkan elsewhere.
+    /// - If multiple are enabled, falls back to OpenGL > Metal > Vulkan, with a warning.
+    fn from_selected_features() -> Self {
+        let with_metal = env::var("CARGO_FEATURE_METAL").is_ok();
+        let with_vulkan = env::var("CARGO_FEATURE_VULKAN").is_ok();
+        let with_opengl = env::var("CARGO_FEATURE_OPENGL").is_ok();
+        let with_wgpu = env::var("CARGO_FEATURE_WGPU").is_ok();
+
+        let target_os = env::var("CARGO_CFG_TARGET_OS").expect("CARGO_CFG_TARGET_OS not set");
+        let is_macos = target_os == "ios" || target_os == "macos";
+
+        match (with_metal, with_vulkan, with_opengl, with_wgpu) {
+            (true, false, false, false) => Self::Metal,
+            (false, true, false, false) => Self::Vulkan,
+            (false, false, true, false) => Self::OpenGl(opengl_context(&target_os)),
+            (false, false, false, true) => Self::WGPU,
+            (false, false, false, false) => {
+                if is_macos {
+                    Self::Metal
+                } else {
+                    Self::Vulkan
+                }
+            }
+            _ => {
+                // Fallback with a warning. This only applies to (unsupported)
+                // multi-backend builds and may change at any time.
+                println!("cargo::warning=Features 'metal', 'vulkan', 'opengl', and 'wgpu' are mutually exclusive.");
+                let default_choice = if with_opengl {
+                    Self::OpenGl(opengl_context(&target_os))
+                } else if with_wgpu {
+                    Self::WGPU
+                } else if is_macos {
+                    Self::Metal
+                } else {
+                    Self::Vulkan
+                };
+                println!("cargo::warning=Using only '{default_choice}', but this default selection may change in future releases.");
+                default_choice
+            }
+        }
+    }
+}
+impl std::fmt::Display for GraphicsApi {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Metal => f.write_str("metal"),
+            Self::OpenGl(_) => f.write_str("opengl"),
+            Self::Vulkan => f.write_str("vulkan"),
+            Self::WGPU => f.write_str("webgpu-wgpu"),
+        }
+    }
+}
+
+/// Extracts the headers from the downloaded tarball
+fn extract_headers(headers_from: &Path, headers_to: &Path) {
+    println!(
+        "cargo:warning=Extracting headers for maplibre-native core library from {} into {}",
+        headers_from.display(),
+        headers_to.display()
+    );
+    let headers_file = fs::File::open(headers_from).expect("Failed to open headers file");
+    let mut tar = flate2::read::GzDecoder::new(headers_file);
+
+    // Overwriting tar entries does not remove headers deleted by a newer input.
+    match fs::remove_dir_all(headers_to) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => panic!("Failed to remove previous headers directory: {err}"),
+    }
+    fs::create_dir_all(headers_to).expect("Failed to create headers directory");
+    let mut archive = tar::Archive::new(&mut tar);
+    archive.set_overwrite(true);
+    archive.unpack(headers_to).expect("Failed to extract headers");
+}
+
+/// Check the actual input access chains without implementing symlink resolution.
+fn check_headers_inputs(generated: &Path, library: &Path, headers: &Path) {
+    let cwd = env::current_dir().expect("Failed to read current directory");
+    let generated = cwd.join(generated);
+    match generated.canonicalize() {
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+        Err(err) => panic!("Failed to resolve previous headers directory: {err}"),
+    }
+    let inputs = [cwd.join(library), cwd.join(headers)];
+    let targets = inputs
+        .each_ref()
+        .map(|input| input.canonicalize().expect("Failed to resolve MLN input path"));
+    // A killed build may leave an empty directory or a complete backup; never reuse either.
+    let mut attempt = 0_u64;
+    let check_dir = loop {
+        let path =
+            generated.with_extension(format!("input-check-{}-{attempt}", std::process::id()));
+        match fs::create_dir(&path) {
+            Ok(()) => break path,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => attempt += 1,
+            Err(err) => panic!("Failed to prepare headers input check directory: {err}"),
+        }
+    };
+    let saved = check_dir.join("headers");
+    println!(
+        "cargo:warning=Headers input check backup: {}; restore destination: {}",
+        saved.display(),
+        generated.display()
+    );
+    if let Err(err) = fs::rename(&generated, &saved) {
+        fs::remove_dir(&check_dir).expect("Failed to remove unused headers input check directory");
+        panic!("Failed to move previous headers for input check: {err}");
+    }
+    // Detach only our output so intermediate aliases are checked by the filesystem itself.
+    let checked = inputs.each_ref().map(|input| input.canonicalize());
+    fs::rename(&saved, &generated).unwrap_or_else(|err| {
+        panic!(
+            "Failed to restore headers from {} to {}: {err}",
+            saved.display(),
+            generated.display()
+        )
+    });
+    fs::remove_dir(&check_dir).expect("Failed to remove headers input check directory");
+    for ((input, expected), actual) in inputs.iter().zip(targets).zip(checked) {
+        let actual = actual.unwrap_or_else(|err| {
+            panic!(
+                "MLN input {} must be outside the generated headers directory and its access chain: {err}",
+                input.display()
+            )
+        });
+        assert_eq!(
+            actual,
+            expected,
+            "MLN input {} changed during headers input check",
+            input.display()
+        );
+    }
+}
+
+/// Resolve explicit precompiled inputs and extract headers into `OUT_DIR`.
+///
+/// Returns the path to the maplibre-native directory and the include directories.
+fn resolve_mln_core() -> (PathBuf, Vec<PathBuf>) {
+    let out_dir =
+        PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is not set")).join("maplibre-native");
+
+    println!("cargo:rerun-if-env-changed=MLN_CORE_LIBRARY_PATH");
+    println!("cargo:rerun-if-env-changed=MLN_CORE_LIBRARY_HEADERS_PATH");
+    let (library_file, headers) = match (env::var_os("MLN_CORE_LIBRARY_PATH"), env::var_os("MLN_CORE_LIBRARY_HEADERS_PATH")) {
+      (Some(library_path),Some(headers_path)) => {
+        println!("cargo:warning=Local library and headers will be used; precompiled cores require MLN_WITH_RTTI=ON and NDEBUG, with matching source/target/backend headers");
+        let _ = headers_path.clone().into_string().inspect(|s| println!("cargo:rerun-if-changed={s}"));
+        let _ = library_path.clone().into_string().inspect(|s| println!("cargo:rerun-if-changed={s}"));
+        (PathBuf::from(library_path), PathBuf::from(headers_path))
+    },
+      (Some(_), None) => panic!("MLN_CORE_LIBRARY_HEADERS_PATH is not set. To compile from a local library/headers, both MLN_CORE_LIBRARY_PATH and MLN_CORE_LIBRARY_HEADERS_PATH must be set."),
+      (None, Some(_)) => panic!("MLN_CORE_LIBRARY_PATH is not set. To compile from a local library/headers, both MLN_CORE_LIBRARY_PATH and MLN_CORE_LIBRARY_HEADERS_PATH must be set."),
+    (None, None) => panic!("This binding requires an RTTI-enabled precompiled core. Set both MLN_CORE_LIBRARY_PATH and MLN_CORE_LIBRARY_HEADERS_PATH to a matching archive and headers, or unset MLN_PRECOMPILE to build the pinned core from source. Automatic downloads are disabled because the published 0.9.3 assets are not ABI-compatible."),
+     };
+    assert!(
+        library_file.is_file(),
+        "The MLN library at {} must be a file. When building locally on Linux it is called libmbgl-core-amalgam.a",
+        library_file.display()
+    );
+    assert!(
+        headers.is_file(),
+        "The MLN headers at {} must be a gzip (tar.gz) file containing the headers.",
+        headers.display()
+    );
+
+    let extracted_path = out_dir.join("headers");
+    check_headers_inputs(&extracted_path, &library_file, &headers);
+    extract_headers(&headers, &extracted_path);
+    // Precompiled inputs do not need a CMake source checkout.
+    let base = extracted_path.join("vendor").join("maplibre-native-base");
+    let deps = base.join("deps");
+    let include_dirs = vec![
+        base.join("include"),
+        deps.join("geometry.hpp").join("include"),
+        deps.join("geojson.hpp").join("include"),
+        deps.join("variant").join("include"),
+        extracted_path.join("vendor").join("expected-lite").join("include"),
+        extracted_path.join("include"),
+        // `platform/default/` headers (e.g. `mln/gfx/headless_frontend.hpp`)
+        // ship in their own include root.
+        extracted_path.join("platform").join("default").join("include"),
+    ];
+    (library_file, include_dirs)
+}
+
+/// Gather include directories and build the C++ bridge using `cxx_build`.
+fn build_bridge(
+    lib_name: &str,
+    include_dirs: &[PathBuf],
+    backend: GraphicsApi,
+    core_uses_ndebug: bool,
+) {
+    // println!("cargo:warning=Include_dirs: {:?}", include_dirs);
+    let root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let bridge_include_dirs: Vec<PathBuf> =
+        BRIDGE_INCLUDE_DIRS.iter().map(|p| root.join(p)).collect();
+    let mut build = cxx_build::bridge(BRIDGE_RS);
+    build
+        .includes(&bridge_include_dirs)
+        .includes(include_dirs)
+        .flag_if_supported("-std=c++20")
+        // Match the core RTTI so exceptions remain catchable across dynamic libraries.
+        .flag_if_supported("-frtti")
+        .warnings(true)
+        .warnings_into_errors(true);
+
+    // Some public MLN types (notably RunLoop) have NDEBUG-dependent layouts.
+    // Compile inline bridge code with the same ABI layout as the linked core.
+    if core_uses_ndebug {
+        build.define("NDEBUG", None);
+    }
+
+    println!("cargo:rerun-if-env-changed=MLN_SANITIZER");
+    if let Ok(sanitizer) = env::var("MLN_SANITIZER") {
+        if !sanitizer.trim().is_empty() {
+            build.flag(format!("-fsanitize={}", sanitizer.trim()));
+            build.flag_if_supported("-fno-omit-frame-pointer");
+            build.flag_if_supported("-fno-optimize-sibling-calls");
+        }
+    }
+
+    if matches!(backend, GraphicsApi::OpenGl(_)) {
+        build.define("MLN_RENDER_BACKEND_OPENGL", Some("1"));
+    }
+    if matches!(backend, GraphicsApi::WGPU) {
+        build.flag_if_supported("-DMLN_WEBGPU_IMPL_FFI=1");
+        build.flag_if_supported("-DMLN_WEBGPU_IMPL_WGPU=1");
+    }
+
+    // Watch the Rust side of the cxx bridge.
+    println!("cargo:rerun-if-changed={BRIDGE_RS}");
+    // Watch the C++ bridge source tree.
+    println!("cargo:rerun-if-changed={BRIDGE_CPP_DIR}");
+
+    // Compile C++ bridge sources.
+    let mut cpp_files = walkdir::WalkDir::new(root.join(BRIDGE_CPP_DIR))
+        .follow_links(true)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_file())
+        .map(walkdir::DirEntry::into_path)
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("cpp"))
+        .collect::<Vec<_>>();
+    cpp_files.sort();
+    build.files(cpp_files);
+
+    // Texture FFI bridge is only required for the WebGPU backend.
+    if matches!(backend, GraphicsApi::WGPU) {
+        println!("cargo:rerun-if-changed=src/cpp/texture.h");
+        println!("cargo:rerun-if-changed=src/cpp/texture.cpp");
+        build.file("src/cpp/texture.cpp");
+    }
+
+    build.compile("maplibre_rust_map_renderer_bindings");
+
+    // Link mbgl-core after the bridge - or else `cargo test` won't be able to find the symbols.
+    println!("cargo:rustc-link-lib=static={lib_name}");
+}
+
+struct Info {
+    lib_name: String,
+    include_dirs: Vec<PathBuf>,
+    cpp_root: PathBuf,
+}
+
+fn bundle_precompiled() -> Info {
+    let (cpp_root, include_dirs) = resolve_mln_core();
+
+    println!(
+        "cargo:warning=Using precompiled maplibre-native static library from {}",
+        cpp_root.display()
+    );
+    println!("cargo:rustc-link-search=native={}", cpp_root.parent().unwrap().display());
+
+    // These `cargo:rustc-link-lib` must be done before curl and GL,
+    // especially on Linux before 1.90 (1.90 introduced new linker on Linux)
+    let lib_name = cpp_root
+        .file_name()
+        .expect("static library base has a file name")
+        .to_string_lossy()
+        .to_string()
+        .replacen("lib", "", 1)
+        .replace(".a", "");
+
+    Info { lib_name, include_dirs, cpp_root }
+}
+
+fn clone_repository<P: AsRef<Path>>(
+    clone_dir: P,
+    folder_name: &str,
+    repository_url: &str,
+    commit: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // `git clone --revision` only exists in git >= 2.49 (March 2025); use
+    // init + fetch + checkout so older git works too.
+    let repository_dir = clone_dir.as_ref().join(folder_name);
+    fs::create_dir_all(&repository_dir)?;
+    let git = |args: &[&str]| -> Result<(), Box<dyn std::error::Error>> {
+        let status = Command::new("git").current_dir(&repository_dir).args(args).status()?;
+        if !status.success() {
+            return Err(format!("git {} failed: {status}", args.join(" ")).into());
+        }
+        Ok(())
+    };
+    git(&["init", "--quiet"])?;
+    git(&["remote", "add", "origin", repository_url])?;
+    git(&["fetch", "--depth", "1", "origin", commit])?;
+    git(&["checkout", "--quiet", "FETCH_HEAD"])?;
+    Ok(())
+}
+
+fn submodule_update<P: AsRef<Path>>(repository: P) -> Result<(), Box<dyn std::error::Error>> {
+    let submodule_status = Command::new("git")
+        .current_dir(repository)
+        .args(["submodule", "update", "--init", "--recursive"])
+        .status()?;
+    if !submodule_status.success() {
+        return Err(
+            format!("Failed to initialize maplibre-native submodules: {submodule_status}").into()
+        );
+    }
+    Ok(())
+}
+
+fn configure_local_build(
+    config: &mut cmake::Config,
+    api: GraphicsApi,
+    amalgam_lib: bool,
+    target_os: &str,
+) {
+    // maplibre-native's platform/darwin/darwin.cmake calls enable_language(Swift),
+    // which the default "Unix Makefiles" generator does not support. Switch to Ninja.
+    if target_os == "macos" || target_os == "ios" {
+        config.generator("Ninja");
+    }
+
+    match api {
+        GraphicsApi::Metal => {
+            config.configure_arg("-DMLN_WITH_METAL=ON");
+        }
+        GraphicsApi::OpenGl(context) => {
+            config.configure_arg("-DMLN_WITH_OPENGL=ON");
+            // OpenGL context / windowing options, mapped ~1:1 to mbgl's MLN_WITH_*.
+            // EGL is the default OpenGL context on Linux; GLX is selected with X11.
+            // Windows OpenGL uses native WGL.
+            if context == OpenGlContext::Egl {
+                config.configure_arg("-DMLN_WITH_EGL=ON");
+            }
+            if target_os == "linux" {
+                config.configure_arg(if context == OpenGlContext::Glx {
+                    "-DMLN_WITH_X11=ON"
+                } else {
+                    "-DMLN_WITH_X11=OFF"
+                });
+            }
+        }
+        GraphicsApi::Vulkan => {
+            config.configure_arg("-DMLN_WITH_VULKAN=ON");
+            if target_os == "linux" {
+                // Vulkan has no X11 dependency.
+                config.configure_arg("-DMLN_WITH_X11=OFF");
+            }
+        }
+        #[cfg(feature = "wgpu")]
+        GraphicsApi::WGPU => {
+            config.configure_arg("-DMLN_WITH_WEBGPU=ON");
+            config.configure_arg("-DMLN_WEBGPU_IMPL_FFI=ON");
+            config.configure_arg("-DMLN_WEBGPU_IMPL_WGPU=ON");
+            if target_os == "linux" {
+                // Use EGL here to avoid an X11/GLX dependency for WGPU.
+                config.configure_arg("-DMLN_WITH_EGL=ON");
+                config.configure_arg("-DMLN_WITH_X11=OFF");
+            }
+            config.configure_arg(format!(
+                "-DMLN_WEBGPU_IMPL_WEBGPU_HEADER_DIR={}",
+                webgpu_shim::WEBGPU_HEADER_INCLUDE_DIR
+            ));
+        }
+        #[cfg(not(feature = "wgpu"))]
+        GraphicsApi::WGPU => {
+            panic!("The `wgpu` feature must be enabled to use WGPU rendering.");
+        }
+    }
+    if amalgam_lib {
+        config.configure_arg("-DMLN_CREATE_AMALGAMATION:BOOL=ON");
+    }
+    if target_os == "linux" {
+        config.configure_arg("-DMLN_WITH_WAYLAND=OFF");
+    }
+
+    config.define("MLN_WITH_RTTI", "ON");
+
+    // We only build the `mbgl-core` target, so skip configuring the GLFW demo app.
+    config.configure_arg("-DMLN_WITH_GLFW=OFF");
+
+    // Always pass a value; CMake caches variables between configure runs.
+    let sanitizer = env::var("MLN_SANITIZER").unwrap_or_default();
+    let sanitizer = sanitizer.trim();
+    config.define("MLN_WITH_SANITIZER", if sanitizer.is_empty() { "OFF" } else { sanitizer });
+
+    // Forward an optional compiler launcher (sccache/ccache) so downstream CI can
+    // cache the C++ objects without patching this crate.
+    println!("cargo:rerun-if-env-changed=MLN_CMAKE_CXX_LAUNCHER");
+    if let Ok(launcher) = env::var("MLN_CMAKE_CXX_LAUNCHER") {
+        if !launcher.trim().is_empty() {
+            config.define("CMAKE_CXX_COMPILER_LAUNCHER", launcher.trim());
+            config.define("CMAKE_C_COMPILER_LAUNCHER", launcher.trim());
+        }
+    }
+}
+
+fn build_local(
+    respository_dir: &Path,
+    name: &str,
+    amalgam_lib: bool,
+    target_os: &str,
+) -> Result<Info, Box<dyn std::error::Error>> {
+    const TARGET_NAME: &str = "mbgl-core";
+    let maplibre_native_dir = respository_dir.join(name);
+
+    // Some CI cache restores may leave an incomplete directory tree.
+    // Require files that prove this is a usable maplibre-native checkout.
+    let has_required_checkout_files = maplibre_native_dir.join("CMakeLists.txt").is_file()
+        && maplibre_native_dir.join("include").is_dir();
+
+    // A cached checkout from a previous `MLN_COMMIT` would be reused with the
+    // current bridge sources, so treat a revision mismatch as unusable too.
+    let is_expected_revision = || -> bool {
+        Command::new("git")
+            .current_dir(&maplibre_native_dir)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .is_some_and(|out| {
+                let head = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                // `MLN_COMMIT` may be a tag, so resolve it through the checkout too.
+                head == MLN_COMMIT
+                    || Command::new("git")
+                        .current_dir(&maplibre_native_dir)
+                        .args(["rev-parse", &format!("{MLN_COMMIT}^{{commit}}")])
+                        .output()
+                        .ok()
+                        .filter(|out| out.status.success())
+                        .is_some_and(|out| String::from_utf8_lossy(&out.stdout).trim() == head)
+            })
+    };
+
+    let is_managed_checkout =
+        env::var_os("MLN_LOCAL_REPOSITORY").is_none_or(|path| path.is_empty());
+    if is_managed_checkout
+        && maplibre_native_dir.exists()
+        && (!has_required_checkout_files || !is_expected_revision())
+    {
+        println!(
+            "cargo:warning=Removing stale or incomplete cached maplibre-native checkout at {}",
+            maplibre_native_dir.display()
+        );
+        fs::remove_dir_all(&maplibre_native_dir)?;
+    }
+
+    // Clone Repository
+    if !maplibre_native_dir.exists() {
+        println!("cargo:warning=Cloning maplibre-native.");
+        clone_repository(respository_dir, name, MLN_REPOSITORY_URL, MLN_COMMIT)?;
+    }
+    println!("cargo:rerun-if-changed={}", maplibre_native_dir.as_os_str().to_str().unwrap());
+
+    // Update submodules
+    submodule_update(&maplibre_native_dir)?;
+
+    let mut config = cmake::Config::new(maplibre_native_dir.clone());
+    config.build_target(TARGET_NAME);
+    let api = GraphicsApi::from_selected_features();
+    configure_local_build(&mut config, api, amalgam_lib, target_os);
+
+    let dest = config.build();
+    println!("cargo:rustc-link-search=native={}", dest.join("build").display());
+    println!(
+        "cargo:rustc-link-search=native={}",
+        dest.join("build").join("vendor").join("maplibre-tile-spec").join("cpp").display()
+    );
+    // println!("cargo:warning=Building maplibre-native done.");
+
+    // maplibre-native include directories
+    let mut include_dirs = Vec::new();
+    let maplibre_native_include_dirs = vec![
+        "include",
+        "src", // contains offscreen_texture.hpp
+        "platform/default/include",
+        "vendor/maplibre-native-base/include",
+        "vendor/maplibre-native-base/deps/variant/include",
+        "vendor/maplibre-native-base/deps/geometry.hpp/include",
+        "vendor/maplibre-native-base/deps/geojson.hpp/include",
+        "vendor/metal-cpp",
+        "vendor/expected-lite/include",
+    ];
+    #[cfg(feature = "wgpu")]
+    if matches!(api, GraphicsApi::WGPU) {
+        include_dirs.push(maplibre_native_dir.join("vendor/webgpu-cpp"));
+        include_dirs.push(dest.join("build").join("webgpu-cpp"));
+        include_dirs.push(PathBuf::from(webgpu_shim::WEBGPU_HEADER_INCLUDE_DIR));
+    }
+
+    // maplibre-rs include dirs
+    for i in BRIDGE_INCLUDE_DIRS {
+        include_dirs.push(Path::new(i).to_path_buf());
+    }
+
+    // Move maplibre-native include dirs into maplibre-rs include dirs
+    include_dirs.append(
+        &mut maplibre_native_include_dirs
+            .into_iter()
+            .map(|path| maplibre_native_dir.clone().join(path))
+            .collect::<Vec<PathBuf>>(),
+    );
+
+    Ok(Info {
+        lib_name: format!("{TARGET_NAME}{}", if amalgam_lib { "-amalgam" } else { "" }),
+        include_dirs,
+        cpp_root: maplibre_native_dir,
+    })
+}
+
+#[allow(clippy::too_many_lines)]
+fn build_mln() {
+    println!("cargo:rerun-if-env-changed=MLN_SYSTEM");
+    println!("cargo:rerun-if-env-changed=MLN_PRECOMPILE");
+    println!("cargo:rerun-if-env-changed=MLN_CORE_LIBRARY_USE_AMALGAM");
+    println!("cargo:rerun-if-env-changed=MLN_LOCAL_REPOSITORY");
+
+    let precompiled = !env::var("MLN_PRECOMPILE").unwrap_or("0".to_string()).eq("0");
+    let amalgam_lib =
+        precompiled || !env::var("MLN_CORE_LIBRARY_USE_AMALGAM").unwrap_or("0".to_string()).eq("0");
+    let system_lib = !env::var("MLN_SYSTEM").unwrap_or("0".to_string()).eq("0");
+    let local_repository = env::var("MLN_LOCAL_REPOSITORY").unwrap_or_default();
+
+    if !local_repository.is_empty() {
+        println!("cargo:warning=Using local repository from: {local_repository}");
+    }
+
+    // Add system library search paths for macOS
+    let target_os = env::var("CARGO_CFG_TARGET_OS").expect("CARGO_CFG_TARGET_OS not set");
+    check_feature_combinations(&target_os, precompiled);
+    if target_os == "macos" {
+        // Check for Homebrew installation paths
+        if let Ok(homebrew_prefix) = env::var("HOMEBREW_PREFIX") {
+            println!("cargo:rustc-link-search=native={homebrew_prefix}/lib");
+        } else if Path::new("/opt/homebrew").exists() {
+            println!("cargo:rustc-link-search=native=/opt/homebrew/lib");
+        } else if Path::new("/usr/local").exists() {
+            println!("cargo:rustc-link-search=native=/usr/local/lib");
+        }
+
+        // macOS system library paths
+        println!("cargo:rustc-link-search=native=/usr/lib");
+        println!("cargo:rustc-link-search=native=/System/Library/Frameworks");
+
+        // Add pkg-config paths if available
+        if let Ok(pkgconfig_path) = env::var("PKG_CONFIG_PATH") {
+            for path in pkgconfig_path.split(':') {
+                let lib_path = Path::new(path).parent().map(|p| p.join("lib"));
+                if let Some(lib_path) = lib_path {
+                    if lib_path.exists() {
+                        println!("cargo:rustc-link-search=native={}", lib_path.display());
+                    }
+                }
+            }
+        }
+    }
+
+    let info = if precompiled {
+        bundle_precompiled()
+    } else if system_lib {
+        // Using pkg config
+        // let mut cfg = pkg_config::Config::new();
+        panic!("Not implemented")
+    } else {
+        const MAPLIBRE_NATIVE_DIR_NAME: &str = "maplibre-native";
+        let respository_dir = if local_repository.is_empty() {
+            PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is not set")).join("native-source")
+        } else {
+            assert!(
+                local_repository.ends_with(MAPLIBRE_NATIVE_DIR_NAME),
+                "The repository must be called: {MAPLIBRE_NATIVE_DIR_NAME}"
+            );
+            PathBuf::from(local_repository.clone()).parent().unwrap().to_path_buf()
+        };
+
+        match build_local(&respository_dir, MAPLIBRE_NATIVE_DIR_NAME, amalgam_lib, &target_os) {
+            Err(e) => {
+                if respository_dir.join(MAPLIBRE_NATIVE_DIR_NAME).exists()
+                    && local_repository.is_empty()
+                {
+                    // let _ = fs::remove_dir_all(clone_dir.join(MAPLIBRE_NATIVE_DIR_NAME));
+                }
+                panic!("Failed to build maplibre native: {e}")
+            }
+            Ok(info) => info,
+        }
+    };
+
+    let backend = GraphicsApi::from_selected_features();
+    let source_core_uses_ndebug = match env::var("OPT_LEVEL").as_deref() {
+        Ok("0") => false,
+        Ok("1" | "2" | "3" | "s" | "z") => true,
+        _ => env::var("PROFILE").as_deref() != Ok("debug"),
+    };
+    build_bridge(
+        &info.lib_name,
+        &info.include_dirs,
+        backend,
+        precompiled || source_core_uses_ndebug,
+    );
+    let is_apple = target_os == "macos" || target_os == "ios";
+    if !amalgam_lib {
+        // The dependent libs are not bundled in the core lib, so we have to link manually
+        // Required for mlt-cpp. Cpp root link search was already added above
+        println!(
+            "cargo:rustc-link-search=native={}",
+            info.cpp_root
+                .parent()
+                .unwrap()
+                .join("vendor")
+                .join("maplibre-tile-spec")
+                .join("cpp")
+                .display()
+        );
+        println!("cargo:rustc-link-lib=mbgl-harfbuzz");
+        println!("cargo:rustc-link-lib=mbgl-freetype");
+        println!("cargo:rustc-link-lib=mbgl-vendor-parsedate");
+        println!("cargo:rustc-link-lib=mbgl-vendor-csscolorparser");
+        // provided with maplibre-native; `mlt-cpp` calls into FastPFor, so
+        // `fastpfor-lib` must follow it on the link line.
+        println!("cargo:rustc-link-lib=mlt-cpp");
+        println!("cargo:rustc-link-lib=fastpfor-lib");
+        if is_apple {
+            // darwin builds vendored ICU (system sqlite3 is linked below for all darwin builds)
+            println!("cargo:rustc-link-lib=mbgl-vendor-icu");
+        } else {
+            println!("cargo:rustc-link-lib=mbgl-vendor-nunicode");
+            println!("cargo:rustc-link-lib=mbgl-vendor-sqlite");
+            // println!("cargo:rustc-link-lib=utf8proc"); // sudo dnf install utf8proc-devel
+            println!("cargo:rustc-link-lib=icuuc"); //sudo dnf install libicu-devel
+            println!("cargo:rustc-link-lib=icudata"); //sudo dnf install libicu-devel
+            println!("cargo:rustc-link-lib=icui18n"); //sudo dnf install libicu-devel
+        }
+        // Vulkan translates GLSL to SPIR-V at runtime via glslang; OpenGL/Metal don't.
+        if backend == GraphicsApi::Vulkan {
+            println!("cargo:rustc-link-lib=glslang"); //sudo dnf install libglslang-devel
+            println!("cargo:rustc-link-lib=glslang-default-resource-limits"); //sudo dnf install libglslang-devel
+
+            // `SPIRV-Tools-opt` depends on symbols from `SPIRV-Tools`.
+            // Keep this order for static linking (notably on Linux/aarch64).
+            println!("cargo:rustc-link-lib=SPIRV-Tools-opt"); //sudo dnf install  spirv-tools-devel // Required by glslang spirv-tools-devel
+            println!("cargo:rustc-link-lib=SPIRV-Tools"); //sudo dnf install  spirv-tools-devel // Required by glslang spirv-tools-devel
+        }
+        println!("cargo:rustc-link-lib=png"); // sudo dnf install libpng-devel
+        println!("cargo:rustc-link-lib=jpeg"); // sudo dnf install libjpeg-turbo-devel
+        println!("cargo:rustc-link-lib=webp"); // sudo dnf install libwebp-devel
+    }
+    if !is_apple {
+        println!("cargo:rustc-link-lib=uv"); // sudo dnf install libuv-devel
+    }
+    println!("cargo:rustc-link-lib=curl");
+    println!("cargo:rustc-link-lib=z");
+
+    if is_apple {
+        println!("cargo:rustc-link-lib=framework=Foundation");
+        println!("cargo:rustc-link-lib=framework=CoreGraphics");
+        // darwin uses the system sqlite3 (both source and precompiled builds).
+        println!("cargo:rustc-link-lib=sqlite3");
+    }
+    match backend {
+        GraphicsApi::Vulkan if is_apple => {
+            println!("cargo:rustc-link-lib=framework=CoreText");
+            println!("cargo:rustc-link-lib=framework=ImageIO");
+        }
+        GraphicsApi::OpenGl(context) => {
+            match context {
+                // Windows native OpenGL. Not yet exercised in CI.
+                OpenGlContext::Wgl => println!("cargo:rustc-link-lib=opengl32"),
+                // EGL-based context links libEGL alongside libGL.
+                OpenGlContext::Egl => {
+                    println!("cargo:rustc-link-lib=GL");
+                    println!("cargo:rustc-link-lib=EGL");
+                }
+                OpenGlContext::Glx => println!("cargo:rustc-link-lib=GL"),
+            }
+            if target_os == "linux" && context == OpenGlContext::Glx {
+                // The GLX context uses X11 symbols such as XInitThreads.
+                println!("cargo:rustc-link-lib=X11");
+            }
+        }
+        GraphicsApi::Metal => {
+            // macOS Metal framework dependencies
+            println!("cargo:rustc-link-lib=framework=Metal");
+            println!("cargo:rustc-link-lib=framework=MetalKit");
+            println!("cargo:rustc-link-lib=framework=QuartzCore");
+            println!("cargo:rustc-link-lib=framework=AppKit");
+            println!("cargo:rustc-link-lib=framework=CoreLocation");
+        }
+        GraphicsApi::Vulkan | GraphicsApi::WGPU => {}
+    }
+}
+
+fn main() {
+    println!("cargo:rerun-if-env-changed=DOCS_RS");
+    if env::var("DOCS_RS").is_ok() {
+        println!("cargo:warning=Skipping build.rs when building for docs.rs");
+        println!("cargo::rustc-cfg=docsrs");
+        println!("cargo:rustc-check-cfg=cfg(docsrs)");
+    } else {
+        build_mln();
+    }
+}

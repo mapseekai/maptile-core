@@ -974,3 +974,276 @@ async fn batch_transport_loss_stops_only_the_affected_pool() {
         "a failed pool closed an independent pool's batch admission"
     );
 }
+
+#[test]
+fn tls_initialization_without_global_provider() {
+    const CHILD: &str = "MAPTILE_TEST_PROVIDER_CHILD";
+    if let Ok(mode) = std::env::var(CHILD) {
+        assert!(rustls::crypto::CryptoProvider::get_default().is_none());
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let error = runtime
+            .block_on(PostgresPool::connect(
+                &format!("host=127.0.0.1 port=0 user=test dbname=test sslmode={mode}"),
+                default_settings(),
+            ))
+            .unwrap_err();
+        assert!(
+            matches!(error, maptile_core::error::MaptileError::Backend(_)),
+            "{error:?}"
+        );
+        assert!(rustls::crypto::CryptoProvider::get_default().is_none());
+        return;
+    }
+    for mode in ["disable", "prefer", "require"] {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tls_initialization_without_global_provider",
+                "--nocapture",
+            ])
+            .env(CHILD, mode)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{mode}: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+/// Dedicated fixtures: TLS and plaintext DSNs omit sslmode; the CA is trusted
+/// only inside child processes, without mutating the test runner's environment.
+#[test]
+fn tls_modes_negotiate_and_verify_certificates() {
+    const CHILD: &str = "MAPTILE_TEST_TLS_CASE";
+    if let Ok(case) = std::env::var(CHILD) {
+        assert!(rustls::crypto::CryptoProvider::get_default().is_none());
+        let dsn = std::env::var("MAPTILE_TEST_CASE_DSN").unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let result = PostgresPool::connect(&dsn, default_settings()).await;
+            if matches!(
+                case.as_str(),
+                "untrusted_prefer"
+                    | "untrusted_require"
+                    | "wrong_hostname"
+                    | "wrong_hostname_prefer"
+                    | "plain_require"
+            ) {
+                let error = result.unwrap_err();
+                let detail = format!("{error:?}");
+                if case == "plain_require" {
+                    assert!(detail.contains("server does not support TLS"), "{detail}");
+                } else {
+                    let reason = if case.starts_with("wrong_hostname") {
+                        "NotValidForName"
+                    } else {
+                        "UnknownIssuer"
+                    };
+                    assert!(
+                        detail.contains("InvalidCertificate") && detail.contains(reason),
+                        "{detail}"
+                    );
+                }
+                println!("{case}: rejected {detail}");
+            } else {
+                let pool = result.unwrap();
+                let conn = pool.get().await.unwrap();
+                let ssl: bool = conn
+                    .query_one(
+                        "SELECT ssl FROM pg_stat_ssl WHERE pid=pg_backend_pid()",
+                        &[],
+                    )
+                    .await
+                    .unwrap()
+                    .get(0);
+                let expected = matches!(case.as_str(), "prefer" | "require" | "default");
+                assert_eq!(ssl, expected, "{case}");
+                println!("{case}: pg_stat_ssl.ssl={ssl}");
+            }
+        });
+        assert!(rustls::crypto::CryptoProvider::get_default().is_none());
+        return;
+    }
+    let Ok(tls_dsn) = std::env::var("MAPTILE_TEST_TLS_DSN") else {
+        eprintln!("MAPTILE_TEST_TLS_DSN unset — skipping TLS fixture test");
+        return;
+    };
+    let plain_dsn = std::env::var("MAPTILE_TEST_PLAIN_DSN").expect("plaintext fixture DSN");
+    let socket_dsn = std::env::var("MAPTILE_TEST_SOCKET_DSN").expect("Unix socket fixture DSN");
+    let ca = std::env::var("MAPTILE_TEST_CA_FILE").expect("test CA PEM");
+    let config = tls_dsn.parse::<tokio_postgres::Config>().unwrap();
+    let port = config.get_ports().first().copied().unwrap_or(5432);
+    let wrong_hostname_dsn = format!(
+        "host=wrong.invalid hostaddr=127.0.0.1 port={port} user=test dbname=test sslmode=require"
+    );
+    let empty = tempfile::tempdir().unwrap();
+    let empty_ca = empty.path().join("empty.pem");
+    std::fs::write(&empty_ca, "").unwrap();
+    for (case, dsn, trusted) in [
+        ("default", tls_dsn.clone(), true),
+        ("disable", format!("{tls_dsn} sslmode=disable"), true),
+        ("prefer", format!("{tls_dsn} sslmode=prefer"), true),
+        ("require", format!("{tls_dsn} sslmode=require"), true),
+        (
+            "untrusted_prefer",
+            format!("{tls_dsn} sslmode=prefer"),
+            false,
+        ),
+        (
+            "untrusted_require",
+            format!("{tls_dsn} sslmode=require"),
+            false,
+        ),
+        (
+            "wrong_hostname_prefer",
+            wrong_hostname_dsn.replace("sslmode=require", "sslmode=prefer"),
+            true,
+        ),
+        ("wrong_hostname", wrong_hostname_dsn, true),
+        ("plain_prefer", format!("{plain_dsn} sslmode=prefer"), true),
+        (
+            "plain_require",
+            format!("{plain_dsn} sslmode=require"),
+            true,
+        ),
+        (
+            "socket_prefer",
+            format!("{socket_dsn} sslmode=prefer"),
+            true,
+        ),
+        (
+            "socket_disable",
+            format!("{socket_dsn} sslmode=disable"),
+            true,
+        ),
+    ] {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tls_modes_negotiate_and_verify_certificates",
+                "--nocapture",
+            ])
+            .env(CHILD, case)
+            .env("MAPTILE_TEST_CASE_DSN", dsn)
+            .env(
+                "SSL_CERT_FILE",
+                if trusted {
+                    std::path::Path::new(&ca)
+                } else {
+                    &empty_ca
+                },
+            )
+            .env("SSL_CERT_DIR", empty.path())
+            .output()
+            .unwrap();
+        println!("{}", String::from_utf8_lossy(&output.stdout));
+        assert!(
+            output.status.success(),
+            "{case}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn tls_batch_cancellation_keeps_the_pools_initial_trust() {
+    const CHILD: &str = "MAPTILE_TEST_CANCEL_CA_CHANGE";
+    if let Ok(change) = std::env::var(CHILD) {
+        use maptile_core::sources::postgres::{PostgresFunctionConfig, PostgresFunctionSource};
+        use maptile_core::sources::{TileCoord, TileSource};
+        use std::{sync::Arc, time::Duration};
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let admin_dsn = common::postgres::pg_dsn().expect("real PostgreSQL fixture");
+            let schema = common::postgres::SchemaGuard::create(&admin_dsn).await;
+            let (monitor, connection) = tokio_postgres::connect(&admin_dsn, tokio_postgres::NoTls).await.unwrap();
+            tokio::spawn(async move { connection.await.unwrap(); });
+            monitor.batch_execute(&format!(
+                "CREATE FUNCTION {}.cancel_ca(z integer, x integer, y integer) RETURNS bytea LANGUAGE plpgsql AS $$ BEGIN IF x = 0 THEN PERFORM pg_sleep(8); END IF; RETURN decode('1a0c0a05726f6164732880207802','hex'); END $$;",
+                schema.name)).await.unwrap();
+            let dsn = format!("{} application_name={}", std::env::var("MAPTILE_TEST_CASE_DSN").unwrap(), schema.name);
+            let pool = PostgresPool::connect(&dsn, PoolSettings { batch_concurrency: 1, ..default_settings() }).await.unwrap();
+            let conn = pool.get().await.unwrap();
+            assert!(conn.query_one("SELECT ssl FROM pg_stat_ssl WHERE pid=pg_backend_pid()", &[]).await.unwrap().get::<_, bool>(0));
+            drop(conn);
+            // Clone must keep exactly the same trust as the pool's connection manager.
+            let cloned = Arc::new(pool.clone());
+            let source = Arc::new(PostgresFunctionSource::open(cloned.clone(), PostgresFunctionConfig {
+                id: "cancel-ca".into(), schema: schema.name.clone(), function: "cancel_ca".into(),
+                description: None, minzoom: None, maxzoom: None, bounds: None, cache_zoom: None,
+            }).await.unwrap());
+            let job = { let source = source.clone(); tokio::spawn(async move {
+                source.read_tile_batch(&[TileCoord { z: 1, x: 0, y: 0 }], None).await
+            }) };
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let active: bool = monitor.query_one("SELECT EXISTS(SELECT FROM pg_stat_activity WHERE application_name=$1 AND state='active' AND wait_event='PgSleep')", &[&schema.name]).await.unwrap().get(0);
+                    if active { break; }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }).await.unwrap();
+            let ca = std::env::var("SSL_CERT_FILE").unwrap();
+            match change.as_str() {
+                "remove" => std::fs::remove_file(&ca).unwrap(),
+                "replace" => std::fs::write(&ca, b"not a certificate").unwrap(),
+                "unchanged" => (),
+                _ => panic!("unknown change"),
+            }
+            let started = std::time::Instant::now();
+            job.abort(); assert!(job.await.unwrap_err().is_cancelled());
+            let stopped = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let active: bool = monitor.query_one("SELECT EXISTS(SELECT FROM pg_stat_activity WHERE application_name=$1 AND state='active')", &[&schema.name]).await.unwrap().get(0);
+                    if !active { break; }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }).await;
+            let elapsed = started.elapsed();
+            // Clean up our own backend even when the regression is present.
+            if stopped.is_err() {
+                monitor.query("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name=$1", &[&schema.name]).await.unwrap();
+            }
+            assert!(stopped.is_ok(), "{change}: cancellation failed after {elapsed:?}");
+            tokio::time::timeout(Duration::from_secs(2), source.read_tile_batch(&[TileCoord { z: 1, x: 1, y: 0 }], None)).await.unwrap().unwrap();
+            // The now-replaced backend also reuses the initial trust snapshot.
+            let conn = cloned.get().await.unwrap();
+            assert!(conn.query_one("SELECT ssl FROM pg_stat_ssl WHERE pid=pg_backend_pid()", &[]).await.unwrap().get::<_, bool>(0));
+            println!("{change}: cancellation={elapsed:?}; next batch and TLS replacement succeeded");
+        });
+        return;
+    }
+    let Ok(dsn) = std::env::var("MAPTILE_TEST_TLS_DSN") else {
+        eprintln!("MAPTILE_TEST_TLS_DSN unset — skipping TLS cancellation fixture");
+        return;
+    };
+    let ca = std::env::var("MAPTILE_TEST_CA_FILE").expect("test CA PEM");
+    for mode in ["prefer", "require"] {
+        for change in ["unchanged", "remove", "replace"] {
+            let dir = tempfile::tempdir().unwrap();
+            let local_ca = dir.path().join("ca.pem");
+            std::fs::copy(&ca, &local_ca).unwrap();
+            let empty = dir.path().join("empty");
+            std::fs::create_dir(&empty).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tls_batch_cancellation_keeps_the_pools_initial_trust",
+                    "--nocapture",
+                ])
+                .env(CHILD, change)
+                .env("MAPTILE_TEST_CASE_DSN", format!("{dsn} sslmode={mode}"))
+                .env("SSL_CERT_FILE", &local_ca)
+                .env("SSL_CERT_DIR", &empty)
+                .output()
+                .unwrap();
+            println!("{mode}: {}", String::from_utf8_lossy(&output.stdout));
+            assert!(
+                output.status.success(),
+                "{mode}/{change}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+}

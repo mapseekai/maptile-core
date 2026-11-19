@@ -187,11 +187,12 @@ impl DuckDbSource {
         let conn = tokio::time::timeout_at(deadline, self.conn.clone().lock_owned())
             .await
             .map_err(|_| query_timeout())?;
-        let running = QueryControl::new(&conn);
+        let running = QueryControl::pending();
         let _cancellation = running.watch(deadline);
         let task = tokio::task::spawn_blocking(move || {
             let conn = conn;
             let _completion = FinishQuery(running.clone());
+            let _attachment = running.attach(&conn);
             if running.cancelled() {
                 return Err(query_timeout());
             }
@@ -232,8 +233,9 @@ impl TileSource for DuckDbSource {
     async fn get_tile(
         &self,
         xyz: TileCoord,
-        _query: Option<&TileQuery<'_>>,
+        query: Option<&TileQuery<'_>>,
     ) -> MaptileResult<TileResponse> {
+        super::tile_math::validate_tile_request(std::slice::from_ref(&xyz), query)?;
         if xyz.z < self.minzoom || xyz.z > self.maxzoom {
             return Err(MaptileError::TileNotFound(xyz.z, xyz.x, xyz.y));
         }
@@ -276,6 +278,15 @@ impl TileSource for DuckDbSource {
             info: self.info,
             last_modified: None,
         })
+    }
+
+    async fn read_tile_batch(
+        &self,
+        coords: &[TileCoord],
+        query: Option<&TileQuery<'_>>,
+    ) -> MaptileResult<Vec<TileResponse>> {
+        super::tile_math::validate_tile_request(coords, query)?;
+        super::read_tile_batch_sequential(self, coords, query).await
     }
 }
 
@@ -468,6 +479,107 @@ fn substitute_template(template: &str, z: u8, x: u32, y: u32, bbox: &[f64; 4]) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn invalid_requests_never_execute_duckdb_templates() {
+        for geometry_column in [None, Some("geom".to_owned())] {
+            let source = DuckDbSource::open(DuckDbSourceConfig {
+                query_template: "SELECT error('request reached SQL')::BLOB AS geom".into(),
+                geometry_column,
+                minzoom: 1,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            let valid = TileCoord { z: 1, x: 0, y: 0 };
+            for coord in [
+                TileCoord { z: 0, x: 1, y: 0 },
+                TileCoord { z: 1, x: 10, y: 10 },
+                TileCoord {
+                    z: 30,
+                    x: 1 << 30,
+                    y: 0,
+                },
+                TileCoord {
+                    z: 30,
+                    x: 0,
+                    y: 1 << 30,
+                },
+                TileCoord {
+                    z: 31,
+                    x: 1 << 31,
+                    y: 0,
+                },
+                TileCoord {
+                    z: 255,
+                    x: u32::MAX,
+                    y: u32::MAX,
+                },
+            ] {
+                assert!(matches!(
+                    source.get_tile(coord, None).await,
+                    Err(MaptileError::InvalidRequest(_))
+                ));
+                assert!(matches!(
+                    source.read_tile_batch(&[valid, coord], None).await,
+                    Err(MaptileError::InvalidRequest(_))
+                ));
+            }
+            for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                for index in 0..4 {
+                    let mut bbox = [-180.0, -90.0, 180.0, 90.0];
+                    bbox[index] = value;
+                    let query = TileQuery {
+                        bbox: Some(bbox),
+                        ..Default::default()
+                    };
+                    assert!(matches!(
+                        source.get_tile(valid, Some(&query)).await,
+                        Err(MaptileError::InvalidRequest(_))
+                    ));
+                    for coords in [&[valid][..], &[][..]] {
+                        assert!(matches!(
+                            source.read_tile_batch(coords, Some(&query)).await,
+                            Err(MaptileError::InvalidRequest(_))
+                        ));
+                    }
+                }
+            }
+            assert!(matches!(
+                source.get_tile(TileCoord { z: 0, x: 0, y: 0 }, None).await,
+                Err(MaptileError::TileNotFound(..))
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn valid_coordinate_extremes_execute_duckdb_templates() {
+        let source = DuckDbSource::open(DuckDbSourceConfig {
+            query_template: "SELECT 'tile-{z}-{x}-{y}'::BLOB".into(),
+            maxzoom: 30,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        for coord in [
+            TileCoord { z: 0, x: 0, y: 0 },
+            TileCoord {
+                z: 30,
+                x: (1 << 30) - 1,
+                y: (1 << 30) - 1,
+            },
+        ] {
+            let tile = source.get_tile(coord, None).await.unwrap();
+            assert_eq!(
+                &tile.data[..],
+                format!("tile-{}-{}-{}", coord.z, coord.x, coord.y).as_bytes()
+            );
+            assert_eq!(
+                source.read_tile_batch(&[coord], None).await.unwrap()[0].data,
+                tile.data
+            );
+        }
+    }
 
     #[test]
     fn bbox_z0_covers_world() {

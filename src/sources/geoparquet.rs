@@ -202,20 +202,31 @@ impl GeoParquetSource {
         cfg: GeoParquetSourceConfig,
         remote: RemoteLocation,
     ) -> MaptileResult<Self> {
+        use super::duckdb_query::{FinishQuery, QueryControl};
+        use super::geoparquet_remote::QUERY_CANCELLED;
+
         // Reopening never reuses tiles from a previous remote session.
         let version = crate::cache::ContentVersion::new_generation();
         let deadline =
             tokio::time::Instant::now() + Duration::from_millis(cfg.query_options.timeout_ms);
-        tokio::time::timeout_at(
+        let running = QueryControl::pending();
+        let cancellation = running.watch(deadline);
+        let result = tokio::time::timeout_at(
             deadline,
             tokio::task::spawn_blocking(move || {
-                let geometry = Arc::new(GeometrySource::open_remote(&cfg, &remote, deadline)?);
+                let _completion = FinishQuery(running.clone());
+                let geometry = Arc::new(GeometrySource::open_remote(&cfg, &remote, &running)?);
+                if running.cancelled() {
+                    return Err(MaptileError::BackendMsg(QUERY_CANCELLED.into()));
+                }
                 Self::from_opened(cfg, HashMap::new(), Some(geometry), version)
             }),
         )
         .await
         .map_err(|_| MaptileError::BackendMsg("GeoParquet remote open timed out".into()))?
-        .map_err(MaptileError::backend)?
+        .map_err(MaptileError::backend)?;
+        drop(cancellation);
+        result
     }
 
     pub(super) fn from_opened(

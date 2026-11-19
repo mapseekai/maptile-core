@@ -101,7 +101,9 @@ impl ArchiveStamp {
 }
 
 impl MbtilesSource {
-    pub async fn open(cfg: MbtilesConfig) -> MaptileResult<Self> {
+    pub async fn open(mut cfg: MbtilesConfig) -> MaptileResult<Self> {
+        // Keep the opening alias for replacement checks, independent of later chdir.
+        cfg.path = std::path::absolute(&cfg.path)?;
         let archive_path = std::fs::canonicalize(&cfg.path)?;
         let mut wal_path = archive_path.as_os_str().to_os_string();
         wal_path.push("-wal");

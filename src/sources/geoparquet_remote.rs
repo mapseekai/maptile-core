@@ -5,6 +5,12 @@ use crate::error::{MaptileError, MaptileResult};
 use duckdb::Connection;
 use std::collections::BTreeMap;
 
+pub(super) const HTTPFS_UNAVAILABLE: &str =
+    "cannot load DuckDB httpfs; prepare the matching signed extension with geoparquet_extensions";
+pub(super) const SPATIAL_UNAVAILABLE: &str =
+    "cannot load DuckDB spatial; prepare the matching signed extension with geoparquet_extensions";
+pub(super) const QUERY_CANCELLED: &str = "GeoParquet query exceeded its deadline or was cancelled";
+
 /// Explicit S3-compatible storage settings for one GeoParquet session.
 /// Credentials stay in DuckDB's in-memory secret store; ambient credentials
 /// and persistent secrets are not used. Empty keys select anonymous access.
@@ -148,9 +154,8 @@ impl RemoteLocation {
     }
 
     pub fn configure(&self, conn: &Connection, timeout_ms: u64) -> MaptileResult<()> {
-        conn.execute_batch("LOAD httpfs").map_err(|_| MaptileError::BackendMsg(
-            "cannot load DuckDB httpfs; prepare the matching signed extension with geoparquet_extensions".into()
-        ))?;
+        conn.execute_batch("LOAD httpfs")
+            .map_err(|_| MaptileError::BackendMsg(HTTPFS_UNAVAILABLE.into()))?;
         configure_httpfs_connection(conn, timeout_ms)?;
         if !self.secret_sql.is_empty() {
             conn.execute_batch(&self.secret_sql)
@@ -205,6 +210,14 @@ fn config(message: &str) -> MaptileError {
 /// DuckDB diagnostics can contain signed URLs, SQL and remote response bodies.
 pub(super) fn remote_error(error: MaptileError) -> MaptileError {
     match error {
+        MaptileError::BackendMsg(ref message)
+            if matches!(
+                message.as_str(),
+                HTTPFS_UNAVAILABLE | SPATIAL_UNAVAILABLE | QUERY_CANCELLED
+            ) =>
+        {
+            error
+        }
         MaptileError::Backend(_) | MaptileError::BackendMsg(_) => MaptileError::BackendMsg(
             "GeoParquet remote read failed; check the endpoint, credentials, file and query budget"
                 .into(),
@@ -276,6 +289,44 @@ mod tests {
         assert_eq!(remote.url, "http://host/A%2Fb.parquet?signature=A%2Fb+%2f");
         let remote = RemoteLocation::s3("S3://bucket/File.parquet", Default::default()).unwrap();
         assert_eq!(remote.url, "s3://bucket/File.parquet");
+    }
+
+    #[test]
+    fn only_exact_trusted_diagnostics_survive_redaction() {
+        use std::error::Error;
+        for message in [HTTPFS_UNAVAILABLE, SPATIAL_UNAVAILABLE, QUERY_CANCELLED] {
+            let error = remote_error(MaptileError::BackendMsg(message.into()));
+            assert!(error.to_string().contains(message));
+            for error in [
+                MaptileError::BackendMsg(format!("{message}; url?signature=private-secret")),
+                MaptileError::backend(std::io::Error::other(
+                    "SQL url?signature=private-secret Authorization: token response-body",
+                )),
+            ] {
+                let error = remote_error(error);
+                assert!(!format!("{error} {error:?}").contains("private-secret"));
+                assert!(error.source().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn missing_httpfs_retains_installation_guidance() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = duckdb::Config::default()
+            .enable_autoload_extension(false)
+            .unwrap()
+            .with("autoinstall_known_extensions", "false")
+            .unwrap()
+            .with("extension_directory", dir.path().to_str().unwrap())
+            .unwrap();
+        let connection = Connection::open_in_memory_with_flags(options).unwrap();
+        let remote =
+            RemoteLocation::http("https://example.invalid/data.parquet", BTreeMap::new()).unwrap();
+        let error = remote_error(remote.configure(&connection, 1000).unwrap_err());
+        assert!(
+            matches!(error, MaptileError::BackendMsg(message) if message == HTTPFS_UNAVAILABLE)
+        );
     }
 
     #[test]

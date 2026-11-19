@@ -22,8 +22,10 @@ use crate::cache::CacheZoomRange;
 use crate::error::{MaptileError, MaptileResult};
 use crate::sources::{
     MAX_TILE_BATCH_BYTES, TileCoord, TileEncoding, TileFormat, TileInfo, TileQuery, TileResponse,
-    TileSource, validate_tile_batch,
+    TileSource,
 };
+
+use crate::sources::tile_math::validate_tile_request;
 
 use super::pool::PostgresPool;
 
@@ -369,6 +371,7 @@ impl TileSource for PostgresTableSource {
         xyz: TileCoord,
         query: Option<&TileQuery<'_>>,
     ) -> MaptileResult<TileResponse> {
+        validate_tile_request(std::slice::from_ref(&xyz), query)?;
         // Filter or bbox requests use request-specific SQL. Other requests
         // use the fixed tile query. Applications translate table-source URL
         // parameters into TileQuery.filter or TileQuery.bbox before this call.
@@ -390,21 +393,7 @@ impl TileSource for PostgresTableSource {
             });
         }
 
-        // Bbox short-circuit: if the dataset bounds and the requested tile
-        // do not intersect, skip the DB round-trip entirely. At low zoom
-        // this is by far the biggest performance win for spatially-small
-        // datasets — the client requests every tile in view but only 1-2
-        // tiles actually overlap the data.
-        if let Some(bounds) = self.info.bounds.as_ref()
-            && !tile_intersects_bounds(xyz, bounds)
-        {
-            return Ok(TileResponse {
-                data: bytes::Bytes::new(),
-                info: self.info_meta,
-                last_modified: None,
-            });
-        }
-
+        // SQL owns spatial rejection so its MVT buffer is preserved.
         self.fetch_and_encode(xyz).await
     }
 
@@ -413,7 +402,7 @@ impl TileSource for PostgresTableSource {
         coords: &[TileCoord],
         query: Option<&TileQuery<'_>>,
     ) -> MaptileResult<Vec<TileResponse>> {
-        validate_tile_batch(coords)?;
+        validate_tile_request(coords, query)?;
         if coords.is_empty() {
             return Ok(Vec::new());
         }
@@ -438,14 +427,7 @@ impl TileSource for PostgresTableSource {
         };
         let enabled: Vec<_> = coords
             .iter()
-            .map(|&coord| {
-                filtered
-                    || !(self.info.derived_min_zoom.is_some_and(|min| coord.z < min)
-                        || self
-                            .info
-                            .bounds
-                            .is_some_and(|bounds| !tile_intersects_bounds(coord, &bounds)))
-            })
+            .map(|coord| filtered || !self.info.derived_min_zoom.is_some_and(|min| coord.z < min))
             .collect();
         if !enabled.contains(&true) {
             return Ok(coords
@@ -712,18 +694,6 @@ fn build_tilejson_with_vector_layers(
     layer.maxzoom = tj.maxzoom;
     tj.vector_layers = Some(vec![layer]);
     tj
-}
-
-/// Compute the WGS84 lon/lat bounds of the (z,x,y) tile and check if it
-/// overlaps the dataset's geographic bounds. Used by `get_tile` to skip
-/// DB round-trips for tiles that can't possibly contain data — the
-/// largest single-request optimization for spatially-small datasets.
-fn tile_intersects_bounds(xyz: TileCoord, bounds: &[f64; 4]) -> bool {
-    let tile_bbox = martin_tile_utils::xyz_to_bbox(xyz.z, xyz.x, xyz.y, xyz.x, xyz.y);
-    // tile_bbox is [west, south, east, north]; bounds same order.
-    let [t_w, t_s, t_e, t_n] = tile_bbox;
-    let [b_w, b_s, b_e, b_n] = *bounds;
-    !(t_e < b_w || t_w > b_e || t_n < b_s || t_s > b_n)
 }
 
 /// Build the inline `SELECT ST_AsMVT(...)` query used for unfiltered tile

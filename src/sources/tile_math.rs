@@ -18,6 +18,29 @@ pub fn tiles_per_axis(z: u8) -> Result<u32, MaptileError> {
     }
 }
 
+/// Validate database request inputs before SQL, integer casts, or zoom shortcuts.
+pub(crate) fn validate_tile_request(
+    coords: &[super::TileCoord],
+    query: Option<&super::TileQuery<'_>>,
+) -> Result<(), MaptileError> {
+    super::validate_tile_batch(coords)?;
+    for &super::TileCoord { z, x, y } in coords {
+        if z > MAX_ZOOM || x >= (1u32 << z) || y >= (1u32 << z) {
+            return Err(MaptileError::InvalidRequest(format!(
+                "invalid tile {z}/{x}/{y}: expected z <= {MAX_ZOOM} and x,y < 2^z"
+            )));
+        }
+    }
+    if let Some(bbox) = query.and_then(|q| q.bbox)
+        && !bbox.iter().all(|value| value.is_finite())
+    {
+        return Err(MaptileError::InvalidRequest(
+            "bbox coordinates must be finite".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// `(west, south, east, north)` WGS84 bbox of a slippy tile.
 #[cfg(any(test, feature = "duckdb", feature = "geoparquet"))]
 pub(super) fn tile_envelope_4326(z: u8, x: u32, y: u32) -> (f64, f64, f64, f64) {
@@ -38,6 +61,32 @@ pub(super) fn tile_envelope_4326(z: u8, x: u32, y: u32) -> (f64, f64, f64, f64) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_validation_preserves_finite_envelopes_and_coordinate_edges() {
+        use crate::sources::{TileCoord, TileQuery};
+        let last = (1 << MAX_ZOOM) - 1;
+        let coords = [
+            TileCoord { z: 0, x: 0, y: 0 },
+            TileCoord {
+                z: MAX_ZOOM,
+                x: last,
+                y: last,
+            },
+        ];
+        for bbox in [
+            [-180.0, -90.0, 180.0, 90.0],
+            [170.0, -10.0, -170.0, 10.0],
+            [0.0; 4],
+            [-190.0, -91.0, 190.0, 91.0],
+        ] {
+            let query = TileQuery {
+                bbox: Some(bbox),
+                ..Default::default()
+            };
+            validate_tile_request(&coords, Some(&query)).unwrap();
+        }
+    }
 
     #[test]
     fn z0_is_one() {

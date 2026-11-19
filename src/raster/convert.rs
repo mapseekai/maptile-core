@@ -7,16 +7,27 @@ use crate::raster::image::RasterImage;
 ///
 /// - 1-band rasters are broadcast: `R = G = B = value`,
 /// - 3-band rasters use channels 0..3 for RGB and synthesise alpha = 255,
-/// - 4-band rasters use the raster's RGBA channels directly.
+/// - Rasters with 4 or more bands use the first four RGBA channels directly,
+/// - 0- and 2-band rasters return transparent black pixels.
 ///
 /// In all cases, pixels with `mask == false` get `alpha = 0` so they can
 /// be drawn transparently regardless of their stored value. Values are
 /// clamped to `0..=255` and NaN is treated as 0.
+///
+/// # Panics
+///
+/// The caller must supply a mask with the same `(height, width)` as the data.
+/// This infallible conversion panics on a mismatch; the fallible encoders
+/// validate this invariant and return `MaptileError::Render` instead.
 #[must_use]
 pub fn rgba_from_raster(img: &RasterImage) -> Vec<u8> {
     let (b, h, w) = img.shape();
+    assert_eq!(img.mask.dim(), (h, w), "raster mask shape must match data");
     let pixel_count = h * w;
     let mut out = vec![0u8; pixel_count * 4];
+    if b == 0 {
+        return out;
+    }
 
     // Fast path: ndarray Array3<f32> built via `Array3::zeros((b, h, w))` is
     // C-contiguous, so we can iterate via `.as_slice()` and skip per-pixel
@@ -27,7 +38,6 @@ pub fn rgba_from_raster(img: &RasterImage) -> Vec<u8> {
     let mask_slice = img.mask.as_slice();
     if let (Some(data), Some(mask)) = (data_slice, mask_slice) {
         debug_assert_eq!(data.len(), b * pixel_count);
-        debug_assert_eq!(mask.len(), pixel_count);
         // Pull each band slice (length pixel_count) out once.
         let band0 = &data[..pixel_count];
         match b {
@@ -153,7 +163,7 @@ pub(super) fn clamp_to_u8(v: f32) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::{Array2, Array3};
+    use ndarray::{Array2, Array3, ShapeBuilder};
 
     fn make_single_band(value: f32, w: usize, h: usize) -> RasterImage {
         let mut data = Array3::<f32>::zeros((1, h, w));
@@ -222,5 +232,83 @@ mod tests {
         img.data[(0, 0, 0)] = f32::NAN;
         let rgba = rgba_from_raster(&img);
         assert_eq!(rgba[0], 0);
+    }
+
+    #[test]
+    fn rgba_conversion_keeps_band_fallbacks_across_layouts() {
+        for bands in [0, 1, 2, 3, 4, 5] {
+            for (h, w) in [(2, 2), (2, 4), (0, 2), (2, 0), (0, 0)] {
+                for (data_f, mask_f) in [(false, true), (true, true), (false, false), (true, false)]
+                {
+                    for valid in [true, false] {
+                        let value = |(b, y, x)| (42 + b * 40 + y * 3 + x) as f32;
+                        let data = if data_f {
+                            Array3::from_shape_fn((bands, h, w).f(), value)
+                        } else {
+                            Array3::from_shape_fn((bands, h, w), value)
+                        };
+                        let mask = if mask_f {
+                            Array2::from_elem((h, w).f(), valid)
+                        } else {
+                            Array2::from_elem((h, w), valid)
+                        };
+                        if h > 1 && w > 1 {
+                            assert_eq!(mask.as_slice().is_none(), mask_f);
+                            if bands > 0 {
+                                assert_eq!(data.as_slice().is_none(), data_f);
+                            }
+                        }
+                        let img = RasterImage {
+                            data,
+                            mask,
+                            nodata: None,
+                            bounds: None,
+                            crs: None,
+                        };
+                        let mut expected = Vec::new();
+                        for y in 0..h {
+                            for x in 0..w {
+                                let v = (42 + y * 3 + x) as u8;
+                                let pixel = match bands {
+                                    1 => [v, v, v, if valid { 255 } else { 0 }],
+                                    3 => [v, v + 40, v + 80, if valid { 255 } else { 0 }],
+                                    4 | 5 => [v, v + 40, v + 80, if valid { v + 120 } else { 0 }],
+                                    _ => [0; 4],
+                                };
+                                expected.extend_from_slice(&pixel);
+                            }
+                        }
+                        if bands == 0 && h == 2 && w == 2 {
+                            eprintln!(
+                                "zero-band layout: data_f={data_f} mask_f={mask_f} valid={valid}"
+                            );
+                        }
+                        assert_eq!(
+                            rgba_from_raster(&img),
+                            expected,
+                            "bands={bands} size={h}x{w} data_f={data_f} mask_f={mask_f} valid={valid}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_mask_shape_is_rejected_before_either_conversion_path() {
+        for (bands, h, w) in [(0, 2, 2), (0, 0, 2), (1, 2, 2)] {
+            for shape in [(1, 2), (3, 2), (1, 4), (0, 1)] {
+                for nonstandard in [false, true] {
+                    let mut img = make_single_band(42.0, w, h);
+                    img.data = Array3::zeros((bands, h, w));
+                    img.mask = Array2::from_elem(shape, true);
+                    if nonstandard {
+                        img.mask = img.mask.reversed_axes();
+                    }
+                    assert_ne!(img.mask.dim(), (h, w));
+                    assert!(std::panic::catch_unwind(|| rgba_from_raster(&img)).is_err());
+                }
+            }
+        }
     }
 }

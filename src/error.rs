@@ -18,6 +18,15 @@ pub enum MaptileError {
     #[error("style not found: {0}")]
     StyleNotFound(String),
 
+    /// A local style file failure with its original structured cause.
+    #[error("style {id} at {}: {source}", path.display())]
+    StyleFile {
+        id: String,
+        path: std::path::PathBuf,
+        #[source]
+        source: Arc<MaptileError>,
+    },
+
     #[error("source temporarily unavailable: {0}")]
     SourceUnavailable(String),
 

@@ -324,6 +324,11 @@ impl SourceManager {
     /// from the report are removed, including unavailable records. The returned
     /// [`crate::watch::ReloadDelta`] lists the ids that were added /
     /// removed in this call.
+    /// Duplicate discovered ids return `Config` before any factory is called
+    /// or registry entries are changed, even when the duplicate id is ready.
+    /// Each factory result must retain the discovered id; a mismatch returns
+    /// `Config` and starts closing unpublished sources built by this call.
+    /// Factory results that are still registered as the same `Arc` stay open.
     /// All new sources are built before applying changes. A failed or cancelled
     /// build starts closing unpublished sources and leaves this call's changes
     /// unapplied. The apply phase is not a transaction across concurrent writers.
@@ -342,6 +347,15 @@ impl SourceManager {
     {
         use std::collections::BTreeSet;
 
+        let mut target = BTreeSet::new();
+        for source in &report.sources {
+            if !target.insert(source.id.clone()) {
+                return Err(MaptileError::Config(format!(
+                    "duplicate discovered source id: {}",
+                    source.id
+                )));
+            }
+        }
         let mut current = BTreeSet::new();
         let mut ready = BTreeSet::new();
         for entry in &self.sources {
@@ -350,8 +364,6 @@ impl SourceManager {
                 ready.insert(entry.key().clone());
             }
         }
-        let target: BTreeSet<String> = report.sources.iter().map(|s| s.id.clone()).collect();
-
         let mut pending = PendingSources {
             sources: Vec::new(),
             manager: self,
@@ -359,7 +371,14 @@ impl SourceManager {
         for src in &report.sources {
             if !ready.contains(&src.id) {
                 let built = factory(src).await?;
+                let matches_id = built.id() == src.id;
                 pending.sources.push(built);
+                if !matches_id {
+                    return Err(MaptileError::Config(format!(
+                        "source factory returned a different id for {}",
+                        src.id
+                    )));
+                }
             }
         }
         let mut delta = crate::watch::ReloadDelta::default();
@@ -1732,6 +1751,91 @@ mod tests {
         assert!(!manager.is_unavailable("retry"));
         let recovered: Arc<dyn TileSource> = recovered;
         assert!(Arc::ptr_eq(&manager.require("retry").unwrap(), &recovered));
+    }
+
+    #[tokio::test]
+    async fn duplicate_discovered_ids_fail_before_factory_calls_or_registry_changes() {
+        for duplicate in ["new", "ready", "unavailable"] {
+            let manager = SourceManager::new();
+            let (old, closed) = closing_source("ready");
+            manager.register(old.clone());
+            manager.mark_unavailable("unavailable");
+            manager.mark_unavailable("obsolete");
+            let mut report = discovery_report(&["fresh", duplicate, duplicate]);
+            report.sources.last_mut().unwrap().path = "/tmp/another-file.pmtiles".into();
+            let factory_calls = AtomicUsize::new(0);
+            let result = manager
+                .reload_from_discovery(&report, |_| {
+                    factory_calls.fetch_add(1, Ordering::SeqCst);
+                    async { Err(MaptileError::Config("factory must not be called".into())) }
+                })
+                .await;
+            assert!(matches!(
+                result,
+                Err(MaptileError::Config(message))
+                    if message == format!("duplicate discovered source id: {duplicate}")
+            ));
+            assert_eq!(factory_calls.load(Ordering::SeqCst), 0);
+            let old: Arc<dyn TileSource> = old;
+            assert!(Arc::ptr_eq(&manager.require("ready").unwrap(), &old));
+            assert_eq!(closed.load(Ordering::SeqCst), 0);
+            assert_eq!(manager.list_ids(), ["ready"]);
+            assert!(manager.is_unavailable("unavailable"));
+            assert!(manager.is_unavailable("obsolete"));
+        }
+    }
+
+    #[tokio::test]
+    async fn mismatched_factory_id_keeps_registry_and_closes_every_unpublished_source() {
+        let manager = SourceManager::new();
+        let (old, old_closed) = closing_source("wrong");
+        manager.register(old.clone());
+        manager.mark_unavailable("requested");
+        let (good, good_closed) = closing_source("good");
+        let (wrong, wrong_closed) = closing_source("wrong");
+        let result = manager
+            .reload_from_discovery(&discovery_report(&["good", "requested"]), |source| {
+                let built = if source.id == "good" {
+                    good.clone()
+                } else {
+                    wrong.clone()
+                };
+                async move { Ok(built as Arc<dyn TileSource>) }
+            })
+            .await;
+        assert!(matches!(result, Err(MaptileError::Config(_))));
+        let old: Arc<dyn TileSource> = old;
+        assert!(Arc::ptr_eq(&manager.require("wrong").unwrap(), &old));
+        assert!(manager.is_unavailable("requested"));
+        assert!(manager.get("good").is_none());
+        assert_eq!(old_closed.load(Ordering::SeqCst), 0);
+        assert_eq!(good_closed.load(Ordering::SeqCst), 1);
+        assert_eq!(wrong_closed.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn mismatched_factory_id_does_not_close_a_registered_instance() {
+        let manager = SourceManager::new();
+        let (old, old_closed) = closing_source("old");
+        manager.register(old.clone());
+        let (good, good_closed) = closing_source("good");
+        let result = manager
+            .reload_from_discovery(&discovery_report(&["good", "requested"]), |source| {
+                let built = if source.id == "good" {
+                    good.clone()
+                } else {
+                    old.clone()
+                };
+                async move { Ok(built as Arc<dyn TileSource>) }
+            })
+            .await;
+        assert!(matches!(result, Err(MaptileError::Config(_))));
+        let old: Arc<dyn TileSource> = old;
+        assert!(Arc::ptr_eq(&manager.require("old").unwrap(), &old));
+        assert_eq!(old_closed.load(Ordering::SeqCst), 0);
+        assert_eq!(good_closed.load(Ordering::SeqCst), 1);
+        assert!(manager.get("good").is_none());
+        assert!(manager.get("requested").is_none());
     }
 
     #[tokio::test]

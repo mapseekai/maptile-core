@@ -7,7 +7,10 @@
 
 use crate::error::{MaptileError, MaptileResult};
 use serde_json::Value;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use tokio::io::AsyncReadExt;
+
+const MAX_STYLE_BYTES: usize = 16 * 1024 * 1024;
 
 /// One loaded map style.
 #[derive(Debug, Clone)]
@@ -31,7 +34,10 @@ pub trait StyleStore: Send + Sync + 'static {
 /// from [`crate::discovery::scan`]).
 ///
 /// Unknown IDs return [`MaptileError::StyleNotFound`]. Filesystem and JSON
-/// failures retain their sources as [`MaptileError::Io`] and [`MaptileError::Json`].
+/// failures return [`MaptileError::StyleFile`] with the ID, path and original
+/// [`MaptileError::Io`] or [`MaptileError::Json`] cause. Only regular files up to
+/// 16 MiB are accepted; larger files return a [`MaptileError::PayloadTooLarge`]
+/// cause with the same style context.
 pub struct LocalStyleStore {
     entries: std::collections::HashMap<String, PathBuf>,
 }
@@ -45,7 +51,10 @@ impl LocalStyleStore {
         let mut map = std::collections::HashMap::new();
         for (id, path) in entries {
             let id: String = id.into();
-            std::fs::metadata(&path)?;
+            std::fs::metadata(&path)
+                .map_err(MaptileError::from)
+                .and_then(|metadata| validate_style_file(&metadata))
+                .map_err(|error| style_file_error(&id, &path, error))?;
             map.insert(id, path);
         }
         Ok(Self { entries: map })
@@ -61,8 +70,11 @@ impl StyleStore for LocalStyleStore {
             .ok_or_else(|| MaptileError::StyleNotFound(id.to_string()))?
             .clone();
 
-        let raw = tokio::fs::read(&path).await?;
-        let value: Value = serde_json::from_slice(&raw)?;
+        let raw = read_regular_file(&path)
+            .await
+            .map_err(|error| style_file_error(id, &path, error))?;
+        let value: Value =
+            serde_json::from_slice(&raw).map_err(|error| style_file_error(id, &path, error))?;
         let name = value
             .get("name")
             .and_then(|v| v.as_str())
@@ -83,23 +95,89 @@ impl StyleStore for LocalStyleStore {
     }
 }
 
+fn style_file_error(id: &str, path: &Path, source: impl Into<MaptileError>) -> MaptileError {
+    MaptileError::StyleFile {
+        id: id.to_owned(),
+        path: path.to_owned(),
+        source: std::sync::Arc::new(source.into()),
+    }
+}
+
+fn validate_style_file(metadata: &std::fs::Metadata) -> MaptileResult<()> {
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "style path must refer to a regular file",
+        )
+        .into());
+    }
+    if metadata.len() > MAX_STYLE_BYTES as u64 {
+        return Err(MaptileError::PayloadTooLarge {
+            limit: MAX_STYLE_BYTES,
+        });
+    }
+    Ok(())
+}
+
+async fn read_regular_file(path: &Path) -> MaptileResult<Vec<u8>> {
+    let mut options = tokio::fs::OpenOptions::new();
+    options.read(true);
+    // A path replaced with a FIFO must not block open before we can inspect its handle.
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NONBLOCK);
+    let mut file = options.open(path).await?;
+    validate_style_file(&file.metadata().await?)?;
+    read_style_bytes(&mut file).await
+}
+
+async fn read_style_bytes(file: &mut tokio::fs::File) -> MaptileResult<Vec<u8>> {
+    let mut bytes = Vec::new();
+    // The file may grow after its metadata was checked.
+    file.take(MAX_STYLE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .await?;
+    if bytes.len() > MAX_STYLE_BYTES {
+        return Err(MaptileError::PayloadTooLarge {
+            limit: MAX_STYLE_BYTES,
+        });
+    }
+    Ok(bytes)
+}
+
 /// Rewrite relative URLs (paths starting with `/`) inside a style JSON to
 /// absolute URLs prefixed with `base_url`. Targets the standard MapLibre
 /// fields: `sources[*].url`, `sources[*].tiles[*]`, `glyphs`, `sprite`.
 ///
-/// `query_string` (if non-empty) is appended to every rewritten URL — useful
-/// for forwarding API keys (`?key=...`).
+/// A `query_string` starting with `?` or `&` is merged into each URL's
+/// query before its fragment, without escaping or rewriting placeholders.
+/// Supply already encoded parameter values (`#` in a value must be `%23`).
+/// Other suffixes retain the legacy behavior of appending verbatim.
 pub fn rewrite_urls(style: &Value, base_url: &str, query_string: &str) -> Value {
     let mut style = style.clone();
-    let qs = query_string.to_string();
     let base_url = base_url.trim_end_matches('/').to_string();
 
     let rewrite = move |url: &str| -> Option<String> {
-        if url.starts_with('/') {
-            Some(format!("{base_url}{url}{qs}"))
-        } else {
-            None
+        if !url.starts_with('/') {
+            return None;
         }
+        let Some(query) = query_string
+            .strip_prefix('?')
+            .or_else(|| query_string.strip_prefix('&'))
+        else {
+            return Some(format!("{base_url}{url}{query_string}"));
+        };
+        if query.is_empty() {
+            return Some(format!("{base_url}{url}"));
+        }
+        let (resource, fragment) = url.split_at(url.find('#').unwrap_or(url.len()));
+        let separator = if !resource.contains('?') {
+            "?"
+        } else if resource.ends_with(['?', '&']) {
+            ""
+        } else {
+            "&"
+        };
+        Some(format!("{base_url}{resource}{separator}{query}{fragment}"))
     };
 
     if let Some(sources) = style.get_mut("sources").and_then(Value::as_object_mut) {
@@ -306,6 +384,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn style_size_limit_accepts_boundary_and_preserves_context_when_exceeded() {
+        use std::io::Write;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("style.json");
+        let mut bytes = vec![b' '; MAX_STYLE_BYTES];
+        bytes[..2].copy_from_slice(b"{}");
+        write(&path, &bytes);
+        let store = LocalStyleStore::new([("bounded", path.clone())]).unwrap();
+        assert_eq!(store.get("bounded").await.unwrap().value, json!({}));
+
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b" ")
+            .unwrap();
+        let manager = crate::sources::manager::SourceManager::new();
+        for error in [
+            LocalStyleStore::new([("bounded", path.clone())])
+                .err()
+                .unwrap(),
+            store.get("bounded").await.unwrap_err(),
+            manager
+                .snapshot_catalog(Some(&store), None)
+                .await
+                .unwrap_err(),
+        ] {
+            assert!(matches!(
+                error,
+                MaptileError::StyleFile { id, path: failed_path, source }
+                    if id == "bounded" && failed_path == path
+                        && matches!(source.as_ref(), MaptileError::PayloadTooLarge { limit } if *limit == MAX_STYLE_BYTES)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn growth_after_metadata_validation_is_bounded() {
+        use tokio::io::AsyncSeekExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("growing.json");
+        write(&path, b"{}");
+        let mut file = tokio::fs::File::open(&path).await.unwrap();
+        validate_style_file(&file.metadata().await.unwrap()).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(4 * MAX_STYLE_BYTES as u64)
+            .unwrap();
+        assert!(matches!(
+            read_style_bytes(&mut file).await,
+            Err(MaptileError::PayloadTooLarge { limit }) if limit == MAX_STYLE_BYTES
+        ));
+        assert_eq!(
+            file.stream_position().await.unwrap(),
+            MAX_STYLE_BYTES as u64 + 1
+        );
+    }
+
+    #[tokio::test]
     async fn unknown_id_is_style_not_found() {
         let store = LocalStyleStore::new::<Vec<(&str, PathBuf)>, &str>(vec![]).unwrap();
         let res = store.get("nope").await;
@@ -318,7 +459,9 @@ mod tests {
         let result = LocalStyleStore::new([("missing", tmp.path().join("missing.json"))]);
         assert!(matches!(
             result,
-            Err(MaptileError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound
+            Err(MaptileError::StyleFile { id, path, source })
+                if id == "missing" && path == tmp.path().join("missing.json")
+                    && matches!(source.as_ref(), MaptileError::Io(error) if error.kind() == std::io::ErrorKind::NotFound)
         ));
     }
 
@@ -330,15 +473,24 @@ mod tests {
         let path = tmp.path().join("style.json");
         write(&path, br#"{"version":8}"#);
         let store = LocalStyleStore::new([("style", path.clone())]).unwrap();
-        fs::remove_file(path).unwrap();
+        fs::remove_file(&path).unwrap();
 
         let error = store.get("style").await.unwrap_err();
-        assert!(matches!(
-            &error,
-            MaptileError::Io(cause) if cause.kind() == std::io::ErrorKind::NotFound
-        ));
+        let MaptileError::StyleFile {
+            id,
+            path: failed_path,
+            source,
+        } = &error
+        else {
+            panic!("{error:?}")
+        };
+        assert_eq!(id, "style");
+        assert_eq!(failed_path, &path);
+        assert!(
+            matches!(source.as_ref(), MaptileError::Io(cause) if cause.kind() == std::io::ErrorKind::NotFound)
+        );
         assert_eq!(
-            error
+            source
                 .source()
                 .unwrap()
                 .downcast_ref::<std::sync::Arc<std::io::Error>>()
@@ -355,17 +507,93 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("style.json");
         write(&path, b"{\n  invalid\n}");
-        let store = LocalStyleStore::new([("style", path)]).unwrap();
+        let store = LocalStyleStore::new([("style", path.clone())]).unwrap();
 
         let error = store.get("style").await.unwrap_err();
-        assert!(matches!(&error, MaptileError::Json(cause) if cause.is_syntax()));
-        let cause = error
+        let MaptileError::StyleFile {
+            id,
+            path: failed_path,
+            source,
+        } = &error
+        else {
+            panic!("{error:?}")
+        };
+        assert_eq!(id, "style");
+        assert_eq!(failed_path, &path);
+        assert!(matches!(source.as_ref(), MaptileError::Json(cause) if cause.is_syntax()));
+        let cause = source
             .source()
             .unwrap()
             .downcast_ref::<std::sync::Arc<serde_json::Error>>()
             .unwrap();
         assert_eq!(cause.line(), 2);
         assert!(cause.column() > 0);
+    }
+
+    #[tokio::test]
+    async fn catalog_error_keeps_style_context_and_structured_cause() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("broken-style.json");
+        write(&path, b"{invalid");
+        let store = LocalStyleStore::new([("broken-id", path.clone())]).unwrap();
+        let manager = crate::sources::manager::SourceManager::new();
+        let error = manager
+            .snapshot_catalog(Some(&store), None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("broken-id"));
+        assert!(error.to_string().contains(path.to_str().unwrap()));
+        assert!(
+            matches!(error, MaptileError::StyleFile { source, .. } if matches!(source.as_ref(), MaptileError::Json(_)))
+        );
+    }
+
+    #[tokio::test]
+    async fn directories_are_rejected_at_construction_and_after_replacement() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(
+            matches!(LocalStyleStore::new([("dir", tmp.path().to_owned())]), Err(MaptileError::StyleFile { source, .. }) if matches!(source.as_ref(), MaptileError::Io(error) if error.kind() == std::io::ErrorKind::InvalidInput))
+        );
+        let path = tmp.path().join("style.json");
+        write(&path, b"{}");
+        let store = LocalStyleStore::new([("style", path.clone())]).unwrap();
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(matches!(
+            store.get("style").await,
+            Err(MaptileError::StyleFile { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_replacement_is_rejected_without_a_writer_and_symlinks_still_work() {
+        use std::os::unix::ffi::OsStrExt;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("style.json");
+        write(&path, b"{}");
+        let link = tmp.path().join("link.json");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        let store = LocalStyleStore::new([("style", link.clone())]).unwrap();
+        assert!(runtime.block_on(store.get("style")).is_ok());
+        fs::remove_file(&path).unwrap();
+        let fifo_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: fifo_path is a valid NUL-terminated path in this test's private directory.
+        assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
+        assert!(LocalStyleStore::new([("fifo", path)]).is_err());
+        let result = runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(1), store.get("style")).await
+        });
+        // A regression must fail the test instead of hanging runtime shutdown on a blocked FIFO.
+        runtime.shutdown_timeout(std::time::Duration::from_secs(1));
+        let result = result.unwrap();
+        assert!(
+            matches!(result, Err(MaptileError::StyleFile { source, .. }) if matches!(source.as_ref(), MaptileError::Io(error) if error.kind() == std::io::ErrorKind::InvalidInput))
+        );
     }
 
     #[test]
@@ -419,6 +647,61 @@ mod tests {
         let style = json!({ "sprite": "/sprite" });
         let out = rewrite_urls(&style, "https://example.com/", "");
         assert_eq!(out["sprite"], json!("https://example.com/sprite"));
+    }
+
+    #[test]
+    fn rewrite_merges_each_query_before_fragment_without_escaping_templates() {
+        let style = json!({
+            "sources": {
+                "local": { "url": "/data/a.json?v=1#meta", "tiles": [
+                    "/tiles/{z}/{x}/{y}.pbf#tile", "/tiles/b?", "/tiles/c?v=1&", "/tiles/d"
+                ] },
+                "remote": { "url": "https://remote/data?x=1#remote" }
+            },
+            "glyphs": "/fonts/{fontstack}/{range}.pbf?font=x#glyphs",
+            "sprite": "/sprite#?fragment"
+        });
+        for suffix in ["?key=a%23b", "&key=a%23b"] {
+            let out = rewrite_urls(&style, "https://example.com/", suffix);
+            assert_eq!(
+                out["sources"]["local"]["url"],
+                "https://example.com/data/a.json?v=1&key=a%23b#meta"
+            );
+            assert_eq!(
+                out["sources"]["local"]["tiles"],
+                json!([
+                    "https://example.com/tiles/{z}/{x}/{y}.pbf?key=a%23b#tile",
+                    "https://example.com/tiles/b?key=a%23b",
+                    "https://example.com/tiles/c?v=1&key=a%23b",
+                    "https://example.com/tiles/d?key=a%23b"
+                ])
+            );
+            assert_eq!(out["sources"]["remote"], style["sources"]["remote"]);
+            assert_eq!(
+                out["glyphs"],
+                "https://example.com/fonts/{fontstack}/{range}.pbf?font=x&key=a%23b#glyphs"
+            );
+            assert_eq!(
+                out["sprite"],
+                "https://example.com/sprite?key=a%23b#?fragment"
+            );
+        }
+    }
+
+    #[test]
+    fn rewrite_preserves_non_query_suffixes_and_empty_queries() {
+        for suffix in ["", "?", "&", ".json", "#preview"] {
+            let expected_suffix = if matches!(suffix, "?" | "&") {
+                ""
+            } else {
+                suffix
+            };
+            let out = rewrite_urls(&json!({"sprite": "/sprite"}), "https://example.com", suffix);
+            assert_eq!(
+                out["sprite"],
+                format!("https://example.com/sprite{expected_suffix}")
+            );
+        }
     }
 
     // === rewrite_style_for_native ===

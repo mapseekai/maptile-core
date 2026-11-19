@@ -50,7 +50,8 @@ pub struct PostgresPool {
     postgres_version: Version,
     postgis_version: Version,
     supports_tile_margin: bool,
-    ssl_mode: SslMode,
+    // Connections and cancellation share the trust snapshot loaded at pool creation.
+    tls_config: Option<rustls::ClientConfig>,
     pub(super) database_identity: ContentVersion,
 }
 
@@ -70,7 +71,11 @@ impl PostgresPool {
             pg_config.get_options().unwrap_or_default()
         ));
 
-        let pool = build_pool(pg_config.clone(), &settings)?;
+        let tls_config = match pg_config.get_ssl_mode() {
+            SslMode::Disable => None,
+            _ => Some(build_rustls_config()?),
+        };
+        let pool = build_pool(pg_config.clone(), &settings, tls_config.as_ref())?;
 
         // Probe versions from a connection acquired from the pool — also
         // validates connectivity at startup time.
@@ -118,7 +123,7 @@ impl PostgresPool {
             postgres_version,
             postgis_version,
             supports_tile_margin,
-            ssl_mode: pg_config.get_ssl_mode(),
+            tls_config,
             database_identity,
         })
     }
@@ -147,10 +152,15 @@ impl PostgresPool {
     }
 
     pub(crate) async fn cancel_query(&self, token: CancelToken) -> MaptileResult<()> {
-        match self.ssl_mode {
-            SslMode::Disable | SslMode::Prefer => token.cancel_query(NoTls).await,
-            SslMode::Require => token.cancel_query(build_rustls_connector(false)?).await,
-            _ => token.cancel_query(build_rustls_connector(true)?).await,
+        match &self.tls_config {
+            None => token.cancel_query(NoTls).await,
+            Some(config) => {
+                token
+                    .cancel_query(tokio_postgres_rustls::MakeRustlsConnect::new(
+                        config.clone(),
+                    ))
+                    .await
+            }
         }
         .map_err(MaptileError::backend)
     }
@@ -258,23 +268,22 @@ async fn wait_for_ready(connection: &Client) -> Result<(), tokio_postgres::Error
     Ok(())
 }
 
-fn build_pool(pg_config: Config, settings: &PoolSettings) -> MaptileResult<Pool> {
+fn build_pool(
+    pg_config: Config,
+    settings: &PoolSettings,
+    tls_config: Option<&rustls::ClientConfig>,
+) -> MaptileResult<Pool> {
     let mgr_config = ManagerConfig {
         recycling_method: RecyclingMethod::Fast,
     };
 
-    let mgr = match pg_config.get_ssl_mode() {
-        SslMode::Disable | SslMode::Prefer => Manager::from_config(pg_config, NoTls, mgr_config),
-        SslMode::Require => {
-            let connector = build_rustls_connector(false)?;
-            Manager::from_config(pg_config, connector, mgr_config)
-        }
-        // VerifyCa / VerifyFull and any future variants both want a real cert
-        // chain; rustls-native-certs supplies the platform store.
-        _ => {
-            let connector = build_rustls_connector(true)?;
-            Manager::from_config(pg_config, connector, mgr_config)
-        }
+    let mgr = match tls_config {
+        None => Manager::from_config(pg_config, NoTls, mgr_config),
+        Some(config) => Manager::from_config(
+            pg_config,
+            tokio_postgres_rustls::MakeRustlsConnect::new(config.clone()),
+            mgr_config,
+        ),
     };
 
     let timeouts = Timeouts {
@@ -293,9 +302,7 @@ fn build_pool(pg_config: Config, settings: &PoolSettings) -> MaptileResult<Pool>
         .map_err(|e| MaptileError::Config(format!("pool build: {e}")))
 }
 
-fn build_rustls_connector(
-    _strict_hostname: bool,
-) -> MaptileResult<tokio_postgres_rustls::MakeRustlsConnect> {
+fn build_rustls_config() -> MaptileResult<rustls::ClientConfig> {
     let mut roots = rustls::RootCertStore::empty();
     let native = rustls_native_certs::load_native_certs();
     if native.certs.is_empty() && !native.errors.is_empty() {
@@ -307,10 +314,14 @@ fn build_rustls_connector(
     for cert in native.certs {
         let _ = roots.add(cert);
     }
-    let cfg = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    Ok(tokio_postgres_rustls::MakeRustlsConnect::new(cfg))
+    let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(|e| MaptileError::Config(format!("TLS protocol versions: {e}")))?
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    Ok(cfg)
 }
 
 async fn probe_postgres_version(conn: &Object) -> MaptileResult<Version> {

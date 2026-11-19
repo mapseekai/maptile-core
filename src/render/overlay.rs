@@ -61,69 +61,53 @@ pub enum OverlayItem {
 /// <https://developers.google.com/maps/documentation/utilities/polylinealgorithm>.
 ///
 /// Note: Google's format is `(lat, lon)` but we return `GeoPoint` with
-/// `(lon, lat)` for GeoJSON compatibility.
+/// `(lon, lat)` for GeoJSON compatibility. Invalid, truncated or overflowing
+/// input returns the complete points decoded before the invalid pair.
 #[must_use]
 pub fn decode_polyline(encoded: &str) -> Vec<GeoPoint> {
     // Pre-size: each (dlat, dlng) pair uses ≈ 6–8 bytes of input. Floor
     // division gives a safe lower bound that avoids the first realloc
     // for typical inputs without over-allocating for short ones.
     let mut points = Vec::with_capacity(encoded.len() / 8);
-    let mut index = 0;
+    let mut bytes = encoded.bytes();
     let mut lat = 0i64;
     let mut lng = 0i64;
-
-    let bytes = encoded.as_bytes();
-
-    while index < bytes.len() {
-        let mut shift = 0;
-        let mut result = 0i64;
-        loop {
-            if index >= bytes.len() {
-                return points;
-            }
-            let b = (bytes[index] as i64) - 63;
-            index += 1;
-            result |= (b & 0x1f) << shift;
-            shift += 5;
-            if b < 0x20 {
-                break;
-            }
-        }
-        let dlat = if (result & 1) != 0 {
-            !(result >> 1)
-        } else {
-            result >> 1
+    while let (Some(dlat), Some(dlng)) = (
+        decode_polyline_value(&mut bytes),
+        decode_polyline_value(&mut bytes),
+    ) {
+        let (Some(next_lat), Some(next_lng)) = (lat.checked_add(dlat), lng.checked_add(dlng))
+        else {
+            break;
         };
-        lat += dlat;
-
-        shift = 0;
-        result = 0;
-        loop {
-            if index >= bytes.len() {
-                return points;
-            }
-            let b = (bytes[index] as i64) - 63;
-            index += 1;
-            result |= (b & 0x1f) << shift;
-            shift += 5;
-            if b < 0x20 {
-                break;
-            }
-        }
-        let dlng = if (result & 1) != 0 {
-            !(result >> 1)
-        } else {
-            result >> 1
-        };
-        lng += dlng;
-
+        lat = next_lat;
+        lng = next_lng;
         points.push(GeoPoint {
             lon: lng as f64 / 1e5,
             lat: lat as f64 / 1e5,
         });
     }
-
     points
+}
+
+fn decode_polyline_value(bytes: &mut impl Iterator<Item = u8>) -> Option<i64> {
+    let mut value = 0u64;
+    for shift in (0..64).step_by(5) {
+        let byte = bytes.next()?;
+        if !(63..=126).contains(&byte) {
+            return None;
+        }
+        let chunk = u64::from(byte - 63);
+        let payload = chunk & 0x1f;
+        if payload > (u64::MAX >> shift) {
+            return None;
+        }
+        value |= payload << shift;
+        if chunk < 0x20 {
+            return Some((value >> 1) as i64 ^ -((value & 1) as i64));
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -201,9 +185,8 @@ pub fn parse_path(path_str: &str, latlng: bool) -> Option<PathOverlay> {
     if let Some(encoded) = path_str.strip_prefix("enc:") {
         points = decode_polyline(encoded);
     } else if let Some(rest) = path_str.strip_prefix("path-") {
-        if let Some(paren_idx) = rest.find('(') {
-            let style_part = &rest[..paren_idx];
-            let coords_part = &rest[paren_idx + 1..rest.len() - 1];
+        if let Some((style_part, coords)) = rest.split_once('(') {
+            let coords_part = coords.strip_suffix(')')?;
 
             let mut parts = style_part.split('+');
             if let Some(first) = parts.next() {
@@ -262,10 +245,9 @@ pub fn parse_marker(marker_str: &str) -> Option<MarkerOverlay> {
     let mut color = Rgba([255, 0, 0, 255]);
     let mut size = 24.0f32;
 
-    if marker_str.starts_with("pin-") {
-        if let Some(paren_idx) = marker_str.find('(') {
-            let style_part = &marker_str[4..paren_idx];
-            let coords_part = &marker_str[paren_idx + 1..marker_str.len() - 1];
+    if let Some(rest) = marker_str.strip_prefix("pin-") {
+        if let Some((style_part, coords)) = rest.split_once('(') {
+            let coords_part = coords.strip_suffix(')')?;
 
             let mut parts = style_part.split('+');
             if let Some(size_label_part) = parts.next() {
@@ -311,6 +293,9 @@ pub fn parse_marker(marker_str: &str) -> Option<MarkerOverlay> {
 /// Parse a hex color string (3, 4, 6, or 8 digits) with optional `#` prefix.
 fn parse_hex_color(hex: &str) -> Option<Rgba<u8>> {
     let hex = hex.trim_start_matches('#');
+    if !hex.is_ascii() {
+        return None;
+    }
     match hex.len() {
         3 => {
             let r = u8::from_str_radix(&hex[0..1], 16).ok()? * 17;
@@ -975,6 +960,53 @@ fn coords_to_geopoints(arr: &[Value]) -> Vec<GeoPoint> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn malformed_overlay_strings_do_not_panic() {
+        for path in ["path-red(", "path-(é", "path-", "path-3(0,0|1,1"] {
+            assert!(parse_path(path, false).is_none(), "{path}");
+        }
+        for marker in ["pin-l(", "pin-(é", "pin-", "pin-l(0,0"] {
+            assert!(parse_marker(marker).is_none(), "{marker}");
+        }
+        for color in ["éa", "éaa", "éaaaa", "éaaaaaa", "中", "💩"] {
+            assert!(parse_hex_color(color).is_none());
+            let path = parse_path(&format!("path-3+{color}(0,0|1,1)"), false).unwrap();
+            assert_eq!(path.stroke_color, Rgba([0, 0, 255, 255]));
+            let marker = parse_marker(&format!("pin-l+{color}(0,0)")).unwrap();
+            assert_eq!(marker.color, Rgba([255, 0, 0, 255]));
+        }
+    }
+
+    #[test]
+    fn invalid_polyline_stops_at_complete_prefix_and_checks_integer_bounds() {
+        for invalid in [
+            "~".repeat(100_000),
+            "é".into(),
+            "!".into(),
+            "_".into(),
+            "?".into(),
+        ] {
+            assert!(decode_polyline(&invalid).is_empty());
+            let points = decode_polyline(&format!("??{invalid}"));
+            assert_eq!(points.len(), 1);
+            assert_eq!((points[0].lon, points[0].lat), (0.0, 0.0));
+        }
+        // Twelve continuation groups plus a final nibble fill u64 exactly.
+        let max_delta = format!("}}{}N", "~".repeat(11));
+        let min_delta = format!("{}N", "~".repeat(12));
+        assert_eq!(
+            decode_polyline(&format!("{max_delta}?{max_delta}?")).len(),
+            1
+        );
+        assert_eq!(
+            decode_polyline(&format!("{min_delta}?{min_delta}?")).len(),
+            1
+        );
+        // A thirteenth group with five payload bits cannot fit u64.
+        assert!(decode_polyline(&format!("{}^?", "~".repeat(12))).is_empty());
+        assert!(parse_path(&format!("enc:{}", "~".repeat(100_000)), false).is_none());
+    }
 
     #[test]
     fn clips_long_segments_to_the_viewport_before_rasterization() {

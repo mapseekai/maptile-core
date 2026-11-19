@@ -67,7 +67,13 @@ impl AlgorithmFixture {
     async fn from_values(values: &[&[u8]]) -> Self {
         let dir = tempfile::tempdir().expect("temp fixture directory");
         for (index, value) in values.iter().enumerate() {
-            write_constant_geotiff(dir.path(), &format!("value-{index}.tif"), value);
+            write_constant_geotiff(
+                dir.path(),
+                &format!("value-{index}.tif"),
+                value,
+                [-180.0, -85.051_128_78, 180.0, 85.051_128_78],
+                4326,
+            );
         }
 
         let members = values
@@ -143,7 +149,13 @@ impl AlgorithmFixture {
     }
 }
 
-fn write_constant_geotiff(dir: &std::path::Path, name: &str, values: &[u8]) {
+fn write_constant_geotiff(
+    dir: &std::path::Path,
+    name: &str,
+    values: &[u8],
+    [west, south, east, north]: [f64; 4],
+    srid: u32,
+) {
     let path = dir.join(name);
     let driver = DriverManager::get_driver_by_name("GTiff").expect("GTiff driver");
     let options = RasterCreationOptions::from_iter([
@@ -155,12 +167,18 @@ fn write_constant_geotiff(dir: &std::path::Path, name: &str, values: &[u8]) {
     let mut dataset = driver
         .create_with_band_type_with_options::<u8, _>(&path, 256, 256, values.len(), &options)
         .expect("create tiled GeoTIFF");
-    let north = 85.051_128_78;
     dataset
-        .set_geo_transform(&[-180.0, 360.0 / 256.0, 0.0, north, 0.0, -2.0 * north / 256.0])
+        .set_geo_transform(&[
+            west,
+            (east - west) / 256.0,
+            0.0,
+            north,
+            0.0,
+            (south - north) / 256.0,
+        ])
         .expect("set fixture geotransform");
     dataset
-        .set_spatial_ref(&SpatialRef::from_epsg(4326).expect("EPSG:4326"))
+        .set_spatial_ref(&SpatialRef::from_epsg(srid).expect("fixture CRS"))
         .expect("set fixture CRS");
     for (index, value) in values.iter().enumerate() {
         let mut pixels = Buffer::new((256, 256), vec![*value; 256 * 256]);
@@ -314,6 +332,152 @@ async fn tile_info_defaults_to_webp() {
 }
 
 #[tokio::test]
+async fn large_mosaic_filters_before_cap_and_ignores_distant_broken_assets() {
+    let dir = tempfile::tempdir().unwrap();
+    let local = [0.0, 0.0, 22.5, 21.943_045_533_438_177];
+    let distant = [-120.0, -40.0, -100.0, -20.0];
+    // The only intersecting TIFF is projected; member extents remain WGS84.
+    write_constant_geotiff(
+        dir.path(),
+        "local.tif",
+        &[73],
+        [0.0, 0.0, 2_504_688.542_848_655_5, 2_504_688.542_848_655_5],
+        3857,
+    );
+    for i in 0..64 {
+        write_constant_geotiff(
+            dir.path(),
+            &format!("distant-{i}.tif"),
+            &[90],
+            distant,
+            4326,
+        );
+    }
+    let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    let make_config = |count: usize| {
+        let mut members = vec![MosaicMember {
+            url: "local.tif".into(),
+            source_id: "local".into(),
+            bbox_wgs84: local,
+        }];
+        members.extend((0..count).map(|i| MosaicMember {
+            url: format!("distant-{i}.tif"),
+            source_id: format!("distant-{i}"),
+            bbox_wgs84: distant,
+        }));
+        MosaicSourceConfig {
+            id: "large".into(),
+            members,
+            pixel_selection: MosaicPixelSelection::Mean,
+            bounds: Some([
+                -20_037_508.342_789_244,
+                -20_037_508.342_789_244,
+                20_037_508.342_789_244,
+                20_037_508.342_789_244,
+            ]),
+            srid: Some(3857),
+            store: Some(store.clone()),
+        }
+    };
+    let style = AlgorithmFixture::from_values(&[&[73]]).await.style;
+    let query = TileQuery {
+        style: Some(&style),
+        ..Default::default()
+    };
+    let coord = TileCoord { z: 4, x: 8, y: 7 };
+    let single = MosaicSource::open(make_config(0), make_block_cache())
+        .await
+        .unwrap();
+    let expected = single.get_tile(coord, Some(&query)).await.unwrap().data;
+    let rgba = image::load_from_memory(&expected).unwrap().to_rgba8();
+    assert_eq!(rgba.get_pixel(128, 128).0, [73, 73, 73, 255]);
+
+    let large = MosaicSource::open(make_config(64), make_block_cache())
+        .await
+        .unwrap();
+    assert_eq!(
+        large.get_tile(coord, Some(&query)).await.unwrap().data,
+        expected
+    );
+    // A fresh source/cache proves the distant bad file is never opened.
+    std::fs::write(dir.path().join("distant-0.tif"), b"broken TIFF").unwrap();
+    let mut cfg = make_config(64);
+    cfg.members.push(MosaicMember {
+        url: "missing.tif".into(),
+        source_id: "missing".into(),
+        bbox_wgs84: distant,
+    });
+    let source = MosaicSource::open(cfg, make_block_cache()).await.unwrap();
+    assert_eq!(
+        source.get_tile(coord, Some(&query)).await.unwrap().data,
+        expected
+    );
+
+    // Truly overlapping candidates are still capped, even with a first reducer.
+    let mut cfg = make_config(64);
+    for member in &mut cfg.members {
+        member.bbox_wgs84 = local;
+    }
+    let source = MosaicSource::open(cfg, make_block_cache()).await.unwrap();
+    let error = source.get_tile(coord, Some(&query)).await.unwrap_err();
+    assert!(error.to_string().contains("exceeding limit 64"), "{error}");
+}
+
+#[tokio::test]
+async fn missing_member_bbox_remains_eligible_and_expands_union() {
+    let fixture = AlgorithmFixture::from_values(&[&[73]]).await;
+    let source = MosaicSource::open(
+        MosaicSourceConfig {
+            id: "unknown-extent".into(),
+            members: vec![MosaicMember {
+                url: "value-0.tif".into(),
+                source_id: "unknown".into(),
+                bbox_wgs84: [0.0; 4],
+            }],
+            pixel_selection: MosaicPixelSelection::First,
+            bounds: None,
+            srid: Some(3857),
+            store: Some(Arc::new(
+                LocalFileSystem::new_with_prefix(fixture._dir.path()).unwrap(),
+            )),
+        },
+        make_block_cache(),
+    )
+    .await
+    .unwrap();
+    let query = TileQuery {
+        style: Some(&fixture.style),
+        ..Default::default()
+    };
+    let coord = TileCoord { z: 0, x: 0, y: 0 };
+    assert_eq!(
+        source.get_tile(coord, Some(&query)).await.unwrap().data,
+        fixture
+            .source
+            .get_tile(coord, Some(&query))
+            .await
+            .unwrap()
+            .data
+    );
+    let b = source.tilejson().bounds.unwrap();
+    assert_eq!(
+        [b.left, b.bottom, b.right, b.top],
+        [-180.0, -90.0, 180.0, 90.0]
+    );
+}
+
+#[tokio::test]
+async fn member_extents_partition_content_versions() {
+    let a = MosaicSource::open(two_member_cfg(None), make_block_cache())
+        .await
+        .unwrap();
+    let mut cfg = two_member_cfg(None);
+    cfg.members[0].bbox_wgs84 = [-20.0, -20.0, -10.0, -10.0];
+    let b = MosaicSource::open(cfg, make_block_cache()).await.unwrap();
+    assert_ne!(a.content_version(), b.content_version());
+}
+
+#[tokio::test]
 async fn request_selection_executes_all_async_geotiff_reducers() {
     let fixture = AlgorithmFixture::new().await;
     let mut actual = Vec::new();
@@ -397,4 +561,266 @@ async fn native_mosaic_stage_rank_and_statistics_reach_the_renderer() {
         fixture.render_document(statistical).await,
         [128, 128, 128, 255]
     );
+}
+
+#[tokio::test]
+async fn near_full_member_longitude_span_renders_the_same_real_tile() {
+    let dir = tempfile::tempdir().unwrap();
+    write_constant_geotiff(
+        dir.path(),
+        "local.tif",
+        &[73],
+        [0.0, 0.0, 90.0, 66.51326044311186],
+        4326,
+    );
+    let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    let make_config = |east| MosaicSourceConfig {
+        id: "near-full".into(),
+        members: vec![MosaicMember {
+            url: "local.tif".into(),
+            source_id: "local".into(),
+            bbox_wgs84: [-190.0, -85.0, east, 85.0],
+        }],
+        pixel_selection: MosaicPixelSelection::First,
+        bounds: None,
+        srid: None,
+        store: Some(store.clone()),
+    };
+    let style = AlgorithmFixture::from_values(&[&[73]]).await.style;
+    let query = TileQuery {
+        style: Some(&style),
+        ..Default::default()
+    };
+    let coord = TileCoord { z: 2, x: 2, y: 1 };
+    let control = MosaicSource::open(make_config(170.0), make_block_cache())
+        .await
+        .unwrap();
+    let actual = MosaicSource::open(make_config(169.999_999_999_999_94), make_block_cache())
+        .await
+        .unwrap();
+    let expected = control.get_tile(coord, Some(&query)).await.unwrap().data;
+    assert_eq!(
+        image::load_from_memory(&expected)
+            .unwrap()
+            .to_rgba8()
+            .get_pixel(128, 128)
+            .0,
+        [73, 73, 73, 255]
+    );
+    assert_eq!(
+        actual.get_tile(coord, Some(&query)).await.unwrap().data,
+        expected
+    );
+}
+
+#[tokio::test]
+async fn explicit_wgs84_bounds_reject_out_of_domain_latitudes() {
+    for srid in [None, Some(4326), Some(0), Some(-1), Some(i32::MIN)] {
+        for bounds in [
+            [10.0, 100.0, 20.0, 120.0],
+            [-10.0, -200.0, 10.0, 200.0],
+            [0.0, (-90.0_f64).next_down(), 1.0, 0.0],
+            [0.0, 0.0, 1.0, 90.0_f64.next_up()],
+        ] {
+            let result = MosaicSource::open(
+                two_member_cfg_with_srid(Some(bounds), srid),
+                make_block_cache(),
+            )
+            .await;
+            match result {
+                Err(maptile_core::error::MaptileError::Config(_)) => {}
+                Ok(source) => panic!(
+                    "invalid WGS84 accepted for {srid:?}: {}",
+                    serde_json::to_string(source.tilejson()).unwrap()
+                ),
+                Err(error) => panic!("unexpected error: {error}"),
+            }
+        }
+    }
+    assert!(matches!(
+        MosaicSource::open(
+            two_member_cfg_with_srid(Some([10.0, 100.0, 20.0, 120.0]), Some(4269)),
+            make_block_cache()
+        )
+        .await,
+        Err(maptile_core::error::MaptileError::Config(_))
+    ));
+}
+
+#[tokio::test]
+async fn explicit_bounds_publish_ordered_tilejson_coordinates_and_center() {
+    let cases = [
+        ([-180.0, -90.0, 180.0, 90.0], [-180.0, -90.0, 180.0, 90.0]),
+        ([10.0, 90.0, 10.0, 90.0], [10.0, 90.0, 10.0, 90.0]),
+        ([180.0, -90.0, 180.0, -90.0], [180.0, -90.0, 180.0, -90.0]),
+        ([190.0, -10.0, 200.0, 10.0], [-170.0, -10.0, -160.0, 10.0]),
+        ([-200.0, -10.0, -190.0, 10.0], [160.0, -10.0, 170.0, 10.0]),
+        ([170.0, -10.0, 190.0, 10.0], [-180.0, -10.0, 180.0, 10.0]),
+        ([170.0, -10.0, -170.0, 10.0], [-180.0, -10.0, 180.0, 10.0]),
+        ([-190.0, -10.0, -180.0, 10.0], [170.0, -10.0, 180.0, 10.0]),
+        ([180.0, -10.0, 190.0, 10.0], [-180.0, -10.0, -170.0, 10.0]),
+        ([540.0, 10.0, 540.0, 10.0], [-180.0, 10.0, -180.0, 10.0]),
+        ([190.0, -10.0, 550.0, 10.0], [-180.0, -10.0, 180.0, 10.0]),
+        (
+            [f64::MAX / 2.0, 1.0, f64::MAX, 2.0],
+            [-180.0, 1.0, 180.0, 2.0],
+        ),
+    ];
+    for srid in [None, Some(4326), Some(0), Some(-1)] {
+        for (input, expected) in cases {
+            let source = MosaicSource::open(
+                two_member_cfg_with_srid(Some(input), srid),
+                make_block_cache(),
+            )
+            .await
+            .unwrap();
+            let tj = source.tilejson();
+            assert_eq!(tj.tilejson, "3.0.0");
+            let b = tj.bounds.unwrap();
+            assert_eq!(
+                [b.left, b.bottom, b.right, b.top],
+                expected,
+                "{srid:?} {input:?}"
+            );
+            let c = tj.center.unwrap();
+            assert!(c.longitude.is_finite() && (b.left..=b.right).contains(&c.longitude));
+            assert!(c.latitude.is_finite() && (b.bottom..=b.top).contains(&c.latitude));
+        }
+    }
+    let projected = MosaicSource::open(
+        two_member_cfg_with_srid(Some([10.0, 100.0, 20.0, 120.0]), Some(3857)),
+        make_block_cache(),
+    )
+    .await
+    .unwrap();
+    let b = projected.tilejson().bounds.unwrap();
+    assert!((0.0..1.0).contains(&b.top));
+    assert!((0.0..1.0).contains(&b.right));
+}
+
+#[tokio::test]
+async fn unwrapped_dateline_members_match_their_real_geotiff_extents() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    let p = 180.0_f64;
+    let style = AlgorithmFixture::from_values(&[&[73]]).await.style;
+    let query = TileQuery {
+        style: Some(&style),
+        ..Default::default()
+    };
+    for (name, geometry, unwrapped) in [
+        (
+            "east-ulp",
+            [p.next_down(), -10.0, p, 10.0],
+            [(-p).next_down(), -10.0, -p, 10.0],
+        ),
+        (
+            "west-ulp",
+            [-p, -10.0, (-p).next_up(), 10.0],
+            [p, -10.0, p.next_up(), 10.0],
+        ),
+        (
+            "east-wide",
+            [170.0, -10.0, 180.0, 10.0],
+            [-190.0, -10.0, -180.0, 10.0],
+        ),
+        (
+            "west-wide",
+            [-180.0, -10.0, -170.0, 10.0],
+            [180.0, -10.0, 190.0, 10.0],
+        ),
+    ] {
+        let filename = format!("{name}.tif");
+        write_constant_geotiff(dir.path(), &filename, &[73], geometry, 4326);
+        let config = |bbox_wgs84| MosaicSourceConfig {
+            id: name.into(),
+            members: vec![MosaicMember {
+                url: filename.clone(),
+                source_id: name.into(),
+                bbox_wgs84,
+            }],
+            pixel_selection: MosaicPixelSelection::First,
+            bounds: None,
+            srid: None,
+            store: Some(store.clone()),
+        };
+        let actual = MosaicSource::open(config(unwrapped), make_block_cache())
+            .await
+            .unwrap();
+        let control = MosaicSource::open(config(geometry), make_block_cache())
+            .await
+            .unwrap();
+        assert_eq!(
+            actual.tilejson().bounds,
+            control.tilejson().bounds,
+            "{name}"
+        );
+        assert_eq!(
+            actual.content_version(),
+            control.content_version(),
+            "{name}"
+        );
+        for x in [0, 3] {
+            let coord = TileCoord { z: 2, x, y: 1 };
+            let actual = actual.get_tile(coord, Some(&query)).await;
+            let expected = control.get_tile(coord, Some(&query)).await;
+            if (name == "east-wide" && x == 3) || (name == "west-wide" && x == 0) {
+                let rgba = image::load_from_memory(&actual.as_ref().unwrap().data)
+                    .unwrap()
+                    .to_rgba8();
+                assert!(rgba.pixels().any(|p| p.0 == [73, 73, 73, 255]));
+            }
+            match (actual, expected) {
+                (Ok(actual), Ok(expected)) => {
+                    assert_eq!(actual.data, expected.data, "{name} {coord:?}")
+                }
+                (
+                    Err(maptile_core::error::MaptileError::TileNotFound(..)),
+                    Err(maptile_core::error::MaptileError::TileNotFound(..)),
+                ) => {}
+                (actual, expected) => {
+                    panic!("{name} {coord:?}: actual={actual:?}, control={expected:?}")
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn world_edge_candidates_attempt_object_reads() {
+    let fixture = AlgorithmFixture::from_values(&[&[73]]).await;
+    let query = TileQuery {
+        style: Some(&fixture.style),
+        ..Default::default()
+    };
+    for (x, bounds) in [
+        (0, [-180.0, -10.0, (-180.0_f64).next_up(), 10.0]),
+        (3, [180.0_f64.next_down(), -10.0, 180.0, 10.0]),
+    ] {
+        let source = MosaicSource::open(
+            MosaicSourceConfig {
+                id: format!("world-edge-{x}"),
+                members: vec![MosaicMember {
+                    url: "sliver.tif".into(),
+                    source_id: "sliver".into(),
+                    bbox_wgs84: bounds,
+                }],
+                pixel_selection: MosaicPixelSelection::First,
+                bounds: None,
+                srid: None,
+                store: Some(Arc::new(object_store::memory::InMemory::new())),
+            },
+            make_block_cache(),
+        )
+        .await
+        .unwrap();
+        let error = source
+            .get_tile(TileCoord { z: 2, x, y: 1 }, Some(&query))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, maptile_core::error::MaptileError::Backend(source) if source.to_string().contains("open asset sliver.tif")),
+            "{x}: {error}"
+        );
+    }
 }

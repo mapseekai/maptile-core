@@ -243,6 +243,96 @@ mod mbtiles {
     }
 
     #[tokio::test]
+    async fn relative_path_survives_chdir_in_subprocess() {
+        const CHILD: &str = "MAPTILE_MBTILES_CWD_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let dir = tempfile::tempdir().unwrap();
+            fixture()
+                .persist(dir.path().join("relative.mbtiles"))
+                .unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "mbtiles::relative_path_survives_chdir_in_subprocess",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let writer = rusqlite::Connection::open("relative.mbtiles").unwrap();
+        writer
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+            .unwrap();
+        let source = MbtilesSource::open(MbtilesConfig {
+            id: "relative".into(),
+            path: "relative.mbtiles".into(),
+            serve_as: None,
+            description: None,
+        })
+        .await
+        .unwrap();
+        let coord = TileCoord { z: 0, x: 0, y: 0 };
+        let expected = source.get_tile(coord, None).await.unwrap().data;
+        let other_dir = tempfile::tempdir().unwrap();
+        std::env::set_current_dir(other_dir.path()).unwrap();
+        assert_eq!(source.get_tile(coord, None).await.unwrap().data, expected);
+        assert_eq!(
+            source
+                .clone_source()
+                .get_tile(coord, None)
+                .await
+                .unwrap()
+                .data,
+            expected
+        );
+        writer
+            .execute_batch("UPDATE tiles SET tile_data = x'00' WHERE zoom_level = 0")
+            .unwrap();
+        assert!(matches!(
+            source.get_tile(coord, None).await,
+            Err(MaptileError::SourceUnavailable(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retargeting_opening_symlink_requires_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = fixture();
+        let second = fixture_with_color([255, 0, 0]);
+        let alias = dir.path().join("alias.mbtiles");
+        std::os::unix::fs::symlink(first.path(), &alias).unwrap();
+        let cfg = MbtilesConfig {
+            id: "alias".into(),
+            path: alias.clone(),
+            serve_as: None,
+            description: None,
+        };
+        let old = MbtilesSource::open(cfg.clone()).await.unwrap();
+        let coord = TileCoord { z: 0, x: 0, y: 0 };
+        let before = old.get_tile(coord, None).await.unwrap().data;
+        let replacement = dir.path().join("replacement.mbtiles");
+        std::os::unix::fs::symlink(second.path(), &replacement).unwrap();
+        std::fs::rename(replacement, alias).unwrap();
+        assert!(matches!(
+            old.get_tile(coord, None).await,
+            Err(MaptileError::SourceUnavailable(_))
+        ));
+        let new = MbtilesSource::open(cfg).await.unwrap();
+        assert_ne!(new.get_tile(coord, None).await.unwrap().data, before);
+    }
+
+    #[tokio::test]
     async fn wal_commit_changes_archive_identity() {
         let file = fixture();
         let writer = rusqlite::Connection::open(file.path()).unwrap();

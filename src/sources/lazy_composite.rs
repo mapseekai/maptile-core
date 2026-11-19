@@ -6,6 +6,8 @@
 //! the registry are skipped (mosaic "any member available" semantics); a
 //! member re-registered later is picked up on the next request with no group
 //! re-registration.
+//! Indirect cycles and paths deeper than 64 groups return `Config` on reads.
+//! Sibling branches may share a group; their resolution paths remain independent.
 //!
 //! The advertised TileJSON is snapshotted once at `open` from the members
 //! present at that moment. On the creation path members are READY (hence
@@ -23,6 +25,11 @@ use crate::sources::{
     TileCoord, TileEncoding, TileEtagResponse, TileFormat, TileInfo, TileQuery, TileResponse,
     TileSource, validate_tile_batch,
 };
+
+tokio::task_local! {
+    // Each nested future scopes its own path, so sibling DAG branches do not conflict.
+    static RESOLUTION_PATH: Vec<usize>;
+}
 
 pub struct LazyCompositeSource {
     id: String,
@@ -44,6 +51,28 @@ impl LazyCompositeSource {
             manager,
             tj,
         }
+    }
+
+    async fn guard_cycle<T>(
+        &self,
+        read: impl std::future::Future<Output = MaptileResult<T>>,
+    ) -> MaptileResult<T> {
+        let mut path = RESOLUTION_PATH.try_with(Clone::clone).unwrap_or_default();
+        // A static composite can retain an older instance with the same source id.
+        let instance = std::ptr::from_ref(self).addr();
+        if path.contains(&instance) {
+            return Err(MaptileError::Config(format!(
+                "composite source cycle at {}",
+                self.id
+            )));
+        }
+        if path.len() >= 64 {
+            return Err(MaptileError::Config(
+                "composite nesting exceeds 64 groups".into(),
+            ));
+        }
+        path.push(instance);
+        RESOLUTION_PATH.scope(path, read).await
     }
 }
 
@@ -130,13 +159,16 @@ impl TileSource for LazyCompositeSource {
         xyz: TileCoord,
         query: Option<&TileQuery<'_>>,
     ) -> MaptileResult<TileResponse> {
-        let (manager, composite) = snapshot(&self.id, &self.member_ids, &self.manager)?
-            .ok_or(MaptileError::TileNotFound(xyz.z, xyz.x, xyz.y))?;
-        composite
-            .get_tile_with(xyz, query, |source, query| {
-                read_member(&manager, source, xyz, query)
-            })
-            .await
+        self.guard_cycle(async {
+            let (manager, composite) = snapshot(&self.id, &self.member_ids, &self.manager)?
+                .ok_or(MaptileError::TileNotFound(xyz.z, xyz.x, xyz.y))?;
+            composite
+                .get_tile_with(xyz, query, |source, query| {
+                    read_member(&manager, source, xyz, query)
+                })
+                .await
+        })
+        .await
     }
 
     async fn read_tile_batch(
@@ -148,18 +180,21 @@ impl TileSource for LazyCompositeSource {
         if coords.is_empty() {
             return Ok(Vec::new());
         }
-        let Some((_manager, composite)) = snapshot(&self.id, &self.member_ids, &self.manager)?
-        else {
-            return Ok(coords
-                .iter()
-                .map(|_| TileResponse {
-                    data: bytes::Bytes::new(),
-                    info: self.tile_info(),
-                    last_modified: None,
-                })
-                .collect());
-        };
-        composite.read_tile_batch(coords, query).await
+        self.guard_cycle(async {
+            let Some((_manager, composite)) = snapshot(&self.id, &self.member_ids, &self.manager)?
+            else {
+                return Ok(coords
+                    .iter()
+                    .map(|_| TileResponse {
+                        data: bytes::Bytes::new(),
+                        info: self.tile_info(),
+                        last_modified: None,
+                    })
+                    .collect());
+            };
+            composite.read_tile_batch(coords, query).await
+        })
+        .await
     }
 
     async fn get_tile_with_etag(
@@ -168,19 +203,22 @@ impl TileSource for LazyCompositeSource {
         query: Option<&TileQuery<'_>>,
         if_none_match: Option<&str>,
     ) -> MaptileResult<TileEtagResponse> {
-        let (manager, composite) = snapshot(&self.id, &self.member_ids, &self.manager)?
-            .ok_or(MaptileError::TileNotFound(xyz.z, xyz.x, xyz.y))?;
-        let resp = composite
-            .get_tile_with(xyz, query, |source, query| {
-                read_member(&manager, source, xyz, query)
-            })
-            .await?;
-        let etag = composite.tile_etag(&resp);
-        if Some(etag.as_str()) == if_none_match {
-            Ok(TileEtagResponse::NotModified)
-        } else {
-            Ok(TileEtagResponse::Fresh { resp, etag })
-        }
+        self.guard_cycle(async {
+            let (manager, composite) = snapshot(&self.id, &self.member_ids, &self.manager)?
+                .ok_or(MaptileError::TileNotFound(xyz.z, xyz.x, xyz.y))?;
+            let resp = composite
+                .get_tile_with(xyz, query, |source, query| {
+                    read_member(&manager, source, xyz, query)
+                })
+                .await?;
+            let etag = composite.tile_etag(&resp);
+            if Some(etag.as_str()) == if_none_match {
+                Ok(TileEtagResponse::NotModified)
+            } else {
+                Ok(TileEtagResponse::Fresh { resp, etag })
+            }
+        })
+        .await
     }
 }
 
@@ -297,6 +335,130 @@ mod tests {
     }
 
     // --- tests ---
+
+    #[tokio::test]
+    async fn indirect_cycles_fail_all_read_paths_and_recovery_is_possible() {
+        let manager = manager_with(vec![]);
+        let group = Arc::new(LazyCompositeSource::open(
+            "a".into(),
+            vec!["b".into()],
+            Arc::downgrade(&manager),
+        ));
+        manager.register(group.clone());
+        manager.register(Arc::new(LazyCompositeSource::open(
+            "b".into(),
+            vec!["a".into()],
+            Arc::downgrade(&manager),
+        )));
+        let xyz = TileCoord { z: 0, x: 0, y: 0 };
+        assert!(matches!(
+            group.get_tile(xyz, None).await,
+            Err(MaptileError::Config(_))
+        ));
+        assert!(matches!(
+            group.read_tile_batch(&[xyz], None).await,
+            Err(MaptileError::Config(_))
+        ));
+        assert!(matches!(
+            group.get_tile_with_etag(xyz, None, None).await,
+            Err(MaptileError::Config(_))
+        ));
+        manager.register(MvtFake::new("b", &["recovered"]));
+        assert_eq!(
+            layer_names(&group.get_tile(xyz, None).await.unwrap()),
+            ["recovered"]
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_nested_groups_are_valid_across_concurrent_branches() {
+        let manager = manager_with(vec![MvtFake::new("leaf", &["roads"])]);
+        for (id, members) in [
+            ("shared", vec!["leaf"]),
+            ("left", vec!["shared"]),
+            ("right", vec!["shared"]),
+            ("root", vec!["left", "right"]),
+        ] {
+            manager.register(Arc::new(LazyCompositeSource::open(
+                id.into(),
+                members.into_iter().map(str::to_owned).collect(),
+                Arc::downgrade(&manager),
+            )));
+        }
+        let root = manager.require("root").unwrap();
+        let xyz = TileCoord { z: 0, x: 0, y: 0 };
+        let (first, second) = tokio::join!(
+            root.get_tile(xyz, None),
+            root.get_tile_with_etag(xyz, None, None)
+        );
+        assert!(!first.unwrap().data.is_empty());
+        assert!(second.is_ok());
+        assert!(
+            !root.read_tile_batch(&[xyz], None).await.unwrap()[0]
+                .data
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn replacement_can_reach_an_older_instance_with_the_same_id() {
+        let manager = manager_with(vec![MvtFake::new("leaf", &["roads"])]);
+        manager.register(Arc::new(LazyCompositeSource::open(
+            "a".into(),
+            vec!["leaf".into()],
+            Arc::downgrade(&manager),
+        )));
+        manager.register_composite_from_ids("b", &["a"]).unwrap();
+        manager.register(Arc::new(LazyCompositeSource::open(
+            "a".into(),
+            vec!["b".into()],
+            Arc::downgrade(&manager),
+        )));
+        let root = manager.require("a").unwrap();
+        let xyz = TileCoord { z: 0, x: 0, y: 0 };
+        assert_eq!(
+            layer_names(&root.get_tile(xyz, None).await.unwrap()),
+            ["roads"]
+        );
+        assert!(root.get_tile_with_etag(xyz, None, None).await.is_ok());
+        assert_eq!(
+            layer_names(&root.read_tile_batch(&[xyz], None).await.unwrap()[0]),
+            ["roads"]
+        );
+        manager.register(Arc::new(LazyCompositeSource::open(
+            "leaf".into(),
+            vec!["a".into()],
+            Arc::downgrade(&manager),
+        )));
+        assert!(matches!(
+            root.get_tile(xyz, None).await,
+            Err(MaptileError::Config(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn excessive_nesting_returns_an_error_before_stack_exhaustion() {
+        let manager = manager_with(vec![MvtFake::new("leaf", &["roads"])]);
+        let mut child = "leaf".to_owned();
+        for n in 0..65 {
+            let id = format!("group_{n}");
+            manager.register(Arc::new(LazyCompositeSource::open(
+                id.clone(),
+                vec![child],
+                Arc::downgrade(&manager),
+            )));
+            child = id;
+        }
+        let xyz = TileCoord { z: 0, x: 0, y: 0 };
+        let at_limit = manager.require("group_63").unwrap();
+        assert!(at_limit.get_tile(xyz, None).await.is_ok());
+        assert!(at_limit.get_tile_with_etag(xyz, None, None).await.is_ok());
+        assert!(at_limit.read_tile_batch(&[xyz], None).await.is_ok());
+        assert!(matches!(
+            manager.require(&child).unwrap().get_tile(xyz, None).await,
+            Err(MaptileError::Config(_))
+        ));
+    }
 
     #[tokio::test]
     async fn merges_layers_of_present_members() {

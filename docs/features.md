@@ -32,7 +32,7 @@
 | `stac` | STAC 资产发现与 Raster Style 镶嵌渲染 | 包含 `agtiff`，配置 STAC 地址与资产读取环境 |
 | `mlt` | MVT 与 MLT 转换 | 启用 `mlt-core` 和几何转换依赖 |
 | `metrics` | Prometheus 缓存请求计数器 | 首次访问时注册默认 Prometheus registry，应用抓取并暴露指标 |
-| `render` | MapLibre Native 渲染器、渲染池、图片编码和覆盖物叠加 | 固定 `maplibre_native =0.9.3`；macOS 使用 Metal，Linux 默认使用 Vulkan |
+| `render` | MapLibre Native 渲染器、渲染池、图片编码和覆盖物叠加 | 使用仓库内修正过的 `maplibre_native 0.9.3` 相对路径依赖；macOS 使用 Metal，Linux 默认使用 Vulkan |
 | `render-opengl` | Linux OpenGL 渲染后端 | 包含 `render`，使用 Linux 对应图形与构建环境 |
 | `render-bench` | 原生渲染生命周期基准与测量接口 | 包含 `render`，用于 `render_native` 基准 |
 

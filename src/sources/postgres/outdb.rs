@@ -71,8 +71,9 @@ impl PostgresOutDbRasterSource {
         Self::verify_function(&conn, &config.schema, function_name).await?;
 
         let sql_query = format!(
-            "SELECT * FROM \"{}\".\"{}\"($1::integer, $2::integer, $3::integer, $4::geometry, $5::jsonb)",
-            config.schema, function_name
+            "SELECT * FROM {}.{}($1::integer, $2::integer, $3::integer, $4::geometry, $5::jsonb)",
+            pg_escape::quote_identifier(&config.schema),
+            pg_escape::quote_identifier(function_name)
         );
 
         let mut tj: TileJSON = tilejson! { tiles: vec![] };
@@ -168,11 +169,8 @@ impl PostgresOutDbRasterSource {
         query_params: Option<serde_json::Value>,
         style: &EffectiveStyle,
     ) -> MaptileResult<Option<TileResponse>> {
+        crate::sources::tile_math::validate_tile_request(&[TileCoord { z, x, y }], None)?;
         crate::raster::agtiff_style::to_tile_style(style)?;
-        let max_tile = crate::sources::tile_math::tiles_per_axis(z)?;
-        if x >= max_tile || y >= max_tile {
-            return Err(MaptileError::TileNotFound(z, x, y));
-        }
 
         if z < self.minzoom || z > self.maxzoom {
             return Ok(None);
@@ -437,6 +435,7 @@ impl TileSource for PostgresOutDbRasterSource {
         xyz: TileCoord,
         query: Option<&TileQuery<'_>>,
     ) -> MaptileResult<TileResponse> {
+        crate::sources::tile_math::validate_tile_request(std::slice::from_ref(&xyz), query)?;
         let style = query.and_then(|q| q.style).ok_or_else(|| {
             MaptileError::InvalidRequest("canonical raster style is required".into())
         })?;
@@ -447,6 +446,15 @@ impl TileSource for PostgresOutDbRasterSource {
             Some(tile) => Ok(tile),
             None => Err(MaptileError::TileNotFound(xyz.z, xyz.x, xyz.y)),
         }
+    }
+
+    async fn read_tile_batch(
+        &self,
+        coords: &[TileCoord],
+        query: Option<&TileQuery<'_>>,
+    ) -> MaptileResult<Vec<TileResponse>> {
+        crate::sources::tile_math::validate_tile_request(coords, query)?;
+        crate::sources::read_tile_batch_sequential(self, coords, query).await
     }
 }
 

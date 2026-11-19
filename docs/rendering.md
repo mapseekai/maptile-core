@@ -81,17 +81,24 @@ bash scripts/ci/maptile-render-cargo.sh run --locked --features render --example
 | 情况 | 错误 |
 | --- | --- |
 | `get` 请求未注册的样式 ID | `StyleNotFound(id)` |
-| 构造时检查文件失败，或 `get` 读取文件失败 | `Io(error)`，通过 `error.kind()` 区分文件不存在、权限不足等 |
-| `get` 解析 JSON 失败 | `Json(error)`，可读取 `classify()`、`line()`、`column()` |
+| 构造时检查文件失败，或 `get` 读取文件失败 | `StyleFile { id, path, source }`，`source` 为 `Io(error)`，通过 `error.kind()` 区分文件不存在、权限不足等 |
+| `get` 解析 JSON 失败 | `StyleFile { id, path, source }`，`source` 为 `Json(error)`，可读取 `classify()`、`line()`、`column()` |
+| 构造或读取时样式文件超过 16 MiB | `StyleFile { id, path, source }`，`source` 为 `PayloadTooLarge { limit: 16777216 }` |
 
-`Io` 与 `Json` 保留原始错误；应用记录诊断时应附上所请求的样式 ID。已注册样式的文件随后被删除属于文件访问失败，返回 `Io(NotFound)`。
+`StyleFile.source.as_ref()` 可用于匹配上述底层错误；错误本身和 `snapshot_catalog` 返回值都带有样式 ID 与路径。已注册样式的文件随后被删除时，底层错误为 `Io(NotFound)`。应用对外输出错误时应隐藏内部文件路径。
+
+样式路径必须指向普通文件，指向普通文件的符号链接仍可使用。构造和读取都会校验类型；读取校验的是已打开句柄，Unix 上使用非阻塞打开，避免注册后路径被替换为 FIFO 时阻塞。目录和 FIFO 返回带上下文的文件错误。
+
+本地样式文件最大为 **16 MiB（16,777,216 字节，包含边界）**。构造和读取都会检查文件长度；实际读取最多取上限加 1 字节，超限即拒绝解析，防止检查后文件增长绕过限制。`snapshot_catalog` 使用同一读取路径。该限制针对文件字节数，不是 JSON 解析后的内存配额；原先超过上限的本地样式需要缩小文件或由应用提供自己的 `StyleStore` 实现。
 
 `rewrite_urls(&style, base_url, query_string)` 将以下字段中以 `/` 开头的资源地址转换为绝对 URL：
 
 - `sources[*].url` 与 `sources[*].tiles[*]`。
 - `glyphs` 和字符串形式的 `sprite`。
 
-`query_string` 按原样追加到这些 URL 的末尾。传入空字符串可只补齐域名；需要附加参数时，由应用准备包含正确分隔符的后缀。已有完整 URL 保持其配置值。
+`query_string` 以 `?` 或 `&` 开头时，参数会合并到每个资源各自的查询串，并放在 `#fragment` 之前。例如 `/data/a.json?v=1#meta` 与 `?key=abc` 合并为 `/data/a.json?v=1&key=abc#meta`；没有查询串的 URL 则使用 `?`。已有完整 URL 保持其配置值，瓦片、字体占位符保持原字节。
+
+传入空字符串、单独的 `?` 或 `&` 可只补齐域名。参数值应已完成 URL 编码，例如值中的 `#` 应写为 `%23`；函数不会解析或编码参数。其他后缀保留直接追加的既有用途，例如 `.json` 会追加到完整资源字符串末尾，不参与查询串或片段合并。
 
 `rewrite_style_for_native(&style, base_url, &manager)` 处理指向已注册源的 `/data/<id>` 或 `/data/<id>.json` 引用：将其转换为瓦片 URL 模板，并从源元数据补充缺省的缩放范围、边界和署名。应用提供对应瓦片、字体和精灵图的资源访问路径。具体重写规则见 [`styles/store.rs`](../src/styles/store.rs)，源注册见[数据源与查询](sources.md)。
 
@@ -114,7 +121,7 @@ bash scripts/ci/maptile-render-cargo.sh run --locked --features render --example
 2. 使用 `calculate_bounds(&paths, &markers)` 得到地理边界；应用根据结果添加留白或选择默认视口。
 3. 用 `StaticTarget::BoundingBox` 构造请求，再将原覆盖物放入 `request.overlay_items`。
 
-`render` feature 提供路径、标记和 GeoJSON 覆盖物，可配置颜色、线宽、填充与标记尺寸。渲染器先生成地图图像，再绘制覆盖物并编码。公开类型和解析函数见 [`overlay.rs`](../src/render/overlay.rs)。
+`render` feature 提供路径、标记和 GeoJSON 覆盖物，可配置颜色、线宽、填充与标记尺寸。渲染器先生成地图图像，再绘制覆盖物并编码。公开类型和解析函数见 [`overlay.rs`](../src/render/overlay.rs)。缺失闭括号的路径和标记返回 `None`；无效颜色沿用默认颜色。`decode_polyline` 遇到非法字符、截断或整数溢出时返回此前完整解码的点，保留既有的前缀解码行为。
 
 ## 输出尺寸与并发
 
@@ -141,6 +148,10 @@ bash scripts/ci/maptile-render-cargo.sh run --locked --features render --example
 入队等待超时返回 `MaptileError::CapacityExhausted`，应用可据此实施退避或返回繁忙响应。队列已关闭或工作线程丢失响应仍返回 `MaptileError::Render`。
 
 应用需要为某次请求创建独立原生上下文时，可以设置 `request.isolate_native_state = true`。这一选项由可信应用代码决定，适合为请求配置独立的资源访问上下文，字段语义见 [`RenderRequest`](../src/render/types.rs)。
+
+启用 `raster` 后，独立的 `raster::encode::to_png_async`、`to_jpeg_async`、`to_webp_async` 与传输压缩、解压共用 `configure_blocking_concurrency` 设置的阻塞任务预算。它们会等待可用名额；取消尚未开始的等待不会占用名额，取消已开始任务的等待者也不会提前释放名额，实际编码结束后才释放。不要在已占用同一预算的阻塞任务中同步等待这些 async 包装；该场景应直接调用同步编码函数。
+
+独立栅格编码工具对 1、3、4 波段 PNG/WebP 均将无效 mask 像素编码为透明像素。全有效的单波段 PNG 保留灰度格式，全有效的三波段 PNG 保留 RGB；需要透明度时增加 alpha，四波段保留其 alpha 并叠加 mask。JPEG 仍输出 RGB，忽略 mask 和 alpha。所有同步和异步编码入口都要求 `mask.shape() == [height, width]`，包括全有效 mask 与 JPEG；尺寸不匹配返回 `MaptileError::Render`，不按元素数量或内存布局截断。直接使用返回 `Vec<u8>` 的 `rgba_from_raster` 时，调用方须保证这一前置条件，违反时在 Debug 和 Release 均会 panic。
 
 ## COG 栅格切片
 
@@ -170,6 +181,8 @@ bash scripts/ci/maptile-render-cargo.sh run --locked --features render --example
 | `PostgresOutDbRasterSource` | 从 PostgreSQL 查询外部栅格路径，使用 GDAL 读取与渲染 | 配置连接池、查询函数及栅格文件访问环境 |
 
 `stac` 包含 `agtiff`；固定镶嵌和 OutDB 通过 `raster` 启用。STAC 和固定镶嵌提供 `first`、`highest`、`lowest`、`mean`、`median` 像元组合方式，应用可通过 `TileQuery.pixel_selection` 选择请求使用的方式。
+
+固定镶嵌先按成员 WGS84 范围筛选每瓦片候选，但全局统计仍使用全部成员，并继续受上游默认 64 个资产的统计发现限制。跨日期线、未知范围和缓存版本规则见[成员范围说明](sources.md#固定栅格镶嵌与成员范围)。
 
 各入口的配置与处理流程见 [`stac.rs`](../src/sources/stac.rs)、[`mosaic_source.rs`](../src/sources/mosaic_source.rs)、[`outdb.rs`](../src/sources/postgres/outdb.rs)。数据库连接复用方式见[数据源与查询](sources.md)。
 

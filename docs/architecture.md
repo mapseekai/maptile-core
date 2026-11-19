@@ -53,6 +53,8 @@ flowchart TD
 
 [`TileCacheKey`](../src/cache/tile_cache.rs)由源 ID、内容版本、XYZ 坐标和样式散列组成。栅格输出的有效样式与镶嵌像元选择通过规范化散列区分；同一坐标的不同内容或样式可以拥有独立缓存项。
 
+FlatGeobuf 的 Unix 内容版本纳入完整 FileStamp，包含设备号、inode、ctime、长度与 mtime；其他平台每次打开使用新代次，克隆共享版本。同大小、同 mtime 的替换文件需要重新打开和注册，热缓存不会主动检查磁盘。固定栅格镶嵌还将成员范围纳入版本，因为范围决定本次瓦片的候选；全局统计继续保留全成员及上游 64 个资产的限制，见[成员范围说明](sources.md#固定栅格镶嵌与成员范围)。
+
 内容版本由数据源提供。归档和文件源使用文件身份、对象校验信息或打开代次；PostGIS 表源可结合应用持久化的编辑修订号。COG 的 `content_id` 由应用给出，适合使用版本化 URI 或数据版本标识。自定义源通过 `content_version()` 声明自己的内容身份。
 
 `TileCache::new` 接收容量、TTL 和 TTI。容量参数按 MiB 换算，权重包含瓦片载荷、键和记录开销；进程容量规划还应计入连接池、渲染器、数据解码与其他分配。同一缓存键的并发缺失请求共享一次计算，错误保留其结构化类型。
@@ -62,6 +64,8 @@ flowchart TD
 ## 并发额度
 
 `transport::configure_blocking_concurrency(limit)` 配置本 crate 经统一阻塞任务入口运行的解码、编码和其他 CPU/阻塞工作的进程共享额度。应用应在打开源或启动相关异步工作前调用一次；未配置时默认使用可用并行度，最多 16。显式配置可超过 16，须为正数且不超过 Tokio 信号量上限。重复配置或首次使用后配置返回 `Config`。同步编解码入口不经过此额度，原生渲染器仍使用其独立的池配置。
+
+`raster::encode::to_png_async`、`to_jpeg_async`、`to_webp_async` 也通过上述共享额度准入。取消尚未开始的等待不会占用额度，已经开始的编码会持有额度至实际结束；已占同一额度的阻塞闭包应调用同步编码函数，避免同步等待异步包装。该统一准入是预算一致性增强，不代表已复现过载或 DoS。
 
 Postgres 批量查询由每个连接池的 `PoolSettings.batch_concurrency` 控制，默认 2；池的克隆共享额度，分别调用 `connect` 创建的池互相独立。应用需将各池额度合计计入数据库预算。该额度在获取批量连接前占用；普通在线查询不占批量额度，但仍与批量查询共享池的连接数上限。
 
@@ -91,17 +95,35 @@ Postgres 批量查询由每个连接池的 `PoolSettings.batch_concurrency` 控�
 
 具体的会话释放过程由源实现。GeoParquet 和 FlatGeobuf 的克隆共享会话，显式 `close().await` 用于等待查询、连接和读取资源退出，详见[矢量文件指南](geoparquet.md)。
 
+DuckDB 查询与 GeoParquet 远程打开只在阻塞闭包开始工作后发布中断句柄。局部守卫借用连接，并在中断共用的互斥锁下解除句柄；正常返回、错误和展开栈时，先等待在途中断退出，再释放连接或归还连接池。未启动的闭包没有已发布句柄，本地矢量导入也在同锁下解除中断句柄。这是针对已知析构窗口的预防性加固，未复现上游 UAF，也未改变锁定 DuckDB 依赖。
+
 替换源后，若应用还需要等待旧对象完全关闭，应在替换前保留旧引用，再对该引用调用 `close().await`。`close_source(id)` 操作的是调用时按 ID 注册的当前源。
 
 ## 文件发现与更新
 
 [`discovery::scan`](../src/discovery.rs)与 `scan_async` 扫描数据和样式文件，返回发现报告；[`SourceWatcher`](../src/watch.rs)通知文件变更。应用保留 watcher 并消费事件，把发现信息交给自己的数据源工厂。
 
+watcher 默认保留 300ms 窗口的首个事件，并按种类补发尾沿，创建后迅速删除或原地覆写仍能触发终态重扫。事件通道与待处理路径表各最多 1024 项；拥塞时合并为 `Modified(root)`，在消费者恢复接收后重试，应用需据此重新扫描目录。Drop 会停止自有刷新线程，不等待消费者腾出队列，因此不能将它当作逐条无损事件日志。
+
+MBTiles 在打开时固定相对路径对应的绝对别名，后续 chdir 不改变源身份；文件替换、WAL 更新和 symlink 目标切换仍触发旧源失效。
+
 `reload_from_discovery` 根据 ID 同步新增与删除条目，就绪源保持当前对象。报告中仍存在的不可用源会重新调用工厂构建；报告中已消失的 ID 会被移除，包括不可用记录，并列入 `ReloadDelta.removed`。对已有文件内容或配置的更新，应用重新打开具体源，再调用 `register`。这让文件发布、元数据检查和内容版本更新具有明确的接入位置。
 
 重载先构建全部新增和待恢复的源，再应用注册和删除。工厂失败或构建过程被取消时，本次变更尚未发布，原有不可用记录也保留，已构建但未发布的源开始关闭。成功后的应用阶段逐项执行；需要整个批次隔离的应用应协调并发写入，这个接口不提供跨 ID 的事务隔离。
 
+工厂返回源的 `id()` 必须等于对应发现项的 ID。重载在发布前检查这一条件；不匹配返回 `Config`，并开始关闭本次已构建但未发布的源，保留原注册表状态。工厂若返回仍在注册表中的同一个 `Arc`，清理会保留该实例。
+
+发现报告中的源 ID 必须唯一，即使对应源已经就绪也不能重复。重载在调用任何工厂或修改注册表前检查完整报告，重复则返回 `Config`；现有就绪源和不可用记录保持不变。标准 `scan` 已处理文件重名，手工构造或合并的报告也需遵守这一约束。
+
 对于远程文件和对象存储，使用不可变、带版本的地址可以使数据快照与缓存身份保持一致。应用在发布成功后切换源，并按生命周期策略处理旧对象。
+
+## 数据库与图像输入边界
+
+PostgreSQL 连接显式选择 rustls ring provider，无需宿主初始化全局 provider。`prefer` 在 TCP 上先尝试 TLS，只有服务器明确不支持 TLS 才回退；`require` 必须通过证书链与主机名校验。`disable` 保持明文，Unix socket 可用 disable/prefer；锁定驱动仅接受这三种模式，详见 [TLS 连接](sources.md#tls-连接)。
+
+PostGIS 表的普通、批量和过滤路径统一由 SQL 保留 MVT buffer 内的相交要素；普通和批量的 minzoom 短路不变。PostgreSQL 表/函数/OutDB 与独立 DuckDB 的坐标和 typed bbox 入口拒绝非法 XYZ 或非有限 bbox，返回 InvalidRequest；有限 bbox 保留各源既有语义，不自动新增日期线拆分。函数与 OutDB SQL 使用统一标识符转义，支持名称中的合法双引号。
+
+PNG/WebP 编码将 1、3、4 波段的无效 mask 像素编码为透明像素，JPEG 继续忽略 alpha。Overlay 的括号、UTF-8 颜色和 polyline 整数边界通过解析检查处理，原生池的 panic guard 保留；URL 查询后缀按资源自身查询串合并到 fragment 前，并保留非查询后缀的直接追加用途。兼容性细节见[样式与渲染](rendering.md)。
 
 ## 错误与观测
 
@@ -109,6 +131,6 @@ Postgres 批量查询由每个连接池的 `PoolSettings.batch_concurrency` 控�
 
 默认的栅格覆盖导出和像元查询在源不支持该能力时返回 `InvalidRequest`。这是请求与源能力不匹配，应用可以按无效请求处理。
 
-渲染队列入队等待超时返回 `CapacityExhausted`。本地样式存储对未知样式 ID 返回 `StyleNotFound`；文件访问与 JSON 解析失败分别返回 `Io` 和 `Json`，保留底层错误，供应用检查 `ErrorKind` 或解析位置。具体分类见[样式与渲染](rendering.md)。
+渲染队列入队等待超时返回 `CapacityExhausted`。本地样式存储对未知样式 ID 返回 `StyleNotFound`；文件访问与 JSON 解析失败返回 `StyleFile { id, path, source }`，其 `source` 保留 `Io` 或 `Json`，供应用检查 `ErrorKind` 或解析位置。超过 16 MiB 的本地样式文件同样返回 `StyleFile`，其原因为 `PayloadTooLarge`。目录快照也保留这份样式上下文。具体分类见[样式与渲染](rendering.md)。
 
 关键读取路径使用 `tracing`。启用 `metrics` 后，缓存计数器在首次访问时注册到默认 Prometheus registry，应用负责抓取和暴露；指标定义见 [`metrics.rs`](../src/metrics.rs)。连接数、源数量和原生渲染队列容量由应用按部署预算统一配置。

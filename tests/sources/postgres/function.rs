@@ -26,7 +26,7 @@ async fn install_basic_function(dsn: &str, schema: &str, fn_name: &str) {
     });
     let sql = format!(
         r#"
-        CREATE OR REPLACE FUNCTION "{schema}"."{fn_name}"(z int, x int, y int)
+        CREATE OR REPLACE FUNCTION {schema}.{fn_name}(z int, x int, y int)
         RETURNS bytea AS $$
         DECLARE
             mvt bytea;
@@ -44,7 +44,9 @@ async fn install_basic_function(dsn: &str, schema: &str, fn_name: &str) {
             RETURN mvt;
         END;
         $$ LANGUAGE plpgsql;
-        "#
+        "#,
+        schema = pg_escape::quote_identifier(schema),
+        fn_name = pg_escape::quote_identifier(fn_name)
     );
     client.batch_execute(&sql).await.expect("install function");
 }
@@ -551,3 +553,82 @@ async fn batch_keeps_null_empty_order_and_resumes_its_byte_prefix() {
             .is_err()
     );
 }
+
+#[tokio::test]
+async fn invalid_requests_are_rejected_before_function_sql() {
+    let Some(dsn) = common::postgres::pg_dsn() else {
+        return;
+    };
+    let guard = common::postgres::SchemaGuard::create(&dsn).await;
+    for with_query in [false, true] {
+        let name = if with_query { "with_query" } else { "plain" };
+        if with_query {
+            install_with_query_function(&dsn, &guard.name, name).await;
+        } else {
+            install_basic_function(&dsn, &guard.name, name).await;
+        }
+        let source = PostgresFunctionSource::open(
+            make_pool(&dsn).await,
+            PostgresFunctionConfig {
+                id: name.into(),
+                schema: guard.name.clone(),
+                function: name.into(),
+                description: None,
+                minzoom: None,
+                maxzoom: None,
+                bounds: None,
+                cache_zoom: None,
+            },
+        )
+        .await
+        .unwrap();
+        common::postgres::assert_invalid_tile_requests(&source, None).await;
+    }
+}
+
+#[tokio::test]
+async fn quoted_schema_and_function_names_execute() {
+    let Some(dsn) = common::postgres::pg_dsn() else {
+        return;
+    };
+    let guard = common::postgres::SchemaGuard::create_named(
+        &dsn,
+        format!("{}\"schema", common::postgres::unique_schema()),
+    )
+    .await;
+    let name = "tile\"function";
+    install_basic_function(&dsn, &guard.name, name).await;
+    let source = PostgresFunctionSource::open(
+        make_pool(&dsn).await,
+        PostgresFunctionConfig {
+            id: name.into(),
+            schema: guard.name.clone(),
+            function: name.into(),
+            description: None,
+            minzoom: None,
+            maxzoom: None,
+            bounds: None,
+            cache_zoom: None,
+        },
+    )
+    .await
+    .unwrap();
+    let coord = TileCoord { z: 0, x: 0, y: 0 };
+    let tile = source.get_tile(coord, None).await.unwrap();
+    assert_eq!(
+        maptile_core::sources::mvt::decode(&tile.data)
+            .unwrap()
+            .layers[0]
+            .features
+            .len(),
+        1
+    );
+    assert_eq!(
+        source.read_tile_batch(&[coord], None).await.unwrap()[0].data,
+        tile.data
+    );
+}
+
+#[cfg(feature = "raster")]
+#[path = "outdb.rs"]
+mod outdb;

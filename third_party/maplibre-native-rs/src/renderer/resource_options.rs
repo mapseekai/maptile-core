@@ -1,0 +1,77 @@
+use std::fmt::Debug;
+use std::path::PathBuf;
+
+use cxx::UniquePtr;
+
+use crate::bridge::resource_options;
+use crate::renderer::tile_server_options::TileServerOptions;
+
+/// Resource Options
+pub struct ResourceOptions {
+    ptr: UniquePtr<resource_options::ResourceOptions>,
+}
+
+impl Debug for ResourceOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Resource Options").field("Pointer", &self.ptr.as_ptr()).finish()
+    }
+}
+
+impl Default for ResourceOptions {
+    /// Create new resource options object
+    fn default() -> Self {
+        let ptr = resource_options::new();
+        assert!(!ptr.is_null());
+        Self { ptr }
+    }
+}
+
+impl ResourceOptions {
+    /// Set api key
+    #[must_use]
+    pub fn with_api_key(mut self, key: &str) -> Self {
+        resource_options::withApiKey(self.ptr.pin_mut(), key);
+        self
+    }
+
+    /// Sets cache database file path
+    #[must_use]
+    pub fn with_cache_path(mut self, path: PathBuf) -> Self {
+        // cxx.rs does not support OsString, but going via &[u8] is close enough
+        let os_string = path.into_os_string();
+        resource_options::withCachePath(self.ptr.pin_mut(), os_string.as_encoded_bytes());
+        self
+    }
+
+    /// Sets assets root directory
+    #[must_use]
+    pub fn with_asset_path(mut self, path: PathBuf) -> Self {
+        let os_string = path.into_os_string();
+        resource_options::withAssetPath(self.ptr.pin_mut(), os_string.as_encoded_bytes());
+        self
+    }
+
+    /// Set the ambient cache maximum size in bytes (0 disables)
+    ///
+    /// Only applies to the default [`Database`](crate::FileSourceType::Database)
+    /// file source. It has no effect once that source is replaced with
+    /// [`register_file_source`](crate::register_file_source).
+    #[must_use]
+    pub fn with_maximum_cache_size(mut self, max_cache_size: u64) -> Self {
+        resource_options::withMaximumCacheSize(self.ptr.pin_mut(), max_cache_size);
+        self
+    }
+
+    /// Set tile server options
+    #[must_use]
+    pub fn with_tile_server_options(mut self, tile_server_options: &TileServerOptions) -> Self {
+        resource_options::withTileServerOptions(self.ptr.pin_mut(), tile_server_options.as_ref());
+        self
+    }
+
+    /// Get nonmutable reference to the object
+    #[must_use]
+    pub(crate) fn as_ref(&self) -> &resource_options::ResourceOptions {
+        self.ptr.as_ref().unwrap()
+    }
+}

@@ -975,3 +975,109 @@ async fn clone_source_serves_tiles() {
     assert!(!r1.data.is_empty());
     assert!(!r2.data.is_empty());
 }
+
+#[tokio::test]
+async fn buffered_boundary_point_survives_single_batch_and_filtered_reads() {
+    use maptile_core::{
+        filter::parse_cql2,
+        sources::{TileQuery, mvt},
+    };
+    let Some(dsn) = common::postgres::pg_dsn() else {
+        return;
+    };
+    let pool = make_pool(&dsn).await;
+    let xyz = TileCoord {
+        z: 8,
+        x: 127,
+        y: 127,
+    };
+    let filter = parse_cql2("id = 1").unwrap();
+    for srid in [4326, 3857] {
+        let guard = common::postgres::SchemaGuard::create(&dsn).await;
+        pool.get().await.unwrap().batch_execute(&format!(r#"
+            CREATE TABLE "{}".edge (id int, geom geometry(Point,{srid}));
+            INSERT INTO "{}".edge VALUES (1, ST_Transform(ST_SetSRID(ST_MakePoint(0.001,0.1),4326),{srid}));
+        "#,guard.name,guard.name)).await.unwrap();
+        let config = cfg_for(&guard.name, "edge");
+        let source = PostgresTableSource::open(pool.clone(), config.clone())
+            .await
+            .unwrap()
+            .with_allowed_columns(Arc::new(["id".to_owned()].into_iter().collect()));
+        assert_eq!(source.table_info().derived_min_zoom, Some(0));
+        for query in [
+            None,
+            Some(TileQuery {
+                filter: Some(&filter),
+                ..Default::default()
+            }),
+            Some(TileQuery {
+                bbox: Some([-1.0, -1.0, 1.0, 1.0]),
+                ..Default::default()
+            }),
+        ] {
+            let single = source.get_tile(xyz, query.as_ref()).await.unwrap();
+            let bytes =
+                maptile_core::transport::decode(&single.data, single.info.encoding).unwrap();
+            let tile = mvt::decode(&bytes).unwrap();
+            assert_eq!(tile.layers.len(), 1, "SRID {srid}, query {query:?}");
+            assert_eq!(tile.layers[0].features.len(), 1);
+            let batch = source
+                .read_tile_batch(&[xyz, xyz], query.as_ref())
+                .await
+                .unwrap();
+            assert_eq!(batch.len(), 2);
+            assert!(batch.iter().all(|tile| tile.data == bytes));
+        }
+        let mut small = config;
+        small.bounds = Some([0.001, 0.1, 0.002, 0.101]);
+        let source = PostgresTableSource::open(pool.clone(), small)
+            .await
+            .unwrap();
+        assert!(source.tilejson().minzoom.unwrap() > xyz.z);
+        assert!(source.get_tile(xyz, None).await.unwrap().data.is_empty());
+        assert!(
+            source.read_tile_batch(&[xyz], None).await.unwrap()[0]
+                .data
+                .is_empty()
+        );
+    }
+}
+
+#[tokio::test]
+async fn invalid_requests_are_rejected_before_table_sql_or_zoom_shortcuts() {
+    let Some(dsn) = common::postgres::pg_dsn() else {
+        return;
+    };
+    let guard = common::postgres::SchemaGuard::create(&dsn).await;
+    create_simple_table(&dsn, &guard.name, "validation").await;
+    let source =
+        PostgresTableSource::open(make_pool(&dsn).await, cfg_for(&guard.name, "validation"))
+            .await
+            .unwrap();
+    common::postgres::assert_invalid_tile_requests(&source, None).await;
+}
+
+#[tokio::test]
+async fn finite_reversed_bbox_retains_postgis_envelope_semantics() {
+    use maptile_core::sources::{TileQuery, mvt};
+    let Some(dsn) = common::postgres::pg_dsn() else {
+        return;
+    };
+    let guard = common::postgres::SchemaGuard::create(&dsn).await;
+    create_simple_table(&dsn, &guard.name, "envelope").await;
+    let source = PostgresTableSource::open(make_pool(&dsn).await, cfg_for(&guard.name, "envelope"))
+        .await
+        .unwrap();
+    let xyz = TileCoord { z: 0, x: 0, y: 0 };
+    let query = TileQuery {
+        bbox: Some([170.0, -10.0, -170.0, 10.0]),
+        ..Default::default()
+    };
+    let single = source.get_tile(xyz, Some(&query)).await.unwrap();
+    assert_eq!(
+        mvt::decode(&single.data).unwrap().layers[0].features.len(),
+        2
+    );
+    let batch = source.read_tile_batch(&[xyz], Some(&query)).await.unwrap();
+    assert_eq!(batch[0].data, single.data);
+}

@@ -14,7 +14,9 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
 use super::TileCoord;
 use super::geoparquet::GeoParquetSourceConfig;
-use super::geoparquet_remote::{RemoteLocation, configure_httpfs_connection, remote_error};
+use super::geoparquet_remote::{
+    QUERY_CANCELLED, RemoteLocation, SPATIAL_UNAVAILABLE, configure_httpfs_connection, remote_error,
+};
 use crate::error::{MaptileError, MaptileResult};
 
 /// Per-source execution budget, shared by all clones. DuckDB's memory limit is
@@ -95,16 +97,20 @@ impl GeometrySource {
     pub fn open_remote(
         cfg: &GeoParquetSourceConfig,
         remote: &RemoteLocation,
-        deadline: tokio::time::Instant,
+        running: &Arc<QueryControl>,
     ) -> MaptileResult<Self> {
-        Self::open_input(
+        let result = Self::open_input(
             cfg,
             &remote.url,
             None,
-            Some((remote, deadline)),
+            Some((remote, running)),
             InputKind::GeoParquet,
-        )
-        .map_err(remote_error)
+        );
+        if running.cancelled() {
+            Err(timeout())
+        } else {
+            result.map_err(remote_error)
+        }
     }
 
     #[cfg(feature = "local-vector")]
@@ -128,7 +134,7 @@ impl GeometrySource {
         cfg: &GeoParquetSourceConfig,
         location: &str,
         local: Option<(PathBuf, FileStamp)>,
-        remote: Option<(&RemoteLocation, tokio::time::Instant)>,
+        remote: Option<(&RemoteLocation, &Arc<QueryControl>)>,
         input: InputKind,
     ) -> MaptileResult<Self> {
         cfg.query_options.validate()?;
@@ -138,14 +144,19 @@ impl GeometrySource {
         if cfg.layer_name.trim().is_empty() || cfg.layer_name.contains('\0') {
             return Err(config("layer_name must be nonempty and contain no NUL"));
         }
+        if remote.is_some_and(|(_, running)| running.cancelled()) {
+            return Err(timeout());
+        }
         let conn = spatial_connection(&cfg.query_options)?;
-        let _remote_query = remote.map(|(_, deadline)| {
-            let running = QueryControl::new(&conn);
-            let cancellation = running.watch(deadline);
-            (FinishQuery(running), cancellation)
-        });
-        if let Some((remote, _)) = remote {
+        let attachment = remote.map(|(_, running)| running.attach(&conn));
+        if let Some((remote, running)) = remote {
+            if running.cancelled() {
+                return Err(timeout());
+            }
             remote.configure(&conn, cfg.query_options.timeout_ms)?;
+        }
+        if remote.is_some_and(|(_, running)| running.cancelled()) {
+            return Err(timeout());
         }
         let path_sql = literal(location);
         conn.execute_batch(&format!(
@@ -311,6 +322,9 @@ impl GeometrySource {
             },
         );
         conn.prepare(&sql).map_err(MaptileError::backend)?;
+        if remote.is_some_and(|(_, running)| running.cancelled()) {
+            return Err(timeout());
+        }
         let mut connections = Vec::with_capacity(cfg.query_options.pool_size);
         for _ in 1..cfg.query_options.pool_size {
             let cloned = conn.try_clone().map_err(MaptileError::backend)?;
@@ -319,6 +333,7 @@ impl GeometrySource {
             }
             connections.push(cloned);
         }
+        drop(attachment);
         connections.push(conn);
         check_stamp(&local)?;
         Ok(Self {
@@ -364,7 +379,7 @@ impl GeometrySource {
                 .connections
                 .pop()
                 .ok_or_else(|| config("GeoParquet query pool invariant"))?;
-            let running = QueryControl::new(&conn);
+            let running = QueryControl::pending();
             state.running.retain(|s| s.strong_count() > 0);
             state.running.push(Arc::downgrade(&running));
             state.active += 1;
@@ -382,8 +397,10 @@ impl GeometrySource {
         let local = self.local.clone();
         let options = self.options.clone();
         let task = tokio::task::spawn_blocking(move || {
+            let lease = lease;
             let _file_lease = file_lease;
             let _completion = FinishQuery(running.clone());
+            let attachment = running.attach(lease.conn.as_ref().expect("leased connection"));
             // Drop order matters: finish/disarm before the connection is reused.
             let result = (|| {
                 if running.cancelled() {
@@ -408,6 +425,12 @@ impl GeometrySource {
                 check_stamp(&local)?;
                 Ok(bytes::Bytes::from(data))
             })();
+            let result = if running.cancelled() {
+                Err(timeout())
+            } else {
+                result
+            };
+            drop(attachment);
             drop(_completion);
             drop(_file_lease);
             drop(lease);
@@ -508,9 +531,8 @@ pub(super) fn spatial_connection(options: &GeoParquetQueryOptions) -> MaptileRes
         .and_then(|c| c.with("max_temp_directory_size", "0B"))
         .map_err(MaptileError::backend)?;
     let conn = Connection::open_in_memory_with_flags(db_config).map_err(MaptileError::backend)?;
-    conn.execute_batch("LOAD parquet; LOAD spatial").map_err(|e| MaptileError::BackendMsg(format!(
-        "cannot load DuckDB spatial extension; preinstall the signed extension matching the embedded DuckDB version: {e}"
-    )))?;
+    conn.execute_batch("LOAD parquet; LOAD spatial")
+        .map_err(|_| MaptileError::BackendMsg(SPATIAL_UNAVAILABLE.into()))?;
     Ok(conn)
 }
 
@@ -772,7 +794,7 @@ fn config(message: impl Into<String>) -> MaptileError {
     MaptileError::Config(format!("geoparquet: {}", message.into()))
 }
 fn timeout() -> MaptileError {
-    MaptileError::BackendMsg("GeoParquet query exceeded its deadline or was cancelled".into())
+    MaptileError::BackendMsg(QUERY_CANCELLED.into())
 }
 
 #[cfg(test)]
@@ -1276,12 +1298,16 @@ mod tests {
         let remote = RemoteLocation::http(&original_url, BTreeMap::new()).unwrap();
         let cfg = fixture.config();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let running = QueryControl::pending();
+        let cancellation = running.watch(deadline);
         let source = tokio::task::spawn_blocking(move || {
-            GeometrySource::open_remote(&cfg, &remote, deadline)
+            let _completion = FinishQuery(running.clone());
+            GeometrySource::open_remote(&cfg, &remote, &running)
         })
         .await
         .unwrap()
         .unwrap();
+        drop(cancellation);
         assert!(
             source.sql.contains(&original_url),
             "DuckDB must query the original URL"
@@ -1494,6 +1520,94 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remote_open_error_detaches_before_outer_completion() {
+        let http = TestHttp::start(b"not a parquet file".to_vec()).await;
+        let running = QueryControl::pending();
+        let _completion = FinishQuery(running.clone());
+        let remote = RemoteLocation::http(&http.url, BTreeMap::new()).unwrap();
+        let cfg = GeoParquetSourceConfig {
+            geometry_column: Some("geom".into()),
+            ..Default::default()
+        };
+        let result = tokio::task::spawn_blocking({
+            let running = running.clone();
+            move || GeometrySource::open_remote(&cfg, &remote, &running)
+        })
+        .await
+        .unwrap();
+        assert!(result.is_err());
+        running.assert_detached();
+        running.cancel();
+        assert!(running.cancelled());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remote_open_cancellation_interrupts_active_io_and_preserves_reason() {
+        use std::sync::atomic::Ordering;
+        let fixture = fixture_points(&[(10.0, 60.0)], true);
+        let http = TestHttp::start(std::fs::read(&fixture.path).unwrap()).await;
+        http.stats.mode.store(5, Ordering::SeqCst);
+        let running = QueryControl::pending();
+        let cancellation = running.watch(tokio::time::Instant::now() + Duration::from_secs(10));
+        let config = fixture.config();
+        let remote = RemoteLocation::http(&http.url, BTreeMap::new()).unwrap();
+        let worker = tokio::task::spawn_blocking({
+            let running = running.clone();
+            move || {
+                let _completion = FinishQuery(running.clone());
+                let result = GeometrySource::open_remote(&config, &remote, &running);
+                running.assert_detached();
+                result
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), http.stats.blocked.notified())
+            .await
+            .unwrap();
+        drop(cancellation);
+        assert!(running.cancelled());
+        http.stats.resume.close();
+        let result = tokio::time::timeout(Duration::from_secs(2), worker)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(result, Err(MaptileError::BackendMsg(message)) if message == QUERY_CANCELLED)
+        );
+    }
+
+    #[test]
+    fn queued_remote_open_cancellation_never_starts_network_io() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap()
+            .block_on(async {
+                use std::sync::atomic::Ordering;
+                let fixture = fixture_points(&[(10.0, 60.0)], true);
+                let http = TestHttp::start(std::fs::read(&fixture.path).unwrap()).await;
+                let (entered, ready) = tokio::sync::oneshot::channel();
+                let (release, wait) = std::sync::mpsc::channel();
+                let blocker = tokio::task::spawn_blocking(move || {
+                    let _ = entered.send(());
+                    let _ = wait.recv();
+                });
+                ready.await.unwrap();
+                let mut opening =
+                    Box::pin(GeoParquetSource::open_http(fixture.config(), &http.url));
+                assert!(futures_util::poll!(&mut opening).is_pending());
+                drop(opening);
+                release.send(()).unwrap();
+                blocker.await.unwrap();
+                tokio::time::timeout(Duration::from_secs(2), tokio::task::spawn_blocking(|| ()))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(http.stats.requests.load(Ordering::SeqCst), 0);
+            });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn remote_close_waits_for_duckdb_read_and_can_be_cancelled_and_retried() {
         use std::sync::atomic::Ordering;
         let fixture = fixture_points(&vec![(10.0, 60.0); 100_000], true);
@@ -1566,6 +1680,7 @@ mod tests {
     }
     impl Drop for TestHttp {
         fn drop(&mut self) {
+            self.stats.resume.close();
             self.task.abort();
         }
     }
