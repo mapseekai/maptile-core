@@ -1,8 +1,7 @@
 //! Tile source contract and default per-source operations.
 use super::{
-    MosaicPixelSelection, RasterPointQuery, RasterPointResponse, TileCoord, TileEtagResponse,
-    TileInfo, TileQuery, TileResponse, archive_inspection, raster_coverage,
-    request::read_tile_batch_sequential, validate_source_request,
+    MosaicPixelSelection, RasterPointQuery, RasterPointResponse, TileCoord, TileInfo, TileQuery,
+    TileResponse, archive_inspection, raster_coverage, request::read_tile_batch_sequential,
 };
 use crate::cache::CacheZoomRange;
 use crate::error::MaptileResult;
@@ -28,26 +27,21 @@ pub enum SourceKind {
 }
 
 #[async_trait::async_trait]
-pub trait TileSource: std::any::Any + Send + Sync {
+pub trait TileSource: Send + Sync + 'static {
     fn id(&self) -> &str;
 
     fn source_kind(&self) -> SourceKind {
         SourceKind::Other
     }
 
-    /// Fingerprint used to partition cached tiles by source content.
-    ///
-    /// Cache keys include this version so a new content identity selects a new
-    /// set of entries. The default derives the fingerprint from [`Self::id`].
-    /// Sources that reuse an ID across content changes must override this method
-    /// with a content fingerprint, file generation, or durable edit revision.
-    fn content_version(&self) -> crate::cache::ContentVersion {
-        crate::cache::ContentVersion::from_input(self.id().as_bytes())
-    }
+    /// Revision of the content and metadata served by this opened source.
+    /// Store a durable content fingerprint or allocate a
+    /// [generation](crate::cache::ContentVersion::new_generation) when opening
+    /// the source. Clones of the same handle must report the same revision.
+    fn content_version(&self) -> crate::cache::ContentVersion;
 
     fn tilejson(&self) -> &tilejson::TileJSON;
     fn tile_info(&self) -> TileInfo;
-    fn clone_source(&self) -> Box<dyn TileSource>;
 
     /// Stop accepting new work and begin releasing source-owned resources.
     /// Implementations without a persistent session need no special handling.
@@ -65,7 +59,7 @@ pub trait TileSource: std::any::Any + Send + Sync {
         query: Option<&TileQuery<'_>>,
     ) -> MaptileResult<TileResponse>;
 
-    /// Read an ordered prefix of decoded tiles without the manager's online cache.
+    /// Read an ordered prefix of decoded tiles directly from the source.
     ///
     /// Empty tiles retain their position. A nonempty request returns at least
     /// one tile; resume at the returned length when the byte budget truncates it.
@@ -122,30 +116,6 @@ pub trait TileSource: std::any::Any + Send + Sync {
         )))
     }
 
-    /// Validator for a fetched or cached tile. Archives can use their content identity.
-    fn tile_etag(&self, response: &TileResponse) -> String {
-        compute_default_etag(&response.data)
-    }
-
-    /// Fetch a tile and compare its [`Self::tile_etag`] with `if_none_match`.
-    /// A match returns [`TileEtagResponse::NotModified`]; otherwise the response
-    /// includes the tile and its ETag. The default validator derives from the
-    /// payload, and a source can override it with an authoritative content ID.
-    async fn get_tile_with_etag(
-        &self,
-        xyz: TileCoord,
-        query: Option<&TileQuery<'_>>,
-        if_none_match: Option<&str>,
-    ) -> MaptileResult<TileEtagResponse> {
-        validate_source_request(self, &[xyz], query)?;
-        let resp = self.get_tile(xyz, query).await?;
-        let etag = self.tile_etag(&resp);
-        if Some(etag.as_str()) == if_none_match {
-            return Ok(TileEtagResponse::NotModified);
-        }
-        Ok(TileEtagResponse::Fresh { resp, etag })
-    }
-
     /// Whether the source consumes `TileQuery.url_query`.
     fn supports_url_query(&self) -> bool {
         false
@@ -159,12 +129,6 @@ pub trait TileSource: std::any::Any + Send + Sync {
     /// Whether the source applies a per-request [`TileQuery::style`].
     fn supports_raster_style(&self) -> bool {
         false
-    }
-
-    /// Whether the opened capability remains valid for every catalog read.
-    #[doc(hidden)]
-    fn supports_catalog_raster_style(&self) -> bool {
-        self.supports_raster_style()
     }
 
     fn supports_bbox(&self) -> bool {
@@ -192,7 +156,7 @@ pub trait TileSource: std::any::Any + Send + Sync {
     }
 
     /// Zoom-level bounds for tile caching. Returned by every source
-    /// to tell [`crate::sources::manager::SourceManager`] which zoom
+    /// to tell [`crate::control::CatalogService`] which zoom
     /// levels are worth caching for this source. The default returns
     /// [`CacheZoomRange::default()`] (cache every zoom).
     ///
@@ -202,61 +166,5 @@ pub trait TileSource: std::any::Any + Send + Sync {
     /// CDN in front of them.
     fn cache_zoom(&self) -> CacheZoomRange {
         CacheZoomRange::default()
-    }
-}
-
-fn compute_default_etag(data: &bytes::Bytes) -> String {
-    use base64::Engine as _;
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    let hash: u128 = if data.is_empty() {
-        0
-    } else {
-        xxhash_rust::xxh3::xxh3_128(data)
-    };
-    let mut s = String::with_capacity(24);
-    s.push('"');
-    s.push_str(&URL_SAFE_NO_PAD.encode(hash.to_ne_bytes()));
-    s.push('"');
-    s
-}
-
-#[cfg(test)]
-mod etag_tests {
-    use super::compute_default_etag;
-    use bytes::Bytes;
-
-    #[test]
-    fn etag_format_is_base64_url_safe_with_quotes() {
-        let etag = compute_default_etag(&Bytes::from_static(b"hello"));
-        assert_eq!(etag.len(), 24, "expected 22 base64 chars + 2 quotes");
-        assert!(etag.starts_with('"') && etag.ends_with('"'));
-        let body = &etag[1..etag.len() - 1];
-        assert!(
-            body.bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
-            "body must be base64 URL-safe (no = padding): {body}"
-        );
-    }
-
-    #[test]
-    fn etag_empty_input_is_zero_hash_base64() {
-        // xxh3_128(empty) is implementation-defined but we hash 0u128 instead.
-        // Result: base64(URL_SAFE_NO_PAD) of [0; 16] = "AAAAAAAAAAAAAAAAAAAAAA".
-        let etag = compute_default_etag(&Bytes::new());
-        assert_eq!(etag, "\"AAAAAAAAAAAAAAAAAAAAAA\"");
-    }
-
-    #[test]
-    fn etag_changes_with_data() {
-        let a = compute_default_etag(&Bytes::from_static(b"alpha"));
-        let b = compute_default_etag(&Bytes::from_static(b"beta"));
-        assert_ne!(a, b);
-    }
-
-    #[test]
-    fn etag_stable_for_same_data() {
-        let a = compute_default_etag(&Bytes::from_static(b"stable"));
-        let b = compute_default_etag(&Bytes::from_static(b"stable"));
-        assert_eq!(a, b);
     }
 }

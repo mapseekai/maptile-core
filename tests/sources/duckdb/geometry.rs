@@ -466,7 +466,7 @@ async fn clones_share_pool_and_file_lease_until_last_reader() {
     let src = GeoParquetSource::open(f.config())
         .unwrap()
         .with_file_lease(Lease(dropped.clone()));
-    let cloned = src.clone_source();
+    let cloned = src.clone();
     drop(src);
     assert_eq!(dropped.load(Ordering::SeqCst), 0);
     assert!(!cloned.get_tile(TILE, None).await.unwrap().data.is_empty());

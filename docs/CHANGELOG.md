@@ -4,11 +4,19 @@
 
 ## 未发布
 
-### 注册表故障回报与恢复协调
+### 版本化目录与瓦片读取
 
-新增 `SourceManager::mark_unavailable_if_current`，仅在注册项仍是故障操作持有的同一个 `Arc` 时标记不可用，避免迟到的旧失败关闭新实例或恢复已删除的记录。异步故障回调需从按 ID 的 `mark_unavailable` 迁移到此入口；原入口保留为管理操作，重复标记不再重置退避或打断恢复。
+`CatalogService` 与 `TileStack` 提供原子目录发布、瓦片读取、应用中间层及导出。移除 `SourceManager`、源和样式的 `Catalog` 聚合及旧故障恢复接口。应用用 `SourceCatalog::reconcile` 提交发现清单，通过 `revoke` 撤销指定快照中的源实例。 [迁移指南](migration-0.3.md)
 
-新增 `recover_unavailable`，在单个注册项内原子取得恢复资格并发布工厂结果。同一不可用代次只执行一个请求触发的工厂；其他请求立即收到 `SourceUnavailable`。失败、取消或展开栈后恢复资格释放，并重新开始 1 秒退避。迟到的成功或失败不覆盖替换、删除及发现重载发布的新状态，未发布结果按实例身份清理。`unavailable_retry_due` 仍是观察接口，恢复进行中返回 `false`。
+`CompositeDeclaration` 取代 `CompositeSource` 和 `LazyCompositeSource`。目录在发布时编译组合成员和描述符，并拒绝循环、重复叶子和超出深度限制的声明。`TileStack` 在本次快照中解析逗号分隔的临时组合。移除 `sources::mvt::merge` 和 `parse_composite_id_list`。 [组合策略](sources.md#组合多个-mvt-源)
+
+自定义 `TileSource` 必须实现 `content_version()`，为每个打开实例提供稳定修订。缺少权威版本时，在打开时保存 `ContentVersion::new_generation()` 的返回值。移除 `clone_source` 和旧组合用于向下转型的 `Any` 超特征。重复发布同一实例时复用原 `Arc`，替换实例时独立打开源。 [源版本规则](sources.md#自定义数据源与内容版本)
+
+### 样式重写与 HTTP 适配
+
+`rewrite_style_for_native` 接收 `&CatalogSnapshot`，在同一目录代次读取普通源与组合的元数据。样式列表使用 `styles::snapshot`。 [样式与资源地址](rendering.md#样式与资源地址)
+
+移除逐源 `get_tile_with_etag` 及 `TileEtagResponse`。HTTP 示例演示基于最终字节和表示元数据的 ETag 与条件请求。WMTS XML 生成代码和测试移到该示例，`/wmts.xml` 从目录读取图层元数据。渲染瓦片尺寸通过 `RenderRequest::TILE_SIZE` 取得，示例中的原生栅格使用归档尺寸。 [HTTP 示例](../examples/archive_http.rs) · [WMTS 实现](../examples/archive_http/wmts.rs)
 
 ### 数据库连接、空间边界与标识符
 
@@ -38,9 +46,7 @@ DuckDB/GeoParquet 查询的中断句柄由借用连接的局部 guard 管理，�
 
 ### 缓存所有权与并发额度
 
-Postgres 表源和函数源移除源级瓦片缓存，统一通过 `SourceManager::with_cache` 配置和读取。移除两者的 `with_cache` 以及函数源的 `set_cache` / `cache` 公共接口；直接调用源会查询数据库。管理器不再发送用于跳过源缓存的空查询标记，保留缓存合并、内容版本、查询旁路及样式/镶嵌身份。
-
-动态组合源的普通与 ETag 读取复用管理器中的成员缓存，成员身份固定在本次请求快照中；组整体仍不缓存，批量路径仍直读。静态组合源保持合并结果缓存，首次合并直接读取固定成员。
+`CatalogService` 按源策略缓存瓦片。有持久数据修订的 Postgres 表源可按 `cache_zoom` 缓存。函数源和缺少持久修订的表源每次查询数据库。移除两者的 `with_cache` 以及函数源的 `set_cache` 和 `cache` 公共接口。 [缓存规则](architecture.md#缓存身份与预算)
 
 `PoolSettings` 新增 `batch_concurrency`，默认 2，批量 SQL 额度从进程全局改为每个池独立、池克隆共享。完整结构体字面量需要补充此字段或使用 `..PoolSettings::default()`。无法确认取消后的后端完成状态时只停止受影响池的批量准入；核实残留任务后再重建池。
 
@@ -50,33 +56,25 @@ Postgres 表源和函数源移除源级瓦片缓存，统一通过 `SourceManage
 
 本地样式文件上限为 16 MiB，构造和读取时均检查；实际读取也受限，防止文件检查后增长导致无界读取。超限返回带样式 ID、路径的 `StyleFile`，其 `source` 为 `PayloadTooLarge`。此前超过上限的样式需缩小文件或改用应用提供的 `StyleStore`。
 
-发现重载在调用任何工厂前拒绝重复源 ID，返回 `Config` 并保留现有注册状态。手工构造或合并报告时，需要保证 ID 唯一；不再重复构建同 ID 的源或返回重复的 `ReloadDelta.added`。
+发现清单中出现重复源 ID 或工厂返回不同的 ID 时，`SourceCatalog::reconcile` 返回 `Config`。构建和校验失败时保留当前目录。 [目录发布与生命周期](architecture.md#目录发布与生命周期)
 
-### 错误分类与不可用记录清理
+### 错误分类
 
 渲染队列入队超时改为 `CapacityExhausted`；本地样式存储对未知 ID 返回新增的 `StyleNotFound`，文件检查、读取和 JSON 解析失败返回 `StyleFile { id, path, source }`，底层 `source` 保留 `Io` / `Json`。调用方应更新原先匹配 `Render` / `Style`、直接匹配样式 `Io` / `Json` 或解析错误字符串的逻辑。
 
-发现重载会删除报告中已消失的不可用记录，并将 ID 列入 `ReloadDelta.removed`；仍在报告中的不可用源继续尝试重建。构建失败或取消时保留原注册状态。
+直接调用 `TileSource` 的默认栅格覆盖与像元查询方法会返回 `InvalidRequest`。`TileStack` 对能力不匹配的请求返回 `Unsupported`。
 
 ### 取消与输入边界
 
 GeoParquet 远程打开的取消状态由 async 调用方持有，排队取消会跳过远程读取，在途取消连接到 DuckDB interrupt。明确安全的扩展安装和取消提示保留，其余后端诊断继续脱敏。
 
-惰性组合在普通、ETag 和批量读取中拒绝间接循环及超过 64 层的解析路径，合法嵌套与共享子组保留。发现重载在发布前拒绝与发现项 ID 不一致的工厂结果，并关闭未发布实例。
+本地样式读取校验打开后的句柄，只接受普通文件。Unix 非阻塞打开防止 FIFO 替换挂起读取。`styles::snapshot` 返回的文件错误保留样式 ID、路径和底层原因。
 
-本地样式拒绝目录和 FIFO 等非普通文件，每次读取校验打开后的句柄；Unix 非阻塞打开防止 FIFO 替换挂起读取。样式文件错误及目录快照错误保留样式 ID、路径和原始 cause。
+### GeoParquet 远程版本
 
-### 注册表与查询一致性
+不可变 HTTP(S) 和 S3 对象通过 DuckDB HTTPFS 按需读取。有强 ETag 的 HTTP 对象可在打开时验证各个 Range 并保存为本地快照。移除旧回环 HTTP 服务、`open_http_with_client` 及 `open_object_store`。
 
-源的就绪与不可用状态合并为单一注册项，修复并发注册和标记不可用时丢失恢复状态的问题。发现重载在全部新增源构建成功后才应用变更，构建失败或取消时开始关闭未发布的源；成功应用仍不提供跨 ID 的事务隔离。
-
-惰性组合源保留配置与生命周期错误，只将确实缺少成员的情况映射为空结果。关闭缓存的 ETag 读取与普通读取使用相同的镶嵌参数校验。不支持的默认 coverage/point 查询改为返回 `InvalidRequest`，调用方应按请求错误处理。
-
-### GeoParquet 远程直读
-
-远程几何查询直接使用 DuckDB HTTPFS 读取 HTTP(S) 或 S3 文件，移除回环 HTTP 服务及 GeoParquet 对 axum/reqwest 的生产依赖。空间查询、MVT 编码、连接池和关闭接口继续使用 DuckDB。`geoparquet` 不再启用 Rust `object_store`；其他数据源的存储接口不变。
-
-`open_http` 保持签名；移除 `open_http_with_client` 与 `open_object_store`，分别使用 `open_http_with_headers` 或 `open_s3`/`GeoParquetS3Options` 接入认证。此为公共 API 破坏性调整。HTTPFS 自行处理网络，应用需在部署网络层控制 DNS、重定向和出口；不再继承 Rust 客户端的网络策略。远程源每次打开分配新的缓存内容代次。迁移说明见[矢量文件指南](geoparquet.md#从回环桥接接口迁移)。
+按对象版本选择 `open_immutable_http`、`open_immutable_s3` 或 `open_http_at_etag`。未限定版本的 `open_http`、`open_http_with_headers` 和 `open_s3` 返回 `Unsupported`。部署侧负责约束 HTTPFS 的网络出口与重定向。 [固定远程对象版本](geoparquet.md#固定远程对象版本)
 
 ### WKB 输入校验
 

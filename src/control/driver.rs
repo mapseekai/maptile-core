@@ -151,21 +151,14 @@ pub trait TileDriver: Send + Sync + 'static {
 #[async_trait::async_trait]
 impl<S: TileSource + ?Sized> TileDriver for S {
     fn descriptor(&self) -> SourceDescriptor {
-        let mut revision = self.content_version();
-        // Earlier third-party sources used the bare id as their default revision.
-        if revision == ContentVersion::from_input(self.id().as_bytes()) {
-            revision = ContentVersion::new_generation();
-        }
-        let mut capabilities = SourceCapabilities::from_source(self);
-        capabilities.raster_style = self.supports_catalog_raster_style();
         SourceDescriptor {
             id: self.id().into(),
             kind: self.source_kind(),
             tilejson: self.tilejson().clone(),
             info: self.tile_info(),
-            revision,
+            revision: self.content_version(),
             cache_zoom: self.cache_zoom(),
-            capabilities,
+            capabilities: SourceCapabilities::from_source(self),
         }
     }
     async fn read(

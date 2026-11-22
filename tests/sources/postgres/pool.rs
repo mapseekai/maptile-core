@@ -371,11 +371,16 @@ async fn configured_batch_budgets_are_shared_by_clones_and_isolated_between_pool
 #[tokio::test]
 async fn batch_sql_admission_survives_a_controlled_cancellation_storm() {
     let _batch_test = BATCH_TEST_LOCK.lock().await;
-    use maptile_core::sources::{
-        TileCoord, TileQuery, TileSource,
-        postgres::{
-            PostgresFunctionConfig, PostgresFunctionSource, PostgresTableConfig,
-            PostgresTableSource,
+    use maptile_core::{
+        cache::TileCache,
+        control::CatalogService,
+        service::{ReadTarget, TileStack},
+        sources::{
+            TileCoord, TileQuery,
+            postgres::{
+                PostgresFunctionConfig, PostgresFunctionSource, PostgresTableConfig,
+                PostgresTableSource,
+            },
         },
     };
     use std::{sync::Arc, time::Duration};
@@ -404,10 +409,13 @@ async fn batch_sql_admission_survives_a_controlled_cancellation_storm() {
         CREATE SEQUENCE "{s}".started;
         CREATE FUNCTION "{s}".slow_name(value text) RETURNS text LANGUAGE plpgsql VOLATILE AS $$
         BEGIN
-          PERFORM nextval('{s}.started');
           IF (SELECT enabled FROM "{s}".control) THEN
-            BEGIN PERFORM pg_sleep(10);
-            EXCEPTION WHEN query_canceled THEN PERFORM pg_sleep(0.15); END;
+            BEGIN
+              PERFORM nextval('{s}.started');
+              PERFORM pg_sleep(10);
+            EXCEPTION WHEN query_canceled THEN
+              PERFORM pg_sleep(0.15);
+            END;
           END IF;
           RETURN value;
         END $$;
@@ -417,57 +425,41 @@ async fn batch_sql_admission_survives_a_controlled_cancellation_storm() {
         CREATE FUNCTION "{s}".storm_function(z integer,x integer,y integer) RETURNS bytea LANGUAGE plpgsql VOLATILE AS $$
         BEGIN PERFORM "{s}".slow_name('point'); RETURN decode('1a0c0a05726f6164732880207802','hex'); END $$;
     "#,s=schema.name)).await.unwrap();
-    let table_pool = Arc::new(
+    let pool = Arc::new(
         PostgresPool::connect(&named_dsn, default_settings())
             .await
             .unwrap(),
     );
-    let function_pool = table_pool.clone();
     let mut config = PostgresTableConfig::new("storm-table", &schema.name, "storm_batch");
     config.bounds = Some([-180., -85., 180., 85.]);
     config.id_column = Some("id".into());
     config.properties = Some(vec!["name".into()]);
-    let table: Arc<dyn TileSource> = Arc::new(
-        PostgresTableSource::open(table_pool.clone(), config)
-            .await
-            .unwrap()
-            .with_allowed_columns(Arc::new(std::collections::HashSet::from(["id".into()]))),
-    );
-    let function: Arc<dyn TileSource> = Arc::new(
-        PostgresFunctionSource::open(
-            function_pool,
-            PostgresFunctionConfig {
-                id: "storm-function".into(),
-                schema: schema.name.clone(),
-                function: "storm_function".into(),
-                description: None,
-                minzoom: None,
-                maxzoom: None,
-                bounds: None,
-                cache_zoom: None,
-            },
-        )
+    let table = PostgresTableSource::open(pool.clone(), config)
         .await
-        .unwrap(),
-    );
-    let manager = Arc::new(maptile_core::sources::manager::SourceManager::new());
-    manager.register(table.clone());
-    manager.register(function.clone());
-    let composite: Arc<dyn TileSource> = Arc::new(
-        maptile_core::sources::CompositeSource::new(
-            "storm-composite",
-            vec![
-                maptile_core::sources::CompositeChild::new(table.clone()),
-                maptile_core::sources::CompositeChild::new(function.clone()),
-            ],
-        )
-        .unwrap(),
-    );
-    let lazy: Arc<dyn TileSource> = Arc::new(maptile_core::sources::LazyCompositeSource::open(
-        "storm-group".into(),
-        vec![table.id().into(), function.id().into()],
-        Arc::downgrade(&manager),
-    ));
+        .unwrap()
+        .with_allowed_columns(Arc::new(std::collections::HashSet::from(["id".into()])));
+    let function = PostgresFunctionSource::open(
+        pool,
+        PostgresFunctionConfig {
+            id: "storm-function".into(),
+            schema: schema.name.clone(),
+            function: "storm_function".into(),
+            description: None,
+            minzoom: None,
+            maxzoom: None,
+            bounds: None,
+            cache_zoom: None,
+        },
+    )
+    .await
+    .unwrap();
+    let engine = Arc::new(CatalogService::new(TileCache::new(1, None, None).unwrap()));
+    let mut update = engine.catalog().update();
+    update.put(Arc::new(table)).unwrap();
+    update.put(Arc::new(function)).unwrap();
+    engine.catalog().publish(update).unwrap();
+    let stack = TileStack::builder(engine).build();
+
     monitor
         .query_one(
             &format!("SELECT setval('{}.started',1,false)", schema.name),
@@ -475,63 +467,62 @@ async fn batch_sql_admission_survives_a_controlled_cancellation_storm() {
         )
         .await
         .unwrap();
-    let admission = Arc::new(tokio::sync::Semaphore::new(2));
-    let spawn = |source: Arc<dyn TileSource>, filtered: bool| {
-        let admission = admission.clone();
+    let coords = [TileCoord {
+        z: 14,
+        x: 8192,
+        y: 8192,
+    }];
+    let spawn = |source: &'static str, filtered: bool| {
+        let stack = stack.clone();
         tokio::spawn(async move {
-            let _permit = admission.acquire_owned().await.unwrap();
             let expr = filtered.then(|| maptile_core::filter::parse_cql2("id=1").unwrap());
             let query = expr.as_ref().map(|expr| TileQuery {
                 filter: Some(expr),
                 ..TileQuery::default()
             });
-            source
-                .read_tile_batch(
-                    &[TileCoord {
-                        z: 14,
-                        x: 8192,
-                        y: 8192,
-                    }],
-                    query.as_ref(),
-                )
-                .await
+            let mut target = ReadTarget::new(source, "public");
+            target.query = query.as_ref();
+            stack.read_batch(target, &coords).await
         })
     };
-    let mut current = spawn(table.clone(), false);
-    let persistent = spawn(function.clone(), false);
+    let mut current = spawn("storm-table", false);
+    let persistent = spawn("storm-function", false);
+    let active_sql =
+        "SELECT count(*) FROM pg_stat_activity WHERE application_name=$1 AND state='active'";
+    let start_sql = format!("SELECT last_value FROM \"{}\".started", schema.name);
+    let activity_sql = format!("SELECT ({active_sql}), ({start_sql})");
     let mut peak = 0_i64;
     let mut starved = false;
     let mut expected = 2_i64;
+    let variants = [
+        ("storm-table", false),
+        ("storm-table", true),
+        ("storm-function", false),
+    ];
     for replacement in 0..=8 {
         if replacement > 0 {
             current.abort();
             let _ = current.await;
             expected = monitor
-                .query_one(
-                    &format!("SELECT last_value FROM \"{}\".started", schema.name),
-                    &[],
-                )
+                .query_one(&start_sql, &[])
                 .await
                 .unwrap()
                 .get::<_, i64>(0)
                 + 1;
-            let (source, filtered) = match replacement % 5 {
-                0 => (table.clone(), false),
-                1 => (table.clone(), true),
-                2 => (function.clone(), false),
-                3 => (composite.clone(), false),
-                _ => (lazy.clone(), false),
-            };
+            let (source, filtered) = variants[(replacement - 1) % variants.len()];
             current = spawn(source, filtered);
         }
-        let started=tokio::time::timeout(Duration::from_secs(3),async {
+        let started = tokio::time::timeout(Duration::from_secs(3), async {
             loop {
-                let row=monitor.query_one(&format!("SELECT (SELECT count(*) FROM pg_stat_activity WHERE application_name=$1 AND state='active'),(SELECT last_value FROM \"{}\".started)",schema.name),&[&name]).await.unwrap();
-                peak=peak.max(row.get::<_,i64>(0));
-                if row.get::<_,i64>(1)>=expected { break; }
+                let row = monitor.query_one(&activity_sql, &[&name]).await.unwrap();
+                peak = peak.max(row.get::<_, i64>(0));
+                if row.get::<_, i64>(1) >= expected {
+                    break;
+                }
                 tokio::time::sleep(Duration::from_millis(2)).await;
             }
-        }).await;
+        })
+        .await;
         if started.is_err() {
             starved = true;
             break;
@@ -548,50 +539,24 @@ async fn batch_sql_admission_survives_a_controlled_cancellation_storm() {
         ))
         .await
         .unwrap();
-    let stopped=tokio::time::timeout(Duration::from_secs(2),async {
+    let stopped = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            let row=monitor.query_one("SELECT count(*) FROM pg_stat_activity WHERE application_name=$1 AND state='active'",&[&name]).await.unwrap();
-            peak=peak.max(row.get::<_,i64>(0));
-            if row.get::<_,i64>(0)==0 { break; }
+            let row = monitor.query_one(active_sql, &[&name]).await.unwrap();
+            let active = row.get::<_, i64>(0);
+            peak = peak.max(active);
+            if active == 0 {
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
-    }).await;
+    })
+    .await;
     let restored = tokio::time::timeout(
         Duration::from_secs(2),
-        futures_util::future::try_join_all([
-            table.read_tile_batch(
-                &[TileCoord {
-                    z: 14,
-                    x: 8192,
-                    y: 8192,
-                }],
-                None,
-            ),
-            function.read_tile_batch(
-                &[TileCoord {
-                    z: 14,
-                    x: 8192,
-                    y: 8192,
-                }],
-                None,
-            ),
-            composite.read_tile_batch(
-                &[TileCoord {
-                    z: 14,
-                    x: 8192,
-                    y: 8192,
-                }],
-                None,
-            ),
-            lazy.read_tile_batch(
-                &[TileCoord {
-                    z: 14,
-                    x: 8192,
-                    y: 8192,
-                }],
-                None,
-            ),
-        ]),
+        futures_util::future::try_join(
+            stack.read_batch(ReadTarget::new("storm-table", "public"), &coords),
+            stack.read_batch(ReadTarget::new("storm-function", "public"), &coords),
+        ),
     )
     .await;
     monitor.query("SELECT pg_cancel_backend(pid) FROM pg_stat_activity WHERE application_name=$1 AND state='active'",&[&name]).await.unwrap();
@@ -600,16 +565,20 @@ async fn batch_sql_admission_survives_a_controlled_cancellation_storm() {
         stopped.is_ok(),
         restored.as_ref().is_ok_and(|r| r.is_ok())
     );
-    assert!(
-        peak <= 2,
-        "actual PostgreSQL batch concurrency reached {peak}"
-    );
+    assert_eq!(peak, 2, "unexpected actual PostgreSQL batch concurrency");
     assert!(!starved, "a replacement batch never acquired its SQL slot");
     assert!(stopped.is_ok(), "cancelled SQL did not finish cleanup");
-    assert!(
-        restored.unwrap().is_ok(),
-        "SQL admission slots were not restored"
-    );
+    let (table, function) = restored
+        .expect("SQL admission slots were not restored")
+        .unwrap();
+    for page in [table, function] {
+        assert_eq!(page.consumed, 1);
+        assert!(
+            page.tiles[0]
+                .tile()
+                .is_some_and(|tile| !tile.data.is_empty())
+        );
+    }
 }
 
 #[tokio::test]

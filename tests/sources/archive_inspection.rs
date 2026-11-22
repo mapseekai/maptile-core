@@ -149,6 +149,75 @@ mod task14_probe {
     }
 
     #[tokio::test]
+    async fn catalog_serves_vector_mbtiles_and_raster_pmtiles_independently() {
+        use maptile_core::{
+            cache::TileCache,
+            control::CatalogService,
+            service::{ReadTarget, TileStack},
+            sources::mvt,
+        };
+        use std::sync::Arc;
+
+        let vector = mvt::encode(&mvt::proto::Tile {
+            layers: vec![mvt::proto::Layer {
+                name: "roads".into(),
+                version: 2,
+                ..Default::default()
+            }],
+        });
+        let mb = mbtiles(
+            "pbf",
+            &vector,
+            Some(r#"[{"id":"roads","fields":{}}]"#),
+            None,
+        );
+        let pm = raster_pmtiles();
+        let roads = MbtilesSource::open(MbtilesConfig {
+            id: "roads".into(),
+            path: mb.path().into(),
+            serve_as: None,
+            description: None,
+        })
+        .await
+        .unwrap();
+        let imagery = LocalPmtilesSource::open(PmtilesConfig {
+            id: "imagery".into(),
+            path: pm.path().to_str().unwrap().into(),
+            serve_as: None,
+            description: None,
+        })
+        .await
+        .unwrap();
+        let service = Arc::new(CatalogService::new(TileCache::new(1, None, None).unwrap()));
+        let mut update = service.catalog().update();
+        update.put(Arc::new(roads)).unwrap();
+        update.put(Arc::new(imagery)).unwrap();
+        service.catalog().publish(update).unwrap();
+        let snapshot = service.catalog().snapshot();
+        assert_eq!(
+            snapshot.describe("roads").unwrap().info.format,
+            TileFormat::Mvt
+        );
+        assert_eq!(
+            snapshot.describe("imagery").unwrap().info.format,
+            TileFormat::Png
+        );
+        let stack = TileStack::builder(service).build();
+        let coord = TileCoord { z: 0, x: 0, y: 0 };
+        let roads = stack
+            .read(ReadTarget::new("roads", "public").at(coord))
+            .await
+            .unwrap();
+        assert_eq!(roads.tile().unwrap().data, vector);
+        let imagery = stack
+            .read(ReadTarget::new("imagery", "public").at(coord))
+            .await
+            .unwrap();
+        let raster = image::load_from_memory(&imagery.tile().unwrap().data).unwrap();
+        assert_eq!((raster.width(), raster.height()), (256, 256));
+    }
+
+    #[tokio::test]
     async fn emits_shared_archive_inspection_and_native_byte_probe() {
         let Ok(output) = std::env::var("MAPSEEK_TASK14_PROBE_OUTPUT") else {
             return;

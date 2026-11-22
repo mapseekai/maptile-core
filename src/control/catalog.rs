@@ -168,12 +168,14 @@ pub struct CatalogUpdate {
 
 impl CatalogUpdate {
     /// After admission, the catalog owns cleanup even if publication fails. A stopped catalog rejects new ownership.
+    /// Keep one `Arc` per opened driver and clone that `Arc` to publish it again in this catalog.
+    /// A replacement must own an independent lifecycle: retiring the previous driver closes its resources.
     pub fn put(&mut self, driver: Arc<dyn TileDriver>) -> MaptileResult<()> {
         self.put_driver(driver, false)
     }
 
     /// The publisher guarantees MVT 2.1 conformance and complete declared layer names at every coordinate.
-    /// Composition still checks the actual layer names of every tile.
+    /// Composition still checks the actual layer names of every tile. Ownership follows [`Self::put`].
     pub fn put_trusted_mvt(&mut self, driver: Arc<dyn TileDriver>) -> MaptileResult<()> {
         self.put_driver(driver, true)
     }

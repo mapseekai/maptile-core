@@ -1,6 +1,6 @@
 use maptile_core::error::MaptileError;
 use maptile_core::sources::pmtiles::{LocalPmtilesSource, PmtilesConfig};
-use maptile_core::sources::{TileCoord, TileEtagResponse, TileFormat, TileSource};
+use maptile_core::sources::{TileCoord, TileFormat, TileSource};
 
 const FIXTURE_PATH: &str = "tests/fixtures/sample.pmtiles";
 
@@ -217,31 +217,6 @@ async fn get_tile_returns_not_found_for_missing_coord() {
 }
 
 #[tokio::test]
-async fn get_tile_with_etag_round_trip() {
-    ensure_fixture().await;
-    let cfg = PmtilesConfig {
-        id: "s".into(),
-        path: FIXTURE_PATH.into(),
-        serve_as: None,
-        description: None,
-    };
-    let src = LocalPmtilesSource::open(cfg).await.unwrap();
-    let first = src
-        .get_tile_with_etag(TileCoord { z: 0, x: 0, y: 0 }, None, None)
-        .await
-        .unwrap();
-    let etag = match first {
-        TileEtagResponse::Fresh { etag, .. } => etag,
-        _ => panic!("expected Fresh response"),
-    };
-    let second = src
-        .get_tile_with_etag(TileCoord { z: 0, x: 0, y: 0 }, None, Some(&etag))
-        .await
-        .unwrap();
-    assert!(matches!(second, TileEtagResponse::NotModified));
-}
-
-#[tokio::test]
 async fn serve_as_overrides_format() {
     ensure_fixture().await;
     let cfg = PmtilesConfig {
@@ -255,7 +230,7 @@ async fn serve_as_overrides_format() {
 }
 
 #[tokio::test]
-async fn clone_source_works() {
+async fn cloned_archive_reads_the_same_tile() {
     ensure_fixture().await;
     let cfg = PmtilesConfig {
         id: "s".into(),
@@ -264,7 +239,7 @@ async fn clone_source_works() {
         description: None,
     };
     let src = LocalPmtilesSource::open(cfg).await.unwrap();
-    let cloned = src.clone_source();
+    let cloned = src.clone();
     assert_eq!(cloned.id(), "s");
 }
 

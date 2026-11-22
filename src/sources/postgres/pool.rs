@@ -25,7 +25,9 @@ use super::{MINIMUM_POSTGIS_VERSION, MINIMUM_POSTGRES_VERSION, ST_TILE_ENVELOPE_
 #[derive(Clone, Debug)]
 pub struct PoolSettings {
     pub max_size: usize,
-    /// Maximum active batch operations, including cancellation cleanup, per pool.
+    /// Maximum concurrent native SQL batches per pool, including cancellation cleanup.
+    /// A layer-free [`crate::service::TileStack::read_batch`] request to a PostGIS
+    /// vector source uses this budget. Individual reads and composition use ordinary pool connections.
     /// Clones share the budget; separately connected pools have independent budgets.
     pub batch_concurrency: usize,
     pub wait_timeout_ms: u64,

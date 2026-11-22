@@ -183,9 +183,6 @@ impl TileSource for FlatGeobufSource {
     fn cache_zoom(&self) -> crate::cache::CacheZoomRange {
         self.0.cache_zoom()
     }
-    fn clone_source(&self) -> Box<dyn TileSource> {
-        Box::new(self.clone())
-    }
     fn start_close(&self) {
         Self::start_close(self);
     }
@@ -628,9 +625,10 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn flatgeobuf_atomic_replacement_changes_manager_cache_generation() {
+    async fn flatgeobuf_atomic_replacement_changes_catalog_cache_generation() {
         use crate::cache::TileCache;
-        use crate::sources::manager::SourceManager;
+        use crate::control::CatalogService;
+        use crate::service::{ReadTarget, TileStack};
         use std::os::unix::fs::MetadataExt;
 
         let dir = tempfile::tempdir().unwrap();
@@ -665,20 +663,42 @@ mod tests {
 
         let cfg = fgb_config(path.clone());
         let old = Arc::new(FlatGeobufSource::open(cfg.clone()).unwrap());
-        let manager =
-            SourceManager::new().with_cache(Arc::new(TileCache::new(8, None, None).unwrap()));
-        manager.register(old.clone());
-        let cached = manager.get_tile(&cfg.id, TILE, None).await.unwrap().data;
+        let service = Arc::new(CatalogService::new(TileCache::new(8, None, None).unwrap()));
+        let mut update = service.catalog().update();
+        update.put(old.clone()).unwrap();
+        service.catalog().publish(update).unwrap();
+        let stack = TileStack::builder(service.clone()).build();
+        let target = ReadTarget::new(&cfg.id, "public");
+        let cached = stack
+            .read(target.at(TILE))
+            .await
+            .unwrap()
+            .tile()
+            .unwrap()
+            .data
+            .clone();
         std::fs::rename(replacement, &path).unwrap();
         assert!(old.get_tile(TILE, None).await.is_err());
         let new = Arc::new(FlatGeobufSource::open(cfg.clone()).unwrap());
         assert_ne!(old.content_version(), new.content_version());
-        assert_eq!(new.content_version(), new.clone_source().content_version());
+        assert_eq!(
+            new.content_version(),
+            new.as_ref().clone().content_version()
+        );
         let expected = new.get_tile(TILE, None).await.unwrap().data;
         assert_ne!(cached, expected);
-        manager.register(new.clone());
+        let mut update = service.catalog().update();
+        update.put(new.clone()).unwrap();
+        service.catalog().publish(update).unwrap();
         assert_eq!(
-            manager.get_tile(&cfg.id, TILE, None).await.unwrap().data,
+            stack
+                .read(target.at(TILE))
+                .await
+                .unwrap()
+                .tile()
+                .unwrap()
+                .data
+                .clone(),
             expected
         );
         old.close().await.unwrap();

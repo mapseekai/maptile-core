@@ -6,7 +6,8 @@
 //! - [`CACHE_REQUESTS_TOTAL`]: lookups for caches WITHOUT a zoom
 //!   dimension (sprite, font, style — placeholder for future).
 //! - [`TILE_CACHE_REQUESTS_TOTAL`]: lookups for caches keyed by tile
-//!   coordinates, with a `zoom` label. Used by [`crate::cache::TileCache::get_or_insert`].
+//!   coordinates, with a `zoom` label. Counts each online [`crate::service::TileStack`]
+//!   cache lookup and each successful [`crate::cache::TileCache::get_or_insert`] call.
 //!
 //! All metrics are registered against the default Prometheus registry
 //! via `register_int_counter_vec!` on first access (`LazyLock`).
@@ -52,6 +53,17 @@ pub const ZOOM_LABELS: [&str; 31] = [
     "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16",
     "17", "18", "19", "20", "21", "22", "23", "24", "25", "26", "27", "28", "29", "30",
 ];
+
+pub(crate) fn record_tile_cache_lookup(zoom: u8, hit: bool) {
+    let result = if hit { "hit" } else { "miss" };
+    let zoom = ZOOM_LABELS
+        .get(usize::from(zoom))
+        .copied()
+        .unwrap_or("other");
+    TILE_CACHE_REQUESTS_TOTAL
+        .with_label_values(&["tile", result, zoom])
+        .inc();
+}
 
 #[cfg(test)]
 mod tests {

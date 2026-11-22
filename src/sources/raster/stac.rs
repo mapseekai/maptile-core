@@ -5,8 +5,8 @@ use crate::error::{MaptileError, MaptileResult};
 use crate::raster::style::EffectiveStyle;
 use crate::sources::{
     MosaicPixelSelection, SourceKind, TileCoord, TileEncoding, TileFormat, TileInfo, TileQuery,
-    TileResponse, TileSource, effective_pixel_selection, tile_math::MAX_ZOOM,
-    validate_source_request, validate_tile_request,
+    TileResponse, TileSource, effective_pixel_selection, request::validate_source_request,
+    tile_math::MAX_ZOOM, validate_tile_request,
 };
 use async_geotiff::{
     bounds::Bbox,
@@ -303,10 +303,6 @@ impl TileSource for StacSource {
 
     fn content_version(&self) -> crate::cache::ContentVersion {
         self.content_version
-    }
-
-    fn clone_source(&self) -> Box<dyn TileSource> {
-        Box::new(self.clone())
     }
 
     fn supports_raster_style(&self) -> bool {

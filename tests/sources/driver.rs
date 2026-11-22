@@ -1,12 +1,15 @@
 use async_trait::async_trait;
 use bytes::Bytes;
+use maptile_core::cache::ContentVersion;
+use maptile_core::control::TileDriver;
 use maptile_core::error::MaptileResult;
-use maptile_core::sources::{TileCoord, TileEtagResponse, TileQuery, TileResponse, TileSource};
+use maptile_core::sources::{TileCoord, TileQuery, TileResponse, TileSource};
 use maptile_core::sources::{TileEncoding, TileFormat, TileInfo};
 use tilejson::{TileJSON, tilejson};
 
 struct MockSource {
     id: String,
+    revision: ContentVersion,
     body: Bytes,
     tj: TileJSON,
     encoding: TileEncoding,
@@ -18,6 +21,7 @@ impl MockSource {
     fn new(id: &str, body: &[u8]) -> Self {
         Self {
             id: id.to_string(),
+            revision: ContentVersion::new_generation(),
             body: Bytes::copy_from_slice(body),
             tj: tilejson! { tiles: vec![] },
             encoding: TileEncoding::Uncompressed,
@@ -41,15 +45,8 @@ impl TileSource for MockSource {
             encoding: self.encoding,
         }
     }
-    fn clone_source(&self) -> Box<dyn TileSource> {
-        Box::new(MockSource {
-            id: self.id.clone(),
-            body: self.body.clone(),
-            tj: self.tj.clone(),
-            encoding: self.encoding,
-            coordinate_payload: self.coordinate_payload,
-            missing_x: self.missing_x,
-        })
+    fn content_version(&self) -> ContentVersion {
+        self.revision
     }
     async fn get_tile(
         &self,
@@ -135,40 +132,6 @@ async fn batch_default_returns_a_bounded_prefix_and_can_resume() {
     );
 }
 
-#[tokio::test]
-async fn default_get_tile_with_etag_returns_fresh_when_no_match() {
-    let src = MockSource::new("m", b"hello");
-    let resp = src
-        .get_tile_with_etag(TileCoord { z: 0, x: 0, y: 0 }, None, None)
-        .await
-        .unwrap();
-    match resp {
-        TileEtagResponse::Fresh { resp, etag } => {
-            assert_eq!(resp.data.as_ref(), b"hello");
-            assert!(!etag.is_empty());
-        }
-        TileEtagResponse::NotModified => panic!("expected Fresh"),
-    }
-}
-
-#[tokio::test]
-async fn default_get_tile_with_etag_returns_not_modified_on_match() {
-    let src = MockSource::new("m", b"hello");
-    let first = src
-        .get_tile_with_etag(TileCoord { z: 0, x: 0, y: 0 }, None, None)
-        .await
-        .unwrap();
-    let etag = match first {
-        TileEtagResponse::Fresh { etag, .. } => etag,
-        _ => panic!(),
-    };
-    let second = src
-        .get_tile_with_etag(TileCoord { z: 0, x: 0, y: 0 }, None, Some(&etag))
-        .await
-        .unwrap();
-    assert!(matches!(second, TileEtagResponse::NotModified));
-}
-
 #[test]
 fn capability_defaults_are_false() {
     let src = MockSource::new("m", b"x");
@@ -202,14 +165,15 @@ async fn unsupported_raster_capabilities_are_invalid_requests() {
 }
 
 #[test]
-fn default_content_version_is_id_based() {
-    use maptile_core::cache::ContentVersion;
-    let a = ContentVersion::from_input(b"src_test");
-    let b = ContentVersion::from_input(b"src_test");
-    let c = ContentVersion::from_input(b"src_other");
-    assert_eq!(a, b, "deterministic");
-    assert_ne!(a, c, "id-sensitive");
-    assert_eq!(a.to_hex().len(), 64, "full SHA-256 identity is preserved");
+fn descriptor_uses_the_revision_provided_by_the_open_source() {
+    let mut source = MockSource::new("same-id", b"old");
+    let reopened = MockSource::new("same-id", b"new");
+    let revision = source.content_version();
+    assert_eq!(source.descriptor().revision, revision);
+    assert_ne!(reopened.descriptor().revision, revision);
+
+    source.revision = ContentVersion::from_input(source.id.as_bytes());
+    assert_eq!(source.descriptor().revision, source.revision);
 }
 
 #[test]

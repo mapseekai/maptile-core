@@ -1,10 +1,9 @@
-//! Tile source contracts, archive and database drivers, and compatibility entry points.
+//! Tile source contracts and concrete archive, database, vector and raster backends.
 
 pub mod archive_inspection;
 mod driver;
 #[cfg(feature = "duckdb")]
 mod duckdb;
-mod legacy;
 #[cfg(feature = "mbtiles")]
 pub mod mbtiles;
 pub mod mvt;
@@ -18,19 +17,16 @@ mod raster;
 mod request;
 
 pub use crate::core::{
-    response::{TileEtagResponse, TileResponse},
+    response::TileResponse,
     tile_math,
     tile_types::{Encoding as TileEncoding, Format as TileFormat, TileCoord, TileInfo},
 };
-pub use composite::{CompositeChild, CompositeSource};
 pub use driver::{SourceKind, TileSource};
-pub use lazy_composite::LazyCompositeSource;
-pub use legacy::{composite, lazy_composite, manager};
+pub(crate) use request::validate_tile_request;
 pub use request::{
     MAX_TILE_BATCH_BYTES, MAX_TILE_BATCH_COORDS, MosaicPixelSelection, RasterPointQuery,
-    RasterPointResponse, TileQuery, effective_pixel_selection, parse_composite_id_list,
+    RasterPointResponse, TileQuery, effective_pixel_selection,
 };
-pub(crate) use request::{read_tile_batch_with, validate_source_request, validate_tile_request};
 
 #[cfg(feature = "agtiff")]
 pub use mosaic_source::{MosaicMember, MosaicSource, MosaicSourceConfig, pixel_selection_from_str};

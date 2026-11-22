@@ -48,7 +48,7 @@ use crate::sources::archive_inspection::{
 };
 use crate::sources::{
     SourceKind, TileCoord, TileEncoding, TileFormat, TileInfo, TileQuery, TileResponse, TileSource,
-    validate_source_request,
+    request::validate_source_request,
 };
 use crate::transport::{
     CATALOG_BUILD_LEASE, MAX_DECODED_TILE_BYTES, SOURCE_READ_LEASE, decode_async, run_blocking,
@@ -339,10 +339,6 @@ impl TileSource for MbtilesSource {
 
     fn tile_info(&self) -> TileInfo {
         self.info
-    }
-
-    fn clone_source(&self) -> Box<dyn TileSource> {
-        Box::new(self.clone())
     }
 
     fn content_version(&self) -> ContentVersion {

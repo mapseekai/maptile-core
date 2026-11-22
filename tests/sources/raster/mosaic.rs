@@ -489,16 +489,20 @@ async fn request_selection_executes_all_async_geotiff_reducers() {
 #[tokio::test]
 async fn request_selection_overrides_style_and_partitions_the_cache() {
     use maptile_core::cache::{StyleHash, TileCache};
-    use maptile_core::sources::manager::SourceManager;
+    use maptile_core::control::CatalogService;
+    use maptile_core::service::{ReadTarget, TileStack};
     let fixture = AlgorithmFixture::new().await;
     let mut ranked = fixture.style.raster_style().as_value().clone();
     ranked["raster:mosaic"]["pixel_selection"] = "highest".into();
     ranked["raster:mosaic"]["rank_channel"] = 1.into();
     let style =
         EffectiveStyle::from_raster_style(RasterStyle::from_value(ranked).unwrap()).unwrap();
-    let manager = SourceManager::new().with_cache(Arc::new(TileCache::new(1, None, None).unwrap()));
+    let service = Arc::new(CatalogService::new(TileCache::new(1, None, None).unwrap()));
     let id = fixture.source.id().to_string();
-    manager.register(Arc::new(fixture.source));
+    let mut update = service.catalog().update();
+    update.put(Arc::new(fixture.source)).unwrap();
+    service.catalog().publish(update).unwrap();
+    let stack = TileStack::builder(service).build();
     let coord = TileCoord { z: 0, x: 0, y: 0 };
     for (selection, value) in [
         (None, 90),
@@ -511,7 +515,12 @@ async fn request_selection_overrides_style_and_partitions_the_cache() {
             pixel_selection: selection,
             ..Default::default()
         };
-        let tile = manager.get_tile(&id, coord, Some(&query)).await.unwrap();
+        let target = ReadTarget {
+            query: Some(&query),
+            ..ReadTarget::new(&id, "public")
+        };
+        let outcome = stack.read(target.at(coord)).await.unwrap();
+        let tile = outcome.tile().unwrap();
         let rgba = image::load_from_memory(&tile.data).unwrap().to_rgba8();
         assert_eq!(
             rgba.get_pixel(rgba.width() / 2, rgba.height() / 2).0[0],

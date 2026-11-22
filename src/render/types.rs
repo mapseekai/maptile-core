@@ -6,8 +6,6 @@
 
 use std::str::FromStr;
 
-use crate::core::RENDER_TILE_SIZE;
-
 pub(crate) fn mercator_y(lat: f64) -> f64 {
     lat.clamp(-85.051_128_779_806_6, 85.051_128_779_806_6)
         .to_radians()
@@ -123,8 +121,11 @@ pub struct RenderRequest {
 }
 
 impl RenderRequest {
+    /// Logical width and height in pixels of a rendered tile at scale 1.
+    pub const TILE_SIZE: u32 = 512;
+
     /// Build a request for raster tile (z, x, y) at the given scale and format.
-    /// Tile size is fixed at 512px (the de-facto MapLibre default).
+    /// The logical tile dimensions are fixed at [`Self::TILE_SIZE`].
     #[must_use]
     pub fn for_tile(
         style_json: impl Into<String>,
@@ -145,8 +146,8 @@ impl RenderRequest {
             style_json: style_json.into(),
             isolate_native_state: false,
             camera: RenderCamera::new(lon, lat, z as f64),
-            width: RENDER_TILE_SIZE,
-            height: RENDER_TILE_SIZE,
+            width: Self::TILE_SIZE,
+            height: Self::TILE_SIZE,
             scale,
             format,
             #[cfg(feature = "render")]

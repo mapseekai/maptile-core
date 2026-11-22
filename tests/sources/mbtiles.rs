@@ -41,9 +41,7 @@ mod mbtiles_tools_smoke {
 mod mbtiles {
     use maptile_core::error::MaptileError;
     use maptile_core::sources::mbtiles::{MbtilesConfig, MbtilesSource};
-    use maptile_core::sources::{
-        TileCoord, TileEncoding, TileEtagResponse, TileFormat, TileSource,
-    };
+    use maptile_core::sources::{TileCoord, TileEncoding, TileFormat, TileSource};
     use std::path::PathBuf;
 
     #[tokio::test]
@@ -245,10 +243,6 @@ mod mbtiles {
                     .read_tile_batch(&[coord], Some(&query))
                     .await
                     .unwrap_err(),
-                source
-                    .get_tile_with_etag(coord, Some(&query), None)
-                    .await
-                    .unwrap_err(),
             ];
             assert!(
                 errors
@@ -278,31 +272,6 @@ mod mbtiles {
     }
 
     #[tokio::test]
-    async fn get_tile_with_etag_round_trip() {
-        let fixture = fixture();
-        let cfg = MbtilesConfig {
-            id: "s".into(),
-            path: fixture.path().to_path_buf(),
-            serve_as: None,
-            description: None,
-        };
-        let src = MbtilesSource::open(cfg).await.unwrap();
-        let first = src
-            .get_tile_with_etag(TileCoord { z: 0, x: 0, y: 0 }, None, None)
-            .await
-            .unwrap();
-        let etag = match first {
-            TileEtagResponse::Fresh { etag, .. } => etag,
-            _ => panic!("expected Fresh"),
-        };
-        let second = src
-            .get_tile_with_etag(TileCoord { z: 0, x: 0, y: 0 }, None, Some(&etag))
-            .await
-            .unwrap();
-        assert!(matches!(second, TileEtagResponse::NotModified));
-    }
-
-    #[tokio::test]
     async fn serve_as_overrides_format_only() {
         let fixture = fixture();
         let cfg = MbtilesConfig {
@@ -323,7 +292,14 @@ mod mbtiles {
     }
 
     #[tokio::test]
-    async fn clone_source_works() {
+    async fn republishing_the_same_archive_handle_keeps_its_pool_readable() {
+        use maptile_core::{
+            cache::TileCache,
+            control::CatalogService,
+            service::{ReadTarget, TileStack},
+        };
+        use std::sync::Arc;
+
         let fixture = fixture();
         let cfg = MbtilesConfig {
             id: "s".into(),
@@ -332,12 +308,21 @@ mod mbtiles {
             description: None,
         };
         let src = MbtilesSource::open(cfg).await.unwrap();
-        let cloned = src.clone_source();
-        assert_eq!(cloned.id(), "s");
-        cloned
-            .get_tile(TileCoord { z: 0, x: 0, y: 0 }, None)
-            .await
-            .unwrap();
+        let coord = TileCoord { z: 0, x: 0, y: 0 };
+        let expected = src.clone().get_tile(coord, None).await.unwrap().data;
+        let handle = Arc::new(src);
+        let service = Arc::new(CatalogService::new(TileCache::new(1, None, None).unwrap()));
+        let stack = TileStack::builder(service.clone()).build();
+        for scope in ["before", "after"] {
+            let mut update = service.catalog().update();
+            update.put(handle.clone()).unwrap();
+            service.catalog().publish(update).unwrap();
+            let outcome = stack
+                .read(ReadTarget::new("s", scope).at(coord))
+                .await
+                .unwrap();
+            assert_eq!(outcome.tile().unwrap().data, expected);
+        }
     }
 
     // Each test owns a complete PNG archive; no shared on-disk fixture or
@@ -346,7 +331,8 @@ mod mbtiles {
     #[tokio::test]
     async fn replacing_archive_cannot_fill_the_new_generation_from_the_old_pool() {
         use maptile_core::cache::TileCache;
-        use maptile_core::sources::manager::SourceManager;
+        use maptile_core::control::CatalogService;
+        use maptile_core::service::{ReadTarget, TileStack};
         use std::sync::Arc;
 
         let first = fixture();
@@ -358,26 +344,45 @@ mod mbtiles {
         };
         let old = Arc::new(MbtilesSource::open(cfg.clone()).await.unwrap());
         let version = old.content_version();
-        let manager =
-            SourceManager::new().with_cache(Arc::new(TileCache::new(8, None, None).unwrap()));
-        manager.register(old.clone());
+        let service = Arc::new(CatalogService::new(TileCache::new(8, None, None).unwrap()));
+        let mut update = service.catalog().update();
+        update.put(old.clone()).unwrap();
+        service.catalog().publish(update).unwrap();
+        let stack = TileStack::builder(service.clone()).build();
         let coord = TileCoord { z: 0, x: 0, y: 0 };
-        let before = manager.get_tile("stable", coord, None).await.unwrap().data;
+        let target = ReadTarget::new("stable", "public");
+        let before = stack
+            .read(target.at(coord))
+            .await
+            .unwrap()
+            .tile()
+            .unwrap()
+            .data
+            .clone();
         let replacement = fixture_with_color([255, 0, 0]);
         replacement.persist(first.path()).unwrap();
         assert_eq!(old.content_version(), version);
         let uncached = TileCoord { z: 1, x: 0, y: 1 };
         assert!(matches!(
-            manager.get_tile("stable", uncached, None).await,
+            stack.read(target.at(uncached)).await,
             Err(MaptileError::VersionChanged(_))
         ));
         let new = Arc::new(MbtilesSource::open(cfg).await.unwrap());
         assert_ne!(new.content_version(), version);
         let expected = new.get_tile(coord, None).await.unwrap().data;
         assert_ne!(before, expected);
-        manager.register(new);
+        let mut update = service.catalog().update();
+        update.put(new).unwrap();
+        service.catalog().publish(update).unwrap();
         assert_eq!(
-            manager.get_tile("stable", coord, None).await.unwrap().data,
+            stack
+                .read(target.at(coord))
+                .await
+                .unwrap()
+                .tile()
+                .unwrap()
+                .data
+                .clone(),
             expected
         );
     }
@@ -427,12 +432,7 @@ mod mbtiles {
         std::env::set_current_dir(other_dir.path()).unwrap();
         assert_eq!(source.get_tile(coord, None).await.unwrap().data, expected);
         assert_eq!(
-            source
-                .clone_source()
-                .get_tile(coord, None)
-                .await
-                .unwrap()
-                .data,
+            source.clone().get_tile(coord, None).await.unwrap().data,
             expected
         );
         writer

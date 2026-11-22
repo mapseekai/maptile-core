@@ -14,7 +14,7 @@ use crate::error::{MaptileError, MaptileResult};
 use crate::io::file_stamp::FileStamp;
 use crate::sources::{
     SourceKind, TileCoord, TileEncoding, TileFormat, TileInfo, TileQuery, TileResponse, TileSource,
-    validate_source_request,
+    request::validate_source_request,
 };
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -369,9 +369,6 @@ impl TileSource for GeoParquetSource {
     }
     fn cache_zoom(&self) -> crate::cache::CacheZoomRange {
         self.cache_zoom
-    }
-    fn clone_source(&self) -> Box<dyn TileSource> {
-        Box::new(self.clone())
     }
 
     fn start_close(&self) {

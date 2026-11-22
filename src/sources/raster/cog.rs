@@ -34,7 +34,7 @@ use crate::io::file_stamp::FileStamp;
 use crate::raster::agtiff_style::to_tile_style;
 use crate::sources::{
     RasterPointQuery, RasterPointResponse, SourceKind, TileCoord, TileEncoding, TileFormat,
-    TileInfo, TileQuery, TileResponse, TileSource, validate_source_request,
+    TileInfo, TileQuery, TileResponse, TileSource, request::validate_source_request,
 };
 
 fn backend_err(msg: String) -> MaptileError {
@@ -315,10 +315,6 @@ impl TileSource for AsyncCogSource {
 
     fn cache_zoom(&self) -> crate::cache::CacheZoomRange {
         self.cache_zoom
-    }
-
-    fn clone_source(&self) -> Box<dyn TileSource> {
-        Box::new(self.clone())
     }
 
     fn content_version(&self) -> crate::cache::ContentVersion {

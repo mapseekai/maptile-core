@@ -284,15 +284,17 @@ fn compressed_hot_tile_passes_through_layers_without_a_blocking_worker() {
         identity.update(&CACHE_SCHEMA_VERSION.to_le_bytes());
         identity.update(&hex::decode(descriptor.revision.to_hex()).unwrap());
         identity.update(b"public");
+        // Isolate the process-wide hit counter from other tests in this binary.
+        let coord = TileCoord { z: 28, ..ORIGIN };
         let key = TileCacheKey::new(
             descriptor.id.clone(),
             ContentVersion::from_bytes(*identity.finalize().as_bytes()),
-            ORIGIN.z,
-            ORIGIN.x,
-            ORIGIN.y,
+            coord.z,
+            coord.x,
+            coord.y,
             canonical_render_hash(None, None, 256, 1, 0),
         );
-        let req = ReadTarget::new("sample", "public").at(ORIGIN);
+        let req = ReadTarget::new("sample", "public").at(coord);
         let plain = TileStack::builder(service.clone()).build();
         let stack = TileStack::builder(service)
             .layer(Record("outer", Arc::default()))
@@ -332,12 +334,24 @@ fn compressed_hot_tile_passes_through_layers_without_a_blocking_worker() {
         }
 
         cache.insert(key, oversized_gzip_tile()).await;
+        #[cfg(feature = "metrics")]
+        let hits_before = maptile_core::metrics::TILE_CACHE_REQUESTS_TOTAL
+            .with_label_values(&["tile", "hit", "28"])
+            .get();
         for stack in [plain, stack] {
             assert_eq!(
                 stack.read(req).await.unwrap_err().kind(),
                 ErrorKind::ResourceLimit
             );
         }
+        #[cfg(feature = "metrics")]
+        assert_eq!(
+            maptile_core::metrics::TILE_CACHE_REQUESTS_TOTAL
+                .with_label_values(&["tile", "hit", "28"])
+                .get()
+                - hits_before,
+            2
+        );
         assert_eq!(driver.calls.load(Ordering::SeqCst), 1);
     });
 }
@@ -462,6 +476,36 @@ async fn one_waiter_can_leave_a_shared_fill_and_the_remaining_waiter_gets_the_ti
         TileOutcome::Present(_)
     ));
     assert_eq!(driver.calls.load(Ordering::SeqCst), 1);
+}
+
+#[cfg(feature = "metrics")]
+#[tokio::test]
+async fn online_tile_cache_metrics_count_one_lookup_per_request_and_exclude_exports() {
+    let driver = Arc::new(Driver::new("metrics", "v1", Bytes::from_static(b"tile")));
+    let stack = TileStack::builder(engine(driver.clone())).build();
+    let target = ReadTarget::new("metrics", "public");
+    let coord = TileCoord { z: 29, x: 0, y: 0 };
+    let lookups = |result| {
+        maptile_core::metrics::TILE_CACHE_REQUESTS_TOTAL
+            .with_label_values(&["tile", result, "29"])
+            .get()
+    };
+    let hits = lookups("hit");
+    let misses = lookups("miss");
+
+    for _ in 0..2 {
+        assert!(stack.read(target.at(coord)).await.unwrap().tile().is_some());
+    }
+    assert_eq!(driver.calls.load(Ordering::SeqCst), 1);
+    let export = stack.begin_export(target).unwrap();
+    let page = export
+        .read_page(&[coord, TileCoord { x: 1, ..coord }])
+        .await
+        .unwrap();
+    assert_eq!(page.consumed, 2);
+    assert_eq!(driver.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(lookups("miss") - misses, 1);
+    assert_eq!(lookups("hit") - hits, 1);
 }
 
 #[tokio::test]

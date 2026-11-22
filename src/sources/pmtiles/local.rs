@@ -9,8 +9,8 @@ use crate::error::{MaptileError, MaptileResult};
 use crate::io::file_stamp::FileStamp;
 use crate::sources::archive_inspection::ArchiveSourceType;
 use crate::sources::pmtiles::{
-    PmtilesConfig, archive_content_version, archive_tile_etag, pmt_compression_to_encoding,
-    pmt_tile_type_to_format, reader::Reader,
+    PmtilesConfig, archive_content_version, pmt_compression_to_encoding, pmt_tile_type_to_format,
+    reader::Reader,
 };
 use crate::sources::{SourceKind, TileCoord, TileInfo, TileQuery, TileResponse, TileSource};
 use async_trait::async_trait;
@@ -96,6 +96,7 @@ impl pmtiles::AsyncBackend for FileBackend {
     }
 }
 
+#[derive(Clone)]
 pub struct LocalPmtilesSource {
     cfg: PmtilesConfig,
     reader: Arc<Reader<FileBackend>>,
@@ -182,23 +183,12 @@ impl TileSource for LocalPmtilesSource {
         self.info
     }
 
-    fn clone_source(&self) -> Box<dyn TileSource> {
-        Box::new(LocalPmtilesSource {
-            cfg: self.cfg.clone(),
-            reader: self.reader.clone(),
-            tj: self.tj.clone(),
-            info: self.info,
-            last_modified: self.last_modified,
-            content_version: self.content_version,
-        })
-    }
-
     async fn get_tile(
         &self,
         xyz: TileCoord,
         query: Option<&TileQuery<'_>>,
     ) -> MaptileResult<TileResponse> {
-        crate::sources::validate_source_request(self, &[xyz], query)?;
+        crate::sources::request::validate_source_request(self, &[xyz], query)?;
         let coord = super::checked_coord(xyz)?;
         let bytes = self
             .reader
@@ -210,10 +200,6 @@ impl TileSource for LocalPmtilesSource {
             info: self.info,
             last_modified: self.last_modified,
         })
-    }
-
-    fn tile_etag(&self, response: &TileResponse) -> String {
-        archive_tile_etag(self.content_version, response)
     }
 }
 
@@ -272,10 +258,7 @@ mod tests {
         let second = LocalPmtilesSource::open(cfg).await.unwrap();
         assert_eq!(first.tilejson().bounds, second.tilejson().bounds);
         assert_ne!(first.content_version(), second.content_version());
-        assert_eq!(
-            first.content_version(),
-            first.clone_source().content_version()
-        );
+        assert_eq!(first.content_version(), first.clone().content_version());
         let xyz = TileCoord { z: 0, x: 0, y: 0 };
         assert!(matches!(
             first.get_tile(TileCoord { z: 0, x: 1, y: 0 }, None).await,
@@ -289,8 +272,6 @@ mod tests {
         let new = second.get_tile(xyz, None).await.unwrap();
         assert_eq!(old.data.as_ref(), b"before");
         assert_eq!(new.data.as_ref(), b"after!");
-        assert_ne!(first.tile_etag(&old), second.tile_etag(&new));
-        assert_ne!(first.tile_etag(&old), first.tile_etag(&new));
     }
 
     #[tokio::test]

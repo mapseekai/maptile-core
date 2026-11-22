@@ -78,8 +78,10 @@ impl ContentVersion {
         Self(*h.as_bytes())
     }
 
-    /// Isolate the caches of independently opened sources with unknown data revisions.
-    pub(crate) fn new_generation() -> Self {
+    /// Create a revision for one open source when no durable data version is available.
+    /// Store it on the source so each read and clone uses the same revision.
+    #[must_use]
+    pub fn new_generation() -> Self {
         Self::from_input(uuid::Uuid::new_v4().as_bytes())
     }
 

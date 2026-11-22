@@ -1,6 +1,6 @@
 # maptile-core
 
-`maptile-core` 是用于构建地图瓦片服务与静态地图应用的 Rust 组件库。它通过统一的数据源接口，提供瓦片归档读取、PostGIS 动态矢量切片、GeoParquet 与本地矢量数据处理、COG 栅格切片、缓存、样式管理和 MapLibre Native 渲染能力。应用可以按需启用 Cargo features，将这些组件接入自己的服务、桌面工具或数据处理流程。
+`maptile-core` 是用于构建地图瓦片服务与静态地图应用的 Rust 组件库。应用通过 `CatalogService` 发布版本化的数据源目录，再由 `TileStack` 统一读取瓦片归档、数据库和栅格数据。按需启用 Cargo features，可接入 PostGIS 动态矢量切片、GeoParquet 与本地矢量数据处理、COG 栅格切片和 MapLibre Native 渲染。
 
 ## 核心能力
 
@@ -13,7 +13,7 @@
 | 生成地图图片 | MapLibre Native 渲染、静态地图、标记与路径叠加、PNG/JPEG/WebP 输出 | [地图图片渲染](docs/rendering.md#从样式生成地图图片) |
 | 组织服务运行 | 目录快照、MVT 组合、字节计权缓存、文件发现和缓存指标 | [架构与生命周期](docs/architecture.md) |
 
-默认 features 为空。默认构建提供 `TileStack`、目录、严格 MVT 组合、CQL2、缓存及通用类型。PMTiles、MBTiles、PostgreSQL、DuckDB、栅格处理和原生渲染通过 [功能开关](docs/features.md) 显式选择。HTTP 协商、ETag 和对外地址由应用处理。
+默认 features 为空。默认构建提供版本化目录、瓦片读取栈、严格 MVT 组合、CQL2、缓存及样式和渲染请求类型。HTTP 应用负责表示协商、最终字节的 ETag 和 TileJSON、WMTS 的公开地址。 [功能开关](docs/features.md) · [HTTP 示例](examples/archive_http.rs)
 
 ## 获取代码
 
@@ -98,7 +98,7 @@ async fn main() -> MaptileResult<()> {
 - [功能开关](docs/features.md)：选择 Cargo features 及其依赖组合。
 - [数据源与查询](docs/sources.md)：归档、数据库、过滤、组合与数据更新。
 - [GeoParquet 与本地矢量](docs/geoparquet.md)：本地与远程数据、动态切片、格式导入和资源预算。
-- [样式与渲染](docs/rendering.md)：地图样式、栅格样式、图片渲染和 WMTS 元数据。
+- 地图样式、栅格样式、图片渲染和应用侧的 WMTS 示例见[样式与渲染](docs/rendering.md)。
 - [架构与生命周期](docs/architecture.md)：模块职责、缓存身份、数据源关闭和应用集成。
 - [开发与构建](docs/development.md)：环境准备、测试、Rustdoc 和原生渲染构建。
 - [从 0.3 迁移](docs/migration-0.3.md)：迁移数据源、组合和 HTTP 适配。

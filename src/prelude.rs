@@ -13,7 +13,7 @@
 //! `crate::sources::pmtiles::LocalPmtilesSource`) if you need something
 //! that the prelude doesn't surface.
 
-pub use crate::cache::{CacheZoomRange, TileCache, TileCacheKey};
+pub use crate::cache::{CacheZoomRange, ContentVersion, TileCache, TileCacheKey};
 pub use crate::control::{
     CatalogService, CatalogSnapshot, CompositeDeclaration, CompositeLimits, DiscoveredDataset,
     DuplicateLayer, Inventory, MemberFailurePolicy, SourceCapabilities, SourceCatalog,
@@ -33,7 +33,6 @@ pub use crate::service::{
     BatchPage, ExportCursor, ExportSession, MemberFailure, ReadTarget, TileLayer, TileOutcome,
     TileRequest, TileService, TileStack, ValidatedTileRequest,
 };
-pub use crate::sources::manager::{Catalog, SourceManager};
 #[cfg(feature = "mbtiles")]
 /// MBTiles archive lifecycle ops (copy, patch, validate, metadata,
 /// zoom-window updates) — re-exports of Martin's `mbtiles` crate.
@@ -43,8 +42,7 @@ pub use crate::sources::mbtiles::tools as mbtiles_tools;
 pub use crate::sources::pmtiles::{PmTilesStreamWriter, PmTilesWriter};
 pub use crate::sources::tile_math::{MAX_ZOOM as MAX_TILE_ZOOM, tiles_per_axis};
 pub use crate::sources::{
-    CompositeChild, CompositeSource, TileCoord, TileEncoding, TileEtagResponse, TileFormat,
-    TileInfo, TileQuery, TileResponse, TileSource,
+    TileCoord, TileEncoding, TileFormat, TileInfo, TileQuery, TileResponse, TileSource,
 };
 pub use crate::styles::{
     LocalStyleStore, Style, StyleInfo, StyleStore, rewrite_style_for_native, rewrite_urls,
@@ -55,13 +53,12 @@ pub use crate::transport::{decode as decode_payload, encode_as as encode_payload
 pub use bytes::Bytes;
 pub use tilejson::TileJSON;
 
-pub use crate::sources::parse_composite_id_list;
 pub use crate::sources::tile_math::{
     bbox_to_xyz, get_zoom_precision, tile_index, webmercator_to_wgs84, wgs84_to_webmercator,
     xyz_to_bbox,
 };
 pub use crate::transcode::transcode_with_gzip;
-pub use crate::watch::{ReloadDelta, SourceWatcher, WatchEvent};
+pub use crate::watch::{SourceWatcher, WatchEvent};
 pub use crate::wkb_mvt::{WkbFeature, encode_features_to_mvt};
 
 #[cfg(feature = "raster")]
@@ -69,17 +66,12 @@ pub use crate::raster::RasterImage;
 
 #[cfg(feature = "render")]
 pub use crate::render::{
-    GeoPoint, MapLibreRenderer, MarkerOverlay, OverlayItem, PathOverlay, PoolConfig, RenderCamera,
-    RenderFormat, RenderRequest, RenderRequestError, RenderedImage, RendererPool, StaticTarget,
-    WmtsLayer, WmtsService, build_capabilities as build_wmts_capabilities,
+    GeoPoint, MapLibreRenderer, MarkerOverlay, OverlayItem, PathOverlay, PoolConfig, RendererPool,
     calculate_bounds as calculate_overlay_bounds, decode_polyline, draw_overlays, expand_overlays,
     parse_geojson, parse_marker, parse_path,
 };
-
-#[cfg(not(feature = "render"))]
 pub use crate::render::{
     RenderCamera, RenderFormat, RenderRequest, RenderRequestError, RenderedImage, StaticTarget,
-    WmtsLayer, WmtsService, build_capabilities as build_wmts_capabilities,
 };
 
 #[cfg(feature = "duckdb")]

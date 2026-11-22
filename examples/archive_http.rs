@@ -1,5 +1,8 @@
 //! Loopback HTTP adapter showing representation selection outside the canonical cache.
 mod common;
+#[path = "archive_http/wmts.rs"]
+mod wmts;
+
 use axum::{
     Router,
     body::Body,
@@ -10,6 +13,7 @@ use axum::{
 };
 use maptile_core::{error::ErrorKind, prelude::*};
 use std::{path::PathBuf, sync::Arc};
+use wmts::{DEFAULT_MATRIX_MAX_ZOOM, WmtsLayer, WmtsService, build_capabilities};
 
 #[derive(Clone)]
 struct App {
@@ -34,7 +38,7 @@ fn router(app: App) -> Router {
     Router::new()
         .route("/tiles/{z}/{x}/{y}", get(read))
         .route("/tilejson.json", get(tilejson))
-        .route("/wmts.xml", get(wmts))
+        .route("/wmts.xml", get(wmts_capabilities))
         .with_state(app)
 }
 
@@ -57,12 +61,26 @@ async fn tilejson(State(app): State<App>) -> Response {
     }
 }
 
-async fn wmts(State(app): State<App>) -> Response {
+async fn wmts_capabilities(State(app): State<App>) -> Response {
     let snapshot = app.catalog.catalog().snapshot();
     let Some(descriptor) = snapshot.describe("sample") else {
         return StatusCode::NOT_FOUND.into_response();
     };
     let metadata = &descriptor.tilejson;
+    let tile_size = if matches!(descriptor.info.format, TileFormat::Mvt | TileFormat::Mlt) {
+        RenderRequest::TILE_SIZE
+    } else {
+        let Some(size) = metadata
+            .other
+            .get("tile_size")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|size| u32::try_from(size).ok())
+            .filter(|&size| size > 0)
+        else {
+            return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+        };
+        size
+    };
     let service = WmtsService {
         title: "Sample archive".into(),
         abstract_: None,
@@ -82,11 +100,11 @@ async fn wmts(State(app): State<App>) -> Response {
         format: descriptor.info.format.content_type().into(),
         bounding_box: metadata.bounds.map(|b| [b.left, b.bottom, b.right, b.top]),
         min_zoom: metadata.minzoom.unwrap_or(0),
-        max_zoom: metadata.maxzoom.unwrap_or(22).min(22),
+        max_zoom: metadata.maxzoom.unwrap_or(DEFAULT_MATRIX_MAX_ZOOM),
     };
     (
         [(header::CONTENT_TYPE, "application/xml")],
-        build_wmts_capabilities(&service, &[layer]),
+        build_capabilities(&service, &[layer], tile_size),
     )
         .into_response()
 }
@@ -491,10 +509,109 @@ mod tests {
         .unwrap();
         assert!(xml.contains("https://tiles.example.com/tiles/{TileMatrix}/{TileCol}/{TileRow}"));
         assert!(xml.contains("https://tiles.example.com/wmts.xml"));
+        assert!(xml.contains(&format!(
+            "<TileWidth>{}</TileWidth>",
+            RenderRequest::TILE_SIZE
+        )));
         assert!(!xml.contains("attacker.example"));
         assert_eq!(
             app.oneshot(request("/tiles/0/0/0")).await.unwrap().status(),
             StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn wmts_matches_raster_archive_tile_dimensions_and_zoom() {
+        use image::{DynamicImage, ImageFormat};
+        use pmtiles::{Compression, TileCoord as PmtCoord, TileType};
+        use std::io::Cursor;
+
+        let zoom = MAX_TILE_ZOOM;
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut png = Cursor::new(Vec::new());
+        DynamicImage::new_rgb8(256, 256)
+            .write_to(&mut png, ImageFormat::Png)
+            .unwrap();
+        let mut writer = PmTilesWriter::new(TileType::Png)
+            .tile_compression(Compression::None)
+            .internal_compression(Compression::None)
+            .min_zoom(zoom)
+            .max_zoom(zoom)
+            .center_zoom(zoom)
+            .metadata(r#"{"name":"Raster example"}"#)
+            .create(file.reopen().unwrap())
+            .unwrap();
+        writer
+            .add_tile(PmtCoord::new(zoom, 0, 0).unwrap(), png.get_ref())
+            .unwrap();
+        writer.finalize().unwrap();
+
+        let catalog = common::catalog(file.path()).await.unwrap();
+        let app = router(App {
+            stack: TileStack::builder(catalog.clone()).build(),
+            catalog,
+            public_base: public_base("https://tiles.example.com").unwrap(),
+        });
+        let tile = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/tiles/{zoom}/0/0"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(tile.status(), StatusCode::OK);
+        assert_eq!(tile.headers()[header::CONTENT_TYPE], "image/png");
+        let tile = to_bytes(tile.into_body(), 65536).await.unwrap();
+        assert_eq!(tile.as_ref(), png.get_ref().as_slice());
+        let image = image::load_from_memory_with_format(&tile, ImageFormat::Png).unwrap();
+
+        let response = app
+            .oneshot(Request::get("/wmts.xml").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 65536).await.unwrap();
+        let xml = std::str::from_utf8(&body).unwrap();
+        assert_eq!(xml.matches("<TileMatrixLimits>").count(), 1);
+        assert!(xml.contains(&format!("<TileMatrix>{zoom}</TileMatrix>")));
+        let axis = 1_u32 << zoom;
+        assert!(xml.contains(&format!("<MaxTileRow>{}</MaxTileRow>", axis - 1)));
+        assert!(xml.contains(&format!("<MaxTileCol>{}</MaxTileCol>", axis - 1)));
+
+        let identifier = format!("<ows:Identifier>{zoom}</ows:Identifier>");
+        let matrix = xml
+            .split("<TileMatrix>")
+            .skip(1)
+            .filter_map(|entry| entry.split_once("</TileMatrix>"))
+            .map(|(matrix, _)| matrix)
+            .find(|matrix| matrix.contains(&identifier))
+            .expect("the archive's zoom has a matrix definition");
+        let value = |name| {
+            matrix
+                .split_once(&format!("<{name}>"))
+                .unwrap()
+                .1
+                .split_once(&format!("</{name}>"))
+                .unwrap()
+                .0
+        };
+        let scale: f64 = value("ScaleDenominator").parse().unwrap();
+        let tile_width: u32 = value("TileWidth").parse().unwrap();
+        let tile_height: u32 = value("TileHeight").parse().unwrap();
+        let matrix_width: u32 = value("MatrixWidth").parse().unwrap();
+        let matrix_height: u32 = value("MatrixHeight").parse().unwrap();
+        assert_eq!((tile_width, tile_height), (image.width(), image.height()));
+        assert_eq!((matrix_width, matrix_height), (axis, axis));
+
+        let world_pixels = f64::from(tile_width) * f64::from(matrix_width);
+        let world_width = 2.0 * wgs84_to_webmercator(180.0, 0.0).0;
+        let pixel_width = world_width / world_pixels;
+        let width_error = (scale * 0.00028 * world_pixels - world_width).abs();
+        assert!(
+            width_error < pixel_width,
+            "zoom {zoom} matrix width differs by {width_error} m, one pixel is {pixel_width} m"
         );
     }
 

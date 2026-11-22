@@ -11,8 +11,7 @@
 //! [`cache`], [`filter`], [`styles`], and [`transport`] provide tile caching,
 //! CQL2 predicates, style loading, and payload encoding. Optional Cargo features
 //! add archives, PostGIS, GeoParquet, FlatGeobuf, COG/STAC and native map rendering.
-//! Use [`prelude`] for common types and [`render`] for rendering requests and
-//! WMTS metadata.
+//! Use [`prelude`] for common types and [`render`] for rendering requests.
 
 pub mod cache;
 pub mod control;
@@ -25,7 +24,6 @@ mod io;
 #[cfg(feature = "metrics")]
 pub mod metrics;
 pub mod prelude;
-mod protocol;
 pub mod raster;
 pub mod render;
 pub mod service;

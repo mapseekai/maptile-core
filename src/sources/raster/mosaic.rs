@@ -29,7 +29,7 @@ use crate::raster::agtiff_style::to_mosaic_tile_style;
 use crate::raster::style::RasterOutputFormat;
 use crate::sources::{
     MosaicPixelSelection, SourceKind, TileCoord, TileEncoding, TileFormat, TileInfo, TileQuery,
-    TileResponse, TileSource, effective_pixel_selection, validate_source_request,
+    TileResponse, TileSource, effective_pixel_selection, request::validate_source_request,
 };
 
 fn out_tile_format(f: RasterOutputFormat) -> TileFormat {
@@ -104,7 +104,7 @@ pub struct MosaicSourceConfig {
 pub struct MosaicSource {
     id: String,
     tj: TileJSON,
-    /// Wrapped in `Arc` so `clone_source()` is cheap and `Clone` is trivially
+    /// Wrapped in `Arc` so cloning the source is cheap and `Clone` is trivially
     /// derived even though `MosaicTiler` may not itself be `Clone`.
     tiler: Arc<MosaicTiler<FixedMosaicSource>>,
     pixel_selection: MosaicPixelSelection,
@@ -257,10 +257,6 @@ impl TileSource for MosaicSource {
 
     fn cache_zoom(&self) -> crate::cache::CacheZoomRange {
         self.cache_zoom
-    }
-
-    fn clone_source(&self) -> Box<dyn TileSource> {
-        Box::new(self.clone())
     }
 
     fn mosaic_pixel_selection(&self) -> Option<MosaicPixelSelection> {

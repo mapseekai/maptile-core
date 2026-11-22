@@ -169,7 +169,12 @@ async fn supports_url_query_reflects_signature() {
 
 #[tokio::test]
 async fn function_edits_and_same_id_replacement_are_visible() {
-    use maptile_core::{cache::TileCache, sources::manager::SourceManager};
+    use maptile_core::{
+        cache::TileCache,
+        control::CatalogService,
+        service::{ReadTarget, TileStack},
+        sources::mvt,
+    };
 
     let Some(dsn) = common::postgres::pg_dsn() else {
         return;
@@ -198,15 +203,22 @@ async fn function_edits_and_same_id_replacement_are_visible() {
         bounds: None,
         cache_zoom: None,
     };
-    let old = Arc::new(
-        PostgresFunctionSource::open(pool.clone(), cfg.clone())
-            .await
-            .unwrap(),
+    let old = PostgresFunctionSource::open(pool.clone(), cfg.clone())
+        .await
+        .unwrap();
+    let engine = Arc::new(CatalogService::new(TileCache::new(8, None, None).unwrap()));
+    let stack = TileStack::builder(engine.clone()).build();
+    let mut update = engine.catalog().update();
+    update.put(Arc::new(old)).unwrap();
+    engine.catalog().publish(update).unwrap();
+    let before_snapshot = engine.catalog().snapshot();
+    let before_revision = before_snapshot.describe("same").unwrap().revision;
+    let request = ReadTarget::new("same", "public").at(TileCoord { z: 0, x: 0, y: 0 });
+    let before = stack.read(request).await.unwrap();
+    assert_eq!(
+        mvt::decode(&before.tile().unwrap().data).unwrap().layers[0].name,
+        "demo"
     );
-    let manager = SourceManager::new().with_cache(Arc::new(TileCache::new(8, None, None).unwrap()));
-    let coord = TileCoord { z: 0, x: 0, y: 0 };
-    manager.register(old.clone());
-    let before = manager.get_tile("same", coord, None).await.unwrap().data;
     pool.get()
         .await
         .unwrap()
@@ -220,24 +232,32 @@ async fn function_edits_and_same_id_replacement_are_visible() {
         .await
         .unwrap();
     assert!(
-        manager
-            .get_tile("same", coord, None)
+        stack
+            .read(request)
             .await
+            .unwrap()
+            .tile()
             .unwrap()
             .data
             .is_empty()
     );
 
     cfg.function = "jsonb_tiles".into();
-    let new = Arc::new(PostgresFunctionSource::open(pool, cfg).await.unwrap());
-    assert_ne!(old.content_version(), new.content_version());
-    assert_eq!(new.content_version(), new.clone_source().content_version());
-    let expected = new.get_tile(coord, None).await.unwrap().data;
-    assert_ne!(before, expected);
-    manager.register(new);
+    let new = PostgresFunctionSource::open(pool, cfg).await.unwrap();
+    let mut update = engine.catalog().update();
+    update.put(Arc::new(new)).unwrap();
+    engine.catalog().publish(update).unwrap();
+    let after_snapshot = engine.catalog().snapshot();
+    let after = after_snapshot.describe("same").unwrap();
+    assert_ne!(after.revision, before_revision);
+    assert!(after.capabilities.url_query);
+    let replacement = stack.read(request).await.unwrap();
     assert_eq!(
-        manager.get_tile("same", coord, None).await.unwrap().data,
-        expected
+        mvt::decode(&replacement.tile().unwrap().data)
+            .unwrap()
+            .layers[0]
+            .name,
+        "default"
     );
 }
 
@@ -429,7 +449,7 @@ async fn null_bytea_means_missing_but_empty_bytea_is_valid() {
 }
 
 #[tokio::test]
-async fn clone_source_shares_pool() {
+async fn cloned_function_source_serves_same_tile_and_revision() {
     let dsn = match common::postgres::pg_dsn() {
         Some(d) => d,
         None => return,
@@ -454,7 +474,7 @@ async fn clone_source_shares_pool() {
     .await
     .unwrap();
 
-    let clone = src.clone_source();
+    let clone = src.clone();
     let r1 = src
         .get_tile(TileCoord { z: 0, x: 0, y: 0 }, None)
         .await
@@ -464,51 +484,8 @@ async fn clone_source_shares_pool() {
         .await
         .unwrap();
     assert!(!r1.data.is_empty());
-    assert!(!r2.data.is_empty());
-}
-
-#[tokio::test]
-async fn tile_etag_round_trip() {
-    use maptile_core::sources::TileEtagResponse;
-
-    let dsn = match common::postgres::pg_dsn() {
-        Some(d) => d,
-        None => return,
-    };
-    let guard = common::postgres::SchemaGuard::create(&dsn).await;
-    install_basic_function(&dsn, &guard.name, "tiles").await;
-
-    let pool = make_pool(&dsn).await;
-    let src = PostgresFunctionSource::open(
-        pool,
-        PostgresFunctionConfig {
-            id: "demo".into(),
-            schema: guard.name.clone(),
-            function: "tiles".into(),
-            description: None,
-            minzoom: None,
-            maxzoom: None,
-            bounds: None,
-            cache_zoom: None,
-        },
-    )
-    .await
-    .unwrap();
-
-    let fresh = src
-        .get_tile_with_etag(TileCoord { z: 0, x: 0, y: 0 }, None, None)
-        .await
-        .unwrap();
-    let etag = match &fresh {
-        TileEtagResponse::Fresh { etag, .. } => etag.clone(),
-        TileEtagResponse::NotModified => panic!("expected Fresh on first request"),
-    };
-
-    let again = src
-        .get_tile_with_etag(TileCoord { z: 0, x: 0, y: 0 }, None, Some(&etag))
-        .await
-        .unwrap();
-    assert!(matches!(again, TileEtagResponse::NotModified));
+    assert_eq!(r1.data, r2.data);
+    assert_eq!(src.content_version(), clone.content_version());
 }
 
 #[tokio::test]

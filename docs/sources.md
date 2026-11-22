@@ -1,6 +1,6 @@
 # 数据源与查询
 
-`maptile-core` 通过 [`TileStack`](../src/service/mod.rs) 读取已发布目录中的数据源。应用打开具体源，发布到 [`CatalogService`](../src/service/engine.rs)，再按源 ID 和 XYZ 坐标请求瓦片。已有 `TileSource` 实现可直接加入目录；应用也可实现 `TileDriver`。
+`maptile-core` 通过 `TileStack` 读取已发布目录中的数据源。应用打开具体源，发布到 `CatalogService`，再按源 ID 和 XYZ 坐标请求瓦片。目录接受实现 `TileSource` 或 `TileDriver` 的数据源。 [读取栈](../src/service/mod.rs) · [目录服务](../src/service/engine.rs)
 
 ## 按数据形态选择入口
 
@@ -49,6 +49,8 @@ MBTiles 的相对路径在打开时固定为绝对别名路径，后续改变进
 归档发布时，保持服务中的文件快照稳定。准备好新版本文件后，重新打开并注册，具体步骤见[数据更新与关闭](#数据更新与关闭)。
 
 PMTiles 读取器为目录与元数据设置 4 MiB 的读取、解压预算，单张瓦片归档载荷预算为 16 MiB。依据见 [`pmtiles/reader.rs`](../src/sources/pmtiles/reader.rs)；解码预算见 [`transport`](../src/transport.rs)。
+
+打开原生栅格归档时，库在 TileJSON 中将瓦片像素宽高归一化为 `tile_size`。如果归档缺少尺寸声明，库读取一张瓦片以确定尺寸。HTTP 适配器可使用这个字段生成与归档尺寸一致的 WMTS 矩阵。 [归档元数据实现](../src/sources/archive_inspection.rs) · [WMTS 示例](rendering.md#生成-wmts-元数据)
 
 归档制作和维护可使用重导出的 `PmTilesWriter`、`PmTilesStreamWriter`，以及 `sources::mbtiles::tools` 中的复制、补丁、验证、元数据和层级更新 API。
 
@@ -162,7 +164,7 @@ TLS 使用显式 ring provider，无需宿主安装全局 rustls provider，也�
 
 `batch_concurrency` 必须为正数且不超过 Tokio 信号量上限。克隆 `PostgresPool` 会共享同一额度；分别 `connect` 得到的池具有独立额度。在线 `get_tile` 不占批量额度，但与批量查询共享连接池。如果 SQL 取消后无法确认后端已经结束，该池停止接受新批量任务；核实数据库残留任务后再重建池。应用还可在启动时通过 `transport::configure_blocking_concurrency` 配置本 crate 的共享阻塞任务额度，见[并发额度](architecture.md#并发额度)。
 
-Postgres 表源和函数源不持有瓦片结果缓存。通过 `CatalogService` 配置缓存并使用 `TileStack` 读取；`cache_zoom` 控制缓存层级。直接调用源会重新查询数据库。旧 `SourceManager::with_cache` 仍可用于兼容调用方。
+通过 `PostgresTableSource::with_edit_revision` 提供持久数据修订后，`TileStack` 读取表源时可按 `cache_zoom` 缓存瓦片。缺少修订的表源和所有函数源每次查询数据库。直接调用表源的 `get_tile` 也会访问数据库。
 
 ```rust
 use maptile_core::sources::postgres::PoolSettings;
@@ -194,7 +196,7 @@ FlatGeobuf 在 Unix 上将完整 FileStamp（含设备号、inode、ctime、长�
 
 ## 组合多个 MVT 源
 
-通过目录更新发布 `CompositeDeclaration`。各成员须为 MVT、保证合规且完整声明图层名；未知图层集合的源不能加入严格组合。发布时检查缺失成员、循环、重复叶子和深度限制。成员顺序固定在目录快照中。
+通过目录更新发布 `CompositeDeclaration`。各成员须为 MVT、保证合规且完整声明图层名。发布时检查缺失成员、循环、重复叶子和深度限制。成员顺序固定在目录快照中，组合描述符记录已解析成员的图层及可计算的边界与缩放范围。 [组合编译](../src/control/composition/compile.rs)
 
 ```rust
 use maptile_core::prelude::*;
@@ -228,6 +230,12 @@ fn register_city_layers(catalog: &CatalogService) -> MaptileResult<()> {
 [`transport`](../src/transport.rs)提供显式 gzip、zlib、brotli、zstd 编解码，以及异步包装。启用 `mlt` 后，[`transcode`](../src/transcode/mod.rs)提供 MVT 与 MLT 转换。`transcode_with_gzip` 可自动识别 gzip、zstd、zlib；Brotli 载荷先通过已知编码调用 `transport::decode`，再传入转码器。
 
 DuckDB 几何切片与预编码 Parquet 归档的边界和预算见 [GeoParquet 指南](geoparquet.md)。
+
+## 自定义数据源与内容版本
+
+自定义 `TileDriver` 通过 `descriptor()` 提供源 ID、TileJSON、瓦片格式、能力、缓存级别和修订。实现 `TileSource` 时，库通过通用适配读取这些信息，修订由必填方法 `content_version()` 提供。 [TileDriver](../src/control/driver.rs) · [TileSource](../src/sources/driver.rs)
+
+用文件指纹、对象版本或数据库修订号标识打开的数据和影响响应的配置。缺少权威版本时，在打开源时调用一次 `ContentVersion::new_generation()`，存入源实例并在后续读取中返回该值。向同一目录再次发布已打开的源时，复用最初创建的 `Arc`。具体源的 `Clone` 可用于直接读取，这些句柄共享数据修订和关闭状态。数据或配置变化时，独立打开新源再发布，旧代退役后由目录关闭。 [ContentVersion](../src/cache/hashing.rs) · [目录注册](../src/control/catalog.rs)
 
 ## 数据更新与关闭
 

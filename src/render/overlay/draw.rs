@@ -2,8 +2,7 @@
 //! under the MIT license; see `third_party/tileserver-rs/LICENSE`.
 
 use super::{GeoPoint, MarkerOverlay, PathOverlay};
-use crate::core::RENDER_TILE_SIZE;
-use crate::render::types::mercator_y;
+use crate::render::types::{RenderRequest, mercator_y};
 use image::{Rgba, RgbaImage};
 
 fn geo_to_pixel(
@@ -15,7 +14,7 @@ fn geo_to_pixel(
     height: u32,
     scale: f32,
 ) -> (f32, f32) {
-    let tile_size = f64::from(RENDER_TILE_SIZE) * f64::from(scale);
+    let tile_size = f64::from(RenderRequest::TILE_SIZE) * f64::from(scale);
     let scale_factor = tile_size * 2.0_f64.powf(zoom) / 360.0;
 
     let dx = (point.lon - center_lon) * scale_factor;

@@ -3,7 +3,7 @@
 //! Functions receive integer `(z, x, y)` coordinates and may also accept a
 //! JSON or JSONB parameter object. [`PostgresFunctionSource`] discovers the
 //! signature at open time and forwards tile requests through [`PostgresPool`].
-//! Tile caching belongs to [`crate::sources::manager::SourceManager`].
+//! The source reads mutable data and bypasses the tile cache.
 
 use std::sync::Arc;
 
@@ -16,7 +16,7 @@ use crate::cache::{CacheZoomRange, ContentVersion};
 use crate::error::{MaptileError, MaptileResult};
 use crate::sources::{
     MAX_TILE_BATCH_BYTES, TileCoord, TileEncoding, TileFormat, TileInfo, TileQuery, TileResponse,
-    TileSource, validate_source_request,
+    TileSource, request::validate_source_request,
 };
 use crate::transport::MAX_DECODED_TILE_BYTES;
 
@@ -35,6 +35,7 @@ pub struct PostgresFunctionConfig {
     pub cache_zoom: Option<CacheZoomRange>,
 }
 
+#[derive(Clone)]
 pub struct PostgresFunctionSource {
     cfg: PostgresFunctionConfig,
     pool: Arc<PostgresPool>,
@@ -226,18 +227,6 @@ impl TileSource for PostgresFunctionSource {
 
     fn cache_zoom(&self) -> crate::cache::CacheZoomRange {
         CacheZoomRange::disabled()
-    }
-
-    fn clone_source(&self) -> Box<dyn TileSource> {
-        Box::new(PostgresFunctionSource {
-            cfg: self.cfg.clone(),
-            pool: self.pool.clone(),
-            sql: self.sql.clone(),
-            supports_url_query: self.supports_url_query,
-            tj: self.tj.clone(),
-            info: self.info,
-            content_version: self.content_version,
-        })
     }
 
     async fn get_tile(

@@ -12,7 +12,8 @@
 | --- | --- | --- |
 | 发布归档或数据库中的瓦片 | [数据源与查询](sources.md) | 接入 PMTiles、MBTiles 和 PostGIS，配置过滤，组合图层，更新数据源 |
 | 使用矢量文件 | [GeoParquet 与本地矢量](geoparquet.md) | 准备 DuckDB 扩展，接入本地或远程 GeoParquet，读取 FlatGeobuf，转换为 GeoParquet |
-| 生成地图或影像图片 | [样式与渲染](rendering.md) | 加载样式，构造渲染请求，配置 COG 与 STAC，生成 WMTS 元数据 |
+| 生成地图或影像图片 | [样式与渲染](rendering.md) | 加载样式，构造渲染请求，配置 COG 与 STAC |
+| 通过 HTTP 发布瓦片和元数据 | [HTTP 示例](getting-started.md#5-处理瓦片结果) | 协商响应表示，处理条件请求，交付 TileJSON 与 WMTS |
 | 从 0.3 迁移 | [迁移指南](migration-0.3.md) | 选择 features，迁移读取栈、组合策略和 HTTP 适配 |
 | 开发和验证本库 | [开发与构建](development.md) | 准备工具链，运行检查，配置数据库测试，构建原生渲染后端 |
 

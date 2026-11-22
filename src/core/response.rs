@@ -1,4 +1,4 @@
-//! Tile payloads, conditional responses and results of reading a source or composite.
+//! Tile payloads and results of reading a source or composite.
 use super::{SourceId, tile_types::TileInfo};
 use crate::error::MaptileError;
 
@@ -7,12 +7,6 @@ pub struct TileResponse {
     pub data: bytes::Bytes,
     pub info: TileInfo,
     pub last_modified: Option<std::time::SystemTime>,
-}
-
-#[derive(Debug)]
-pub enum TileEtagResponse {
-    Fresh { resp: TileResponse, etag: String },
-    NotModified,
 }
 
 #[derive(Debug, Clone)]

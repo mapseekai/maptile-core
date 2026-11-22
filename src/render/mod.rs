@@ -1,7 +1,7 @@
-//! Server-side raster rendering and WMTS metadata.
+//! Server-side raster rendering.
 //!
 //! The module is split so that **request-shape** code (formats, camera
-//! params, static-map URL parsing, WMTS XML) compiles unconditionally,
+//! params, static-map URL parsing) compiles unconditionally,
 //! while **render execution** (the thread-affine `maplibre_native` adapter,
 //! image encoding, the renderer pool) is gated behind the `render`
 //! cargo feature.
@@ -20,14 +20,12 @@ compile_error!("the render-opengl feature is supported only on Linux");
 
 pub mod static_map;
 pub mod types;
-pub use crate::protocol::wmts;
 
 pub use static_map::{StaticTarget, StaticTargetError};
 pub use types::{
     MAX_IMAGE_DIMENSION, MAX_SCALE, RenderCamera, RenderFormat, RenderRequest, RenderRequestError,
     RenderedImage,
 };
-pub use wmts::{WmtsLayer, WmtsService, build_capabilities};
 
 #[cfg(feature = "render")]
 pub mod encode;

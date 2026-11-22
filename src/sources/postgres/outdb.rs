@@ -21,7 +21,7 @@ use crate::raster::style::pipeline;
 use crate::sources::dataset_cache::{self, CachedDataset, DatasetCache};
 use crate::sources::{
     TileCoord, TileEncoding, TileFormat, TileInfo, TileQuery, TileResponse, TileSource,
-    validate_source_request,
+    request::validate_source_request,
 };
 
 const MAX_OUTDB_ASSETS: usize = 64;
@@ -450,10 +450,6 @@ impl TileSource for PostgresOutDbRasterSource {
 
     fn cache_zoom(&self) -> crate::cache::CacheZoomRange {
         crate::cache::CacheZoomRange::disabled()
-    }
-
-    fn clone_source(&self) -> Box<dyn TileSource> {
-        Box::new(self.clone())
     }
 
     fn supports_raster_style(&self) -> bool {

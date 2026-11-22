@@ -918,48 +918,163 @@ async fn registration_under_tile_load() {
 
 #[tokio::test]
 async fn edited_revision_bypasses_old_tiles_and_rediscovers_fields() {
+    use maptile_core::{
+        cache::TileCache,
+        control::CatalogService,
+        service::{ReadTarget, TileStack},
+        sources::mvt,
+    };
+
     let Some(dsn) = common::postgres::pg_dsn() else {
         return;
     };
     let g = common::postgres::SchemaGuard::create(&dsn).await;
     create_simple_table(&dsn, &g.name, "t").await;
     let pool = make_pool(&dsn).await;
-    let cache = Arc::new(maptile_core::cache::TileCache::new(1, None, None).unwrap());
-    let manager = maptile_core::sources::manager::SourceManager::new().with_cache(cache);
     let old = PostgresTableSource::open(pool.clone(), cfg_for(&g.name, "t"))
         .await
         .unwrap()
         .with_edit_revision(Some("before".into()));
-    let old_version = old.content_version();
-    let id = old.id().to_owned();
-    manager.register(Arc::new(old));
+    let engine = Arc::new(CatalogService::new(TileCache::new(1, None, None).unwrap()));
+    let stack = TileStack::builder(engine.clone()).build();
+    let mut update = engine.catalog().update();
+    update.put(Arc::new(old)).unwrap();
+    engine.catalog().publish(update).unwrap();
+    let old_snapshot = engine.catalog().snapshot();
+    let old_revision = old_snapshot.describe("t").unwrap().revision;
+    let request = ReadTarget::new("t", "public").at(TileCoord {
+        z: 8,
+        x: 128,
+        y: 127,
+    });
+    let before = stack.read(request).await.unwrap();
+    let before = before.tile().unwrap();
+    let conn = pool.get().await.unwrap();
+    conn.batch_execute(&format!(
+        "ALTER TABLE \"{schema}\".t ADD COLUMN extra text;
+         UPDATE \"{schema}\".t SET extra='new';
+         ALTER TABLE \"{schema}\".t DROP COLUMN name",
+        schema = g.name,
+    ))
+    .await
+    .unwrap();
+    drop(conn);
+    let cached = stack.read(request).await.unwrap();
+    assert_eq!(cached.tile().unwrap().data, before.data);
+
+    let fresh = PostgresTableSource::open(pool, cfg_for(&g.name, "t"))
+        .await
+        .unwrap()
+        .with_edit_revision(Some("after".into()));
+    let mut update = engine.catalog().update();
+    update.put(Arc::new(fresh)).unwrap();
+    engine.catalog().publish(update).unwrap();
+    let new_snapshot = engine.catalog().snapshot();
+    let descriptor = new_snapshot.describe("t").unwrap();
+    assert_ne!(descriptor.revision, old_revision);
+    assert_eq!(
+        descriptor.tilejson.other.get("mapseek_revision"),
+        Some(&serde_json::json!("after"))
+    );
+    let fields = &descriptor.tilejson.vector_layers.as_ref().unwrap()[0].fields;
+    assert!(fields.contains_key("extra"));
+    assert!(!fields.contains_key("name"));
+    let after = stack.read(request).await.unwrap();
+    let after = after.tile().unwrap();
+    assert_ne!(before.data, after.data);
+    let tile = mvt::decode(&after.data).unwrap();
+    let layer = &tile.layers[0];
+    assert!(layer.keys.iter().any(|key| key == "extra"));
+    assert!(!layer.keys.iter().any(|key| key == "name"));
+    assert!(
+        layer
+            .values
+            .iter()
+            .any(|value| value.string_value.as_deref() == Some("new"))
+    );
+}
+
+#[tokio::test]
+async fn catalog_composites_merge_live_postgis_layers() {
+    use maptile_core::{
+        cache::TileCache,
+        control::{CatalogService, CompositeDeclaration, DuplicateLayer, MemberFailurePolicy},
+        service::{ReadTarget, TileStack},
+        sources::mvt,
+    };
+    use std::collections::BTreeMap;
+
+    let Some(dsn) = common::postgres::pg_dsn() else {
+        return;
+    };
+    let schema = common::postgres::SchemaGuard::create(&dsn).await;
+    create_simple_table(&dsn, &schema.name, "roads").await;
+    create_simple_table(&dsn, &schema.name, "buildings").await;
+    let pool = make_pool(&dsn).await;
+    let roads = PostgresTableSource::open(
+        pool.clone(),
+        PostgresTableConfig::new("roads", &schema.name, "roads"),
+    )
+    .await
+    .unwrap();
+    let buildings = PostgresTableSource::open(
+        pool,
+        PostgresTableConfig::new("buildings", &schema.name, "buildings"),
+    )
+    .await
+    .unwrap();
+    let engine = Arc::new(CatalogService::new(TileCache::new(4, None, None).unwrap()));
+    let stack = TileStack::builder(engine.clone()).build();
+    let lazy = CompositeDeclaration {
+        id: "lazy".into(),
+        members: vec!["roads".into(), "buildings".into()],
+        lazy: true,
+        duplicate_layer: DuplicateLayer::Error,
+        failure_policy: MemberFailurePolicy::FailFast,
+    };
+    let mut update = engine.catalog().update();
+    update.put(Arc::new(roads)).unwrap();
+    update.composite(lazy.clone()).unwrap();
+    engine.catalog().publish(update).unwrap();
+
     let coord = TileCoord {
         z: 8,
         x: 128,
         y: 127,
     };
-    let before = manager.get_tile(&id, coord, None).await.unwrap();
-    let conn = pool.get().await.unwrap();
-    conn.batch_execute(&format!("ALTER TABLE \"{}\".t ADD COLUMN extra text; UPDATE \"{}\".t SET extra='new'; ALTER TABLE \"{}\".t DROP COLUMN name",g.name,g.name,g.name)).await.unwrap();
-    drop(conn);
-    let fresh = PostgresTableSource::open(pool, cfg_for(&g.name, "t"))
-        .await
-        .unwrap()
-        .with_edit_revision(Some("after".into()));
-    assert_ne!(old_version, fresh.content_version());
+    let read_layers = |id: &'static str| {
+        let stack = &stack;
+        async move {
+            let result = stack
+                .read(ReadTarget::new(id, "public").at(coord))
+                .await
+                .unwrap();
+            mvt::decode(&result.tile().unwrap().data)
+                .unwrap()
+                .layers
+                .into_iter()
+                .map(|layer| (layer.name, layer.features.len()))
+                .collect::<BTreeMap<_, _>>()
+        }
+    };
     assert_eq!(
-        fresh.tilejson().other.get("mapseek_revision"),
-        Some(&serde_json::json!("after"))
+        read_layers("lazy").await,
+        BTreeMap::from([("roads".to_owned(), 2)])
     );
-    assert_eq!(
-        fresh.content_version(),
-        fresh.clone_source().content_version()
-    );
-    assert!(fresh.table_info().properties.contains(&"extra".into()));
-    assert!(!fresh.table_info().properties.contains(&"name".into()));
-    manager.register(Arc::new(fresh));
-    let after = manager.get_tile(&id, coord, None).await.unwrap();
-    assert_ne!(before.data, after.data);
+
+    let mut update = engine.catalog().update();
+    update.put(Arc::new(buildings)).unwrap();
+    update
+        .composite(CompositeDeclaration {
+            id: "eager".into(),
+            lazy: false,
+            ..lazy
+        })
+        .unwrap();
+    engine.catalog().publish(update).unwrap();
+    let expected = BTreeMap::from([("roads".to_owned(), 2), ("buildings".to_owned(), 2)]);
+    assert_eq!(read_layers("lazy").await, expected);
+    assert_eq!(read_layers("eager").await, expected);
 }
 
 #[tokio::test]
@@ -1205,7 +1320,7 @@ async fn bounds_override_takes_precedence_over_auto() {
 // cutover to inline filter SQL).
 
 #[tokio::test]
-async fn clone_source_serves_tiles() {
+async fn cloned_table_source_serves_same_tile_and_revision() {
     let dsn = match common::postgres::pg_dsn() {
         Some(d) => d,
         None => return,
@@ -1216,7 +1331,7 @@ async fn clone_source_serves_tiles() {
         .await
         .unwrap();
     // Use a zoom above the advertised derived minimum for this small dataset.
-    let cloned = src.clone_source();
+    let cloned = src.clone();
     let r1 = src
         .get_tile(
             TileCoord {
@@ -1240,7 +1355,8 @@ async fn clone_source_serves_tiles() {
         .await
         .unwrap();
     assert!(!r1.data.is_empty());
-    assert!(!r2.data.is_empty());
+    assert_eq!(r1.data, r2.data);
+    assert_eq!(src.content_version(), cloned.content_version());
 }
 
 #[tokio::test]

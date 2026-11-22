@@ -59,7 +59,7 @@ pub struct TileCache {
 }
 
 #[derive(Clone)]
-struct CachedTile {
+pub(crate) struct CachedTile {
     tile: TileResponse,
     compression_check: Option<Arc<OnceCell<()>>>,
 }
@@ -76,7 +76,7 @@ impl CachedTile {
         }
     }
 
-    async fn into_validated(self) -> MaptileResult<TileResponse> {
+    pub(crate) async fn into_validated(self) -> MaptileResult<TileResponse> {
         if let Some(check) = self.compression_check {
             check
                 .get_or_try_init(|| transport::validate_tile_payload(&self.tile))
@@ -149,19 +149,12 @@ impl TileCache {
         self.cache.get(key).await.map(|value| value.tile)
     }
 
-    pub(crate) async fn get_validated(
-        &self,
-        key: &TileCacheKey,
-        record_miss: bool,
-    ) -> MaptileResult<Option<TileResponse>> {
+    pub(crate) async fn lookup(&self, key: &TileCacheKey, record_miss: bool) -> Option<CachedTile> {
         // Keep one-off export misses out of the cache's frequency estimate.
         if !record_miss && !self.cache.contains_key(key) {
-            return Ok(None);
+            return None;
         }
-        match self.cache.get(key).await {
-            Some(cached) => cached.into_validated().await.map(Some),
-            None => Ok(None),
-        }
+        self.cache.get(key).await
     }
 
     /// Insert a tile. Eviction happens asynchronously in the background.
@@ -180,39 +173,6 @@ impl TileCache {
     /// On compute error, all waiters receive `Arc<E>` cloning the same
     /// error reference. Caller is responsible for converting `Arc<E>`
     /// to its own error type if needed.
-    pub async fn get_or_insert<F, Fut, E>(
-        &self,
-        key: TileCacheKey,
-        compute: F,
-    ) -> Result<TileResponse, Arc<E>>
-    where
-        F: FnOnce() -> Fut,
-        Fut: std::future::Future<Output = Result<TileResponse, E>> + Send,
-        E: Send + Sync + 'static,
-    {
-        self.get_or_insert_entry(key, async move {
-            Ok::<_, E>(CachedTile::new(compute().await?, false))
-        })
-        .await
-        .map(|entry| entry.tile)
-    }
-
-    pub(crate) async fn get_or_insert_validated(
-        &self,
-        key: TileCacheKey,
-        compute: impl Future<Output = MaptileResult<TileResponse>>,
-    ) -> MaptileResult<TileResponse> {
-        let entry = self
-            .get_or_insert_entry(key, async move {
-                let tile = compute.await?;
-                transport::validate_tile_payload(&tile).await?;
-                Ok::<_, MaptileError>(CachedTile::new(tile, true))
-            })
-            .await
-            .map_err(|error| (*error).clone())?;
-        entry.into_validated().await
-    }
-
     #[tracing::instrument(
         name = "get_or_insert",
         level = "debug",
@@ -224,29 +184,29 @@ impl TileCache {
             tile.y = key.y,
         )
     )]
-    async fn get_or_insert_entry<E: Send + Sync + 'static>(
+    pub async fn get_or_insert<F, Fut, E>(
         &self,
         key: TileCacheKey,
-        compute: impl Future<Output = Result<CachedTile, E>>,
-    ) -> Result<CachedTile, Arc<E>> {
+        compute: F,
+    ) -> Result<TileResponse, Arc<E>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<TileResponse, E>> + Send,
+        E: Send + Sync + 'static,
+    {
         #[cfg(feature = "metrics")]
         let zoom = key.z;
 
-        let entry = self.cache.entry(key).or_try_insert_with(compute).await?;
+        let entry = self
+            .cache
+            .entry(key)
+            .or_try_insert_with(async move { Ok::<_, E>(CachedTile::new(compute().await?, false)) })
+            .await?;
 
         #[cfg(feature = "metrics")]
-        {
-            let result_label = if entry.is_fresh() { "miss" } else { "hit" };
-            let zoom_label = crate::metrics::ZOOM_LABELS
-                .get(zoom as usize)
-                .copied()
-                .unwrap_or("other");
-            crate::metrics::TILE_CACHE_REQUESTS_TOTAL
-                .with_label_values(&["tile", result_label, zoom_label])
-                .inc();
-        }
+        crate::metrics::record_tile_cache_lookup(zoom, !entry.is_fresh());
 
-        Ok(entry.into_value())
+        Ok(entry.into_value().tile)
     }
 
     /// Invalidate all entries. Eviction is eventually consistent.

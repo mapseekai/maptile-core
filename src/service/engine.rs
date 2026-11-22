@@ -83,8 +83,13 @@ impl CatalogService {
             style_hash,
         );
         let online = matches!(pinned.mode, ReadMode::Online);
-        if let Some(hit) = self.cache.get_validated(&key, online).await? {
-            return Ok(TileOutcome::Present(hit));
+        let cached = self.cache.lookup(&key, online).await;
+        #[cfg(feature = "metrics")]
+        if online {
+            crate::metrics::record_tile_cache_lookup(coord.z, cached.is_some());
+        }
+        if let Some(tile) = cached {
+            return Ok(TileOutcome::Present(tile.into_validated().await?));
         }
         let has_query = query.is_some();
         let requested_hash = query.and_then(|q| q.style_hash);

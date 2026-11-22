@@ -66,8 +66,8 @@ impl Flights {
             let tile = tile.clone();
             let load = load();
             async move {
-                if let Some(hit) = cache.get_validated(&tile, populate_cache).await? {
-                    return Ok(FlightResult::Cached(hit));
+                if let Some(hit) = cache.lookup(&tile, populate_cache).await {
+                    return Ok(FlightResult::Cached(hit.into_validated().await?));
                 }
                 load.await.map(FlightResult::Loaded)
             }

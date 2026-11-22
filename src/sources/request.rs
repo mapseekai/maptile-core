@@ -1,33 +1,11 @@
 //! Request options, coordinate validation and bounded sequential tile batches.
-use super::{TileCoord, TileEncoding, TileInfo, TileResponse, TileSource};
+use super::{TileCoord, TileEncoding, TileResponse, TileSource};
 use crate::core::tile_math::MAX_ZOOM;
 use crate::error::{MaptileError, MaptileResult};
 use crate::filter::{Cql2Expr, UrlQuery};
 
 pub const MAX_TILE_BATCH_COORDS: usize = 128;
 pub const MAX_TILE_BATCH_BYTES: usize = 8 * 1024 * 1024;
-
-/// Parse a comma-separated source id list (Martin-style composite URL
-/// syntax: `/foo,bar,baz/{z}/{x}/{y}.pbf`). Returns the component ids
-/// when at least one comma is present, or `None` for a single id (so
-/// callers can fast-path the non-composite case).
-///
-/// Empty components and surrounding whitespace are stripped; if the
-/// result has fewer than 2 components, `None` is returned. Pair with
-/// [`crate::sources::manager::SourceManager::register_composite_from_ids`]
-/// to build the composite on demand.
-#[must_use]
-pub fn parse_composite_id_list(s: &str) -> Option<Vec<&str>> {
-    if !s.contains(',') {
-        return None;
-    }
-    let parts: Vec<&str> = s
-        .split(',')
-        .map(str::trim)
-        .filter(|p| !p.is_empty())
-        .collect();
-    if parts.len() < 2 { None } else { Some(parts) }
-}
 
 /// Pixel-composition algorithms accepted by mosaic tile requests.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -129,9 +107,7 @@ pub struct TileQuery<'a> {
     /// Dataset-authoritative hash for a complete typed raster request.
     /// Only sources that support per-request raster styling accept it.
     pub style_hash: Option<crate::cache::StyleHash>,
-    /// Per-request mosaic composition. Borrowed query state carries this
-    /// `Copy` value without cloning; the manager rejects it for non-mosaic sources
-    /// in both ordinary and ETag reads. Direct source callers must check capabilities.
+    /// Mosaic reducer override. The source must advertise mosaic selection.
     pub pixel_selection: Option<MosaicPixelSelection>,
 }
 
@@ -201,26 +177,11 @@ pub(crate) async fn read_tile_batch_sequential<S: TileSource + ?Sized>(
     query: Option<&TileQuery<'_>>,
 ) -> MaptileResult<Vec<TileResponse>> {
     validate_source_request(source, coords, query)?;
-    read_tile_batch_with(coords, source.tile_info(), |coord| {
-        source.get_tile(coord, query)
-    })
-    .await
-}
-
-pub(crate) async fn read_tile_batch_with<F, Fut>(
-    coords: &[TileCoord],
-    info: TileInfo,
-    mut fetch: F,
-) -> MaptileResult<Vec<TileResponse>>
-where
-    F: FnMut(TileCoord) -> Fut + Send,
-    Fut: std::future::Future<Output = MaptileResult<TileResponse>> + Send,
-{
-    validate_tile_batch(coords)?;
+    let info = source.tile_info();
     let mut tiles = Vec::with_capacity(coords.len());
     let mut bytes = 0;
     for &coord in coords {
-        let mut tile = match fetch(coord).await {
+        let mut tile = match source.get_tile(coord, query).await {
             Ok(tile) => tile,
             Err(crate::error::MaptileError::TileNotFound(..)) => TileResponse {
                 data: bytes::Bytes::new(),
@@ -244,9 +205,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        MosaicPixelSelection, TileQuery, effective_pixel_selection, parse_composite_id_list,
-    };
+    use super::{MosaicPixelSelection, TileQuery, effective_pixel_selection};
 
     #[test]
     fn request_selection_overrides_source_fallback() {
@@ -262,40 +221,6 @@ mod tests {
             effective_pixel_selection(None, MosaicPixelSelection::First),
             MosaicPixelSelection::First
         );
-    }
-
-    #[test]
-    fn single_id_returns_none() {
-        assert_eq!(parse_composite_id_list("foo"), None);
-    }
-
-    #[test]
-    fn comma_separated_returns_components() {
-        assert_eq!(
-            parse_composite_id_list("foo,bar,baz"),
-            Some(vec!["foo", "bar", "baz"])
-        );
-    }
-
-    #[test]
-    fn whitespace_around_components_is_stripped() {
-        assert_eq!(
-            parse_composite_id_list("foo , bar , baz "),
-            Some(vec!["foo", "bar", "baz"])
-        );
-    }
-
-    #[test]
-    fn trailing_comma_with_one_id_returns_none() {
-        // Only one non-empty component → caller treats as plain id.
-        assert_eq!(parse_composite_id_list("foo,"), None);
-        assert_eq!(parse_composite_id_list(",foo"), None);
-        assert_eq!(parse_composite_id_list(",,"), None);
-    }
-
-    #[test]
-    fn two_ids() {
-        assert_eq!(parse_composite_id_list("a,b"), Some(vec!["a", "b"]));
     }
 
     #[test]

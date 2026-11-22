@@ -1,97 +1,82 @@
-//! End-to-end test: build a discovery layout, register sources + stores
-//! in [`SourceManager`], and snapshot a single [`Catalog`] payload.
+//! Public API test for source descriptors and style metadata.
 
 use async_trait::async_trait;
-use bytes::Bytes;
+use maptile_core::cache::ContentVersion;
+use maptile_core::control::{SourceCatalog, SourceDescriptor, TileDriver};
 use maptile_core::error::MaptileResult;
-use maptile_core::prelude::*;
+use maptile_core::sources::{
+    TileCoord, TileEncoding, TileFormat, TileInfo, TileQuery, TileResponse,
+};
+use maptile_core::styles::{LocalStyleStore, snapshot};
 use std::fs;
-use std::path::Path;
 use std::sync::Arc;
-use tilejson::tilejson;
 
-fn write(p: &Path, b: &[u8]) {
-    fs::create_dir_all(p.parent().unwrap()).unwrap();
-    fs::write(p, b).unwrap();
-}
-
-/// Trivial in-memory MVT source for the catalog test.
-struct Stub {
-    id: String,
-    tj: TileJSON,
-}
+struct Stub(&'static str);
 
 #[async_trait]
-impl TileSource for Stub {
-    fn id(&self) -> &str {
-        &self.id
+impl TileDriver for Stub {
+    fn descriptor(&self) -> SourceDescriptor {
+        let mut descriptor = SourceDescriptor::new(
+            self.0,
+            TileInfo {
+                format: TileFormat::Mvt,
+                encoding: TileEncoding::Uncompressed,
+            },
+            ContentVersion::from_input(self.0.as_bytes()),
+        );
+        descriptor.tilejson.name = Some(self.0.into());
+        descriptor
     }
-    fn tilejson(&self) -> &TileJSON {
-        &self.tj
-    }
-    fn tile_info(&self) -> TileInfo {
-        TileInfo {
-            format: TileFormat::Mvt,
-            encoding: TileEncoding::Uncompressed,
-        }
-    }
-    fn clone_source(&self) -> Box<dyn TileSource> {
-        Box::new(Stub {
-            id: self.id.clone(),
-            tj: self.tj.clone(),
-        })
-    }
-    async fn get_tile(
+
+    async fn read(
         &self,
-        _xyz: TileCoord,
-        _q: Option<&TileQuery<'_>>,
-    ) -> MaptileResult<TileResponse> {
-        Ok(TileResponse {
-            data: Bytes::from_static(b""),
-            info: self.tile_info(),
-            last_modified: None,
-        })
+        _: TileCoord,
+        _: Option<&TileQuery<'_>>,
+    ) -> MaptileResult<Option<TileResponse>> {
+        unreachable!("catalog listing only reads metadata");
     }
 }
 
 #[tokio::test]
-async fn catalog_aggregates_sources_styles() {
+async fn source_descriptors_and_style_snapshot_preserve_metadata() {
     let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path();
+    let style_path = tmp.path().join("style.json");
+    fs::write(&style_path, br#"{"version":8,"name":"Bright"}"#).unwrap();
+    let style_store = LocalStyleStore::new([("bright", style_path)]).unwrap();
 
-    write(
-        &root.join("styles/bright/style.json"),
-        br#"{"version":8,"name":"Bright"}"#,
+    let source_catalog = SourceCatalog::default();
+    let mut update = source_catalog.update();
+    update.put(Arc::new(Stub("planet"))).unwrap();
+    update.put(Arc::new(Stub("labels"))).unwrap();
+    source_catalog.publish(update).unwrap();
+    let sources = source_catalog.snapshot();
+    let mut metadata: Vec<_> = sources
+        .descriptors()
+        .map(|source| {
+            (
+                source.id.as_ref(),
+                source.tilejson.name.as_deref(),
+                source.info.format,
+            )
+        })
+        .collect();
+    metadata.sort_by_key(|(id, _, _)| *id);
+    assert_eq!(
+        metadata,
+        [
+            ("labels", Some("labels"), TileFormat::Mvt),
+            ("planet", Some("planet"), TileFormat::Mvt),
+        ]
     );
-    // Source manager with two stub sources.
-    let mgr = SourceManager::new();
-    mgr.register(Arc::new(Stub {
-        id: "planet".into(),
-        tj: tilejson! { tiles: vec![] },
-    }));
-    mgr.register(Arc::new(Stub {
-        id: "labels".into(),
-        tj: tilejson! { tiles: vec![] },
-    }));
 
-    let style_store =
-        LocalStyleStore::new::<_, &str>(vec![("bright", root.join("styles/bright/style.json"))])
-            .unwrap();
-    let cat = mgr
-        .snapshot_catalog(Some(&style_store), Some("https://map.example"))
+    let styles = snapshot(&style_store, Some("https://map.example"), "")
         .await
         .unwrap();
-
-    // Sources sorted by id.
-    let ids: Vec<&str> = cat.sources.iter().map(|s| s.id.as_str()).collect();
-    assert_eq!(ids, vec!["labels", "planet"]);
-
-    // One style with a populated url.
-    assert_eq!(cat.styles.len(), 1);
-    assert_eq!(cat.styles[0].id, "bright");
-    assert_eq!(cat.styles[0].name, "Bright");
+    assert_eq!(styles.len(), 1);
+    assert_eq!(styles[0].id, "bright");
+    assert_eq!(styles[0].name, "Bright");
     assert_eq!(
-        cat.styles[0].url.as_deref(),
+        styles[0].url.as_deref(),
         Some("https://map.example/styles/bright/style.json")
     );
 }

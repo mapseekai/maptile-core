@@ -2,9 +2,8 @@
 //!
 //! Wraps the `notify` crate so callers can subscribe to a tokio mpsc
 //! receiver of [`WatchEvent`]s without dealing with notify's threaded
-//! callback model. Pair with
-//! [`crate::sources::manager::SourceManager::reload_from_discovery`]
-//! to mutate the registry on change.
+//! callback model. Rescan changed directories with [`crate::discovery`] and
+//! publish the resulting inventory through [`crate::control::SourceCatalog::reconcile`].
 //!
 //! Sandbox note: notify uses kqueue on macOS, inotify on Linux, and
 //! ReadDirectoryChangesW on Windows. The watcher's internal thread and
@@ -298,14 +297,6 @@ impl std::fmt::Debug for SourceWatcher {
             .field("root", &self.root)
             .finish_non_exhaustive()
     }
-}
-
-/// Result of a discovery-driven reload. Exposed via
-/// [`crate::sources::manager::SourceManager::reload_from_discovery`].
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ReloadDelta {
-    pub added: Vec<String>,
-    pub removed: Vec<String>,
 }
 
 #[cfg(test)]

@@ -14,17 +14,17 @@
 | 调整缓存或调查同一瓦片的并发读取 | [TileCache](../src/cache/tile_cache.rs)、[按目录代次合并在途读取](../src/cache/flights.rs) |
 | 修改共用的坐标、瓦片结果或底层 I/O 检查 | [核心类型与坐标换算](../src/core/mod.rs)、[文件身份与 HTTP Range](../src/io/mod.rs)、[传输编解码](../src/transport.rs) |
 | 修改具体后端 | [DuckDB 几何源](../src/sources/duckdb/mod.rs)、[栅格数据源](../src/sources/raster/mod.rs)、[Postgres](../src/sources/postgres/mod.rs)、[其他归档源](../src/sources/mod.rs) |
-| 维护 `SourceManager` 与兼容组合源 | [兼容读取入口](../src/sources/legacy/mod.rs)，公开导入路径仍为 `sources::manager`、`sources::composite` 和 `sources::lazy_composite` |
 | 扫描文件、通知变更，将发现结果映射为目录更新 | [discovery](../src/discovery.rs)、[watch](../src/watch.rs) |
-| 调整过滤、样式、影像处理、地图渲染或 WMTS 描述 | [filter](../src/filter.rs)、[styles](../src/styles/mod.rs)、[raster](../src/raster/mod.rs)、[render](../src/render/mod.rs)、[WMTS XML](../src/protocol/wmts.rs) |
+| 调整过滤、样式、影像处理或地图渲染 | [filter](../src/filter.rs)、[styles](../src/styles/mod.rs)、[raster](../src/raster/mod.rs)、[render](../src/render/mod.rs) |
+| 接入 HTTP 表示协商、条件请求和元数据 | [HTTP 示例](../examples/archive_http.rs)、[WMTS XML](../examples/archive_http/wmts.rs) |
 
-应用负责鉴权、可见范围、配置、HTTP 路由、表示协商及对外地址。TileJSON 描述符只包含源元数据；应用必须补充绝对瓦片地址。
+应用负责鉴权、可见范围、配置、HTTP 路由、表示协商及对外地址。应用可以通过 `CatalogSnapshot::descriptors()` 枚举同一代的普通源与组合，并为源的 TileJSON 补充绝对瓦片地址。
 
 ## 瓦片读取过程
 
 一次读取固定当前 `CatalogSnapshot`、源描述符及组合成员。`TileStack` 检查 XYZ、查询能力和请求预算，再按注册顺序进入 `TileLayer`，并按逆序返回。没有自定义层时直接进入默认 `CatalogService`。短路或改写的瓦片仍须通过 16 MiB 大小检查。透传规范结果时，同一字节视图和编码可以复用已完成的校验。
 
-`TileQuery::style` 和 `style_hash` 仅适用于声明 `raster_style` 能力的驱动。COG、固定镶嵌、STAC 和 PostGIS OutDB 使用该能力。目录读取在进入应用层或读取缓存前为不支持样式的源返回 `Unsupported`。自定义 `TileDriver` 在 `SourceDescriptor.capabilities` 中声明能力，自定义 `TileSource` 实现 `supports_raster_style()`。固定组合要求所有成员都支持。兼容接口的 `LazyCompositeSource` 在样式读取开始前固定并校验本次所有嵌套成员。用 `catalog.put` 发布含有 `LazyCompositeSource` 的旧组合时，目录拒绝样式请求。使用 `CompositeDeclaration` 的目录组合在发布时固定成员。
+`TileQuery::style` 和 `style_hash` 适用于声明 `raster_style` 能力的驱动，例如 COG、固定镶嵌、STAC 和 PostGIS OutDB。目录读取在进入应用层或读取缓存前为能力不匹配的请求返回 `Unsupported`。自定义 `TileDriver` 在 `SourceDescriptor.capabilities` 中声明能力，自定义 `TileSource` 实现 `supports_raster_style()`。`CompositeDeclaration` 在发布时固定本代成员，只有已解析成员均支持样式时，组合才能接受该查询。
 
 `TileOutcome::NoTile`、`Present` 与 `Partial` 分别表示无瓦片、完整瓦片和组合降级。合法零字节 MVT 可作为 `Present`。部分结果可包含瓦片，也可没有瓦片。服务端必须对部分结果发送 `Cache-Control: no-store`，不生成强 ETag，并在条件请求时返回部分结果而非 304。
 
@@ -32,15 +32,13 @@
 
 一致导出（`begin_export`、`read_export_page`）逐瓦片读取时可以命中在线缓存。命中会更新该瓦片的访问频率和空闲过期时间（TTI）。只有在线请求也在等待同一份完整瓦片时，这次回源结果才会写入在线缓存。因此连续两次导出同一个冷坐标可能各自回源。单瓦片读取和 `read_batch` 的逐瓦片回退路径会照常缓存完整结果。
 
-[`SourceManager`](../src/sources/legacy/manager.rs) 和其 `get_tile_with_etag` 仍为兼容接口；新接入应使用 `TileStack`，由 HTTP 适配器针对最终表示生成验证标识。两个接口的缓存和生命周期各自独立。
-
 ## 缓存身份与预算
 
 `CatalogService` 的规范缓存键包含 schema 版本、源和组合修订、调用方指定的可见范围、XYZ、有效样式及镶嵌选择。过滤、bbox 和自定义参数按实现走直接读取。缓存只保存完整 `Present`，不保存部分结果和错误。自定义层改写返回内容时，改写值不会回填规范缓存。层应同步改写实际格式和编码，HTTP 层针对最终字节计算 ETag。
 
-源修订必须随数据或影响元数据的配置变化而更新。文件源使用文件身份或打开代次；数据库源可使用持久化编辑修订号；COG 应使用版本化地址或内容标识。远端归档需要不可变对象、固定版本或强 ETag，确保同一次打开的多个 Range 属于同一版本。
+缓存用驱动声明的源修订隔离不同的数据版本。应用更新数据或影响响应的配置时，打开并发布具有新修订的源。远端归档需要不可变对象、固定版本或强 ETag，确保同一次打开的多个 Range 属于同一版本。 [数据源版本与接入](sources.md#自定义数据源与内容版本)
 
-`TileCache::new` 接收按 MiB 计量的容量、TTL 和 TTI。容量不包含连接池、渲染器和其他分配。`TileStack` 和 `SourceManager` 首次读取通过缓存公开接口写入的压缩瓦片时会校验负载。校验结果只适用于该缓存条目。缓存命中不主动检查文件变化；更新数据后先打开新源并发布新目录。`invalidate_source` 和 `invalidate_all` 发起异步维护，测试可通过 `run_pending_tasks().await` 等待。
+`TileCache::new` 接收按 MiB 计量的容量、TTL 和 TTI。容量不包含连接池、渲染器和其他分配。`TileStack` 首次读取通过缓存公开接口写入的压缩瓦片时会校验负载。校验结果只适用于该缓存条目。缓存命中不主动检查文件变化，更新数据后先打开新源并发布新目录。`invalidate_source` 和 `invalidate_all` 发起异步维护，测试可通过 `run_pending_tasks().await` 等待。
 
 ## 并发额度
 
@@ -72,43 +70,6 @@ ID 冲突或工厂返回不同的 ID 会拒绝更新。同一数据集恢复时�
 
 发布新版本前准备好不可变文件或对象，打开并校验后一次发布。等待旧代请求和导出结束后再删除旧资源。GeoParquet 和 FlatGeobuf 使用共享查询池，`start_close` 停止准入，`close().await` 等待阻塞查询及文件租约退出，详见[矢量文件指南](geoparquet.md)。
 
-## 兼容 SourceManager
-
-旧接口的管理器按以下规则管理源，不能将这些操作等同于版本化目录的 `publish` 或 `revoke`。
-
-| 操作 | 管理器行为 | 适用场景 |
-| --- | --- | --- |
-| `register(source)` | 按 ID 插入或替换；替换为新对象时对旧对象调用 `start_close` | 应用启动、更新源配置、发布新文件 |
-| `remove(id)` | 移除源并发起 `start_close`，返回旧源引用 | 调用方继续管理旧源的关闭过程 |
-| `close_source(id).await` | 移除当前源、失效其缓存并等待 `close` | 数据源下线、显式资源回收 |
-| `mark_unavailable(id)` | 按 ID 将当前源标为不可用并发起关闭；重复标记不重置退避或打断恢复 | 管理操作、记录首次加载失败 |
-| `mark_unavailable_if_current(&source)` | 仅在当前注册对象仍是传入的同一个 `Arc` 时标记不可用并发起关闭 | 回报持有该实例的异步操作失败 |
-| `recover_unavailable(id, factory).await` | 原子取得恢复资格、调用工厂并有条件发布结果，返回可用源 | 请求触发的单源恢复 |
-| `require(id)` | 返回当前源，或返回对应的结构化错误 | 查询前解析源状态 |
-
-每个 ID 的就绪和不可用状态保存在同一注册项中，注册、标记不可用和删除以单次状态更新完成。旧源的关闭钩子在释放注册表锁后调用；目录快照只包含就绪源。
-
-异步操作回报源级故障时，保留该操作实际使用的 `Arc`，并调用 `mark_unavailable_if_current`。只有实例仍匹配时才返回 `true`；旧实例在替换或删除后回报失败会返回 `false`，不会改变当前注册项。内容版本相同的两个实例也分别判断。调用方负责区分源级故障与普通瓦片错误；不要在故障发生后重新按 ID 获取实例来回报。
-
-`recover_unavailable` 对就绪源直接返回当前引用，对不存在的 ID 返回 `SourceNotFound`。不可用源经过 1 秒退避后，只有一个调用能执行工厂；退避期间和恢复进行中的其他调用立即返回 `SourceUnavailable`，不调用工厂，也不等待已有恢复。`unavailable_retry_due` 只提供当前是否可重试的观察值，不预留恢复资格。
-
-恢复工厂必须返回同一 ID 的源，否则返回 `Config`。失败、取消或 panic 展开栈会释放本次恢复资格，并重新开始 1 秒退避。恢复期间发生 `register`、`remove` 或发现重载发布时，旧恢复结果不能覆盖新状态；调用改为返回当时的 `require(id)` 结果。未发布的工厂结果会开始关闭，仍注册着的同一个 `Arc` 保持打开。返回的源引用与普通 `require` 一样，之后仍可能被管理操作替换。
-
-恢复资格按不可用注册项协调，不限制管理操作建立新代次后的工厂，也不接管工厂自行启动的后台任务。工厂负责清理尚未返回的资源；已经开始关闭的实例不能通过重新注册复活。
-
-替换源后，若应用还需要等待旧对象完全关闭，应在替换前保留旧引用，再对该引用调用 `close().await`。`close_source(id)` 操作的是调用时按 ID 注册的当前源。
-
-### 兼容管理器的发现重载
-
-`reload_from_discovery` 根据 ID 同步新增与删除条目，就绪源保持当前对象。报告中仍存在的不可用源会重新调用工厂构建；报告中已消失的 ID 会被移除，包括不可用记录，并列入 `ReloadDelta.removed`。对已有文件内容或配置的更新，应用重新打开具体源，再调用 `register`。这让文件发布、元数据检查和内容版本更新具有明确的接入位置。
-
-重载先构建全部新增和待恢复的源，再应用注册和删除。工厂失败或构建过程被取消时，本次变更尚未发布，原有不可用记录也保留，已构建但未发布的源开始关闭。成功后的应用阶段逐项执行；需要整个批次隔离的应用应协调并发写入，这个接口不提供跨 ID 的事务隔离。
-
-工厂返回源的 `id()` 必须等于对应发现项的 ID。重载在发布前检查这一条件；不匹配返回 `Config`，并开始关闭本次已构建但未发布的源，保留原注册表状态。工厂若返回仍在注册表中的同一个 `Arc`，清理会保留该实例。
-
-发现报告中的源 ID 必须唯一，即使对应源已经就绪也不能重复。重载在调用任何工厂或修改注册表前检查完整报告，重复则返回 `Config`；现有就绪源和不可用记录保持不变。标准 `scan` 遇到冲突会返回错误，应用可为路径显式配置稳定 ID。
-
-
 ## 数据库与图像输入边界
 
 PostgreSQL 连接显式选择 rustls ring provider，无需宿主初始化全局 provider。`prefer` 在 TCP 上先尝试 TLS，只有服务器明确不支持 TLS 才回退；`require` 必须通过证书链与主机名校验。`disable` 保持明文，Unix socket 可用 disable/prefer；锁定驱动仅接受这三种模式，详见 [TLS 连接](sources.md#tls-连接)。
@@ -121,8 +82,8 @@ PNG/WebP 编码将 1、3、4 波段的无效 mask 像素编码为透明像素，
 
 [`MaptileError`](../src/error.rs)区分源状态、瓦片查找、配置、过滤和后端错误。应用可依据错误变体决定响应、重试或记录方式，并在对外输出时处理内部连接和文件上下文。
 
-默认的栅格覆盖导出和像元查询在源不支持该能力时返回 `InvalidRequest`。这是请求与源能力不匹配，应用可以按无效请求处理。
+`TileStack` 根据源描述符校验栅格覆盖导出与像元查询能力，能力不匹配时返回 `Unsupported`。直接调用 `TileSource` 的默认覆盖和像元查询方法会返回 `InvalidRequest`。
 
-渲染队列入队等待超时返回 `CapacityExhausted`。本地样式存储对未知样式 ID 返回 `StyleNotFound`；文件访问与 JSON 解析失败返回 `StyleFile { id, path, source }`，其 `source` 保留 `Io` 或 `Json`，供应用检查 `ErrorKind` 或解析位置。超过 16 MiB 的本地样式文件同样返回 `StyleFile`，其原因为 `PayloadTooLarge`。目录快照也保留这份样式上下文。具体分类见[样式与渲染](rendering.md)。
+渲染队列入队等待超时返回 `CapacityExhausted`。本地样式存储对未知样式 ID 返回 `StyleNotFound`，文件访问、大小检查与 JSON 解析失败返回带 ID、路径和底层原因的 `StyleFile`。`styles::snapshot` 读取样式时传播这一错误。 [样式与渲染](rendering.md#样式与资源地址)
 
-关键读取路径使用 `tracing`。启用 `metrics` 后，缓存计数器在首次访问时注册到默认 Prometheus registry，应用负责抓取和暴露；指标定义见 [`metrics.rs`](../src/metrics.rs)。连接数、源数量和原生渲染队列容量由应用按部署预算统一配置。
+应用可在 `TileLayer` 中记录请求级 `tracing`。启用 `metrics` 后，`TileStack` 的在线请求每次查询规范缓存计一次命中或未命中。导出、绕过缓存的请求以及合并并发读取时的内部复查均排除在此计数外。计数器在首次访问时注册到默认 Prometheus registry，应用负责抓取和暴露。连接数、源数量和原生渲染队列容量由应用按部署预算统一配置。 [指标定义](../src/metrics.rs)

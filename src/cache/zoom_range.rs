@@ -1,9 +1,7 @@
 //! Zoom-level bounds for tile caching.
 //!
-//! Mirrors `martin_core::CacheZoomRange` so configurations stay
-//! compatible. Used by [`crate::sources::TileSource::cache_zoom`] to
-//! tell [`crate::sources::manager::SourceManager`] which zoom levels
-//! are worth caching for that source.
+//! [`crate::sources::TileSource::cache_zoom`] supplies the range the catalog
+//! uses when caching tiles from a source.
 
 use serde::{Deserialize, Serialize};
 

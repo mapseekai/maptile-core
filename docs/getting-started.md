@@ -81,7 +81,7 @@ fn decoded_bytes(tile: &TileResponse) -> MaptileResult<Bytes> {
 }
 ```
 
-HTTP 应用在选择最终格式和编码后计算强 ETag，并处理 `If-None-Match`。`Partial` 不应生成强 ETag，必须下发 `Cache-Control: no-store`。[HTTP 示例](../examples/archive_http.rs)演示了协商、条件请求、TileJSON 和 WMTS。
+HTTP 示例根据完整瓦片的最终格式、编码和响应字节计算强 ETag，并处理 `If-None-Match`。部分结果使用 `Cache-Control: no-store`。 [HTTP 示例](../examples/archive_http.rs)
 
 在仓库根目录启动示例，再访问 `http://127.0.0.1:3000/tilejson.json` 或 `/wmts.xml`：
 
@@ -89,7 +89,7 @@ HTTP 应用在选择最终格式和编码后计算强 ETag，并处理 `If-None-
 cargo run --locked --features pmtiles --example archive_http -- http://127.0.0.1:3000
 ```
 
-参数是应用配置的可信公开 origin，不能从客户端的 `Host` 请求头推导。进程只监听 `127.0.0.1:3000`，使用与 CLI 相同的目录和归档。也可以在 origin 后传入其他 PMTiles 路径。示例不包含鉴权，并使用 512 像素的 WMTS 矩阵；发布真实服务前须匹配数据和访问策略。
+参数是应用配置的可信公开 origin。示例只监听 `127.0.0.1:3000`，使用与 CLI 相同的目录和归档。也可以在 origin 后传入其他 PMTiles 路径。在应用中接入时，按服务配置补充鉴权，并使 WMTS 声明与瓦片输出一致。 [WMTS 元数据示例](rendering.md#生成-wmts-元数据)
 
 ## 后续任务
 

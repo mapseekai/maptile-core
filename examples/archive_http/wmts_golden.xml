@@ -321,7 +321,7 @@
       </TileMatrix>
       <TileMatrix>
         <ows:Identifier>1</ows:Identifier>
-        <ScaleDenominator>139770566.0071791</ScaleDenominator>
+        <ScaleDenominator>139770566.00717914</ScaleDenominator>
         <TopLeftCorner>-20037508.3427892 20037508.3427892</TopLeftCorner>
         <TileWidth>512</TileWidth>
         <TileHeight>512</TileHeight>
@@ -330,7 +330,7 @@
       </TileMatrix>
       <TileMatrix>
         <ows:Identifier>2</ows:Identifier>
-        <ScaleDenominator>69885283.0035896</ScaleDenominator>
+        <ScaleDenominator>69885283.00358957</ScaleDenominator>
         <TopLeftCorner>-20037508.3427892 20037508.3427892</TopLeftCorner>
         <TileWidth>512</TileWidth>
         <TileHeight>512</TileHeight>
@@ -339,7 +339,7 @@
       </TileMatrix>
       <TileMatrix>
         <ows:Identifier>3</ows:Identifier>
-        <ScaleDenominator>34942641.5017948</ScaleDenominator>
+        <ScaleDenominator>34942641.501794785</ScaleDenominator>
         <TopLeftCorner>-20037508.3427892 20037508.3427892</TopLeftCorner>
         <TileWidth>512</TileWidth>
         <TileHeight>512</TileHeight>
@@ -348,7 +348,7 @@
       </TileMatrix>
       <TileMatrix>
         <ows:Identifier>4</ows:Identifier>
-        <ScaleDenominator>17471320.7508974</ScaleDenominator>
+        <ScaleDenominator>17471320.750897393</ScaleDenominator>
         <TopLeftCorner>-20037508.3427892 20037508.3427892</TopLeftCorner>
         <TileWidth>512</TileWidth>
         <TileHeight>512</TileHeight>
@@ -357,7 +357,7 @@
       </TileMatrix>
       <TileMatrix>
         <ows:Identifier>5</ows:Identifier>
-        <ScaleDenominator>8735660.3754487</ScaleDenominator>
+        <ScaleDenominator>8735660.375448696</ScaleDenominator>
         <TopLeftCorner>-20037508.3427892 20037508.3427892</TopLeftCorner>
         <TileWidth>512</TileWidth>
         <TileHeight>512</TileHeight>
@@ -366,7 +366,7 @@
       </TileMatrix>
       <TileMatrix>
         <ows:Identifier>6</ows:Identifier>
-        <ScaleDenominator>4367830.1877243</ScaleDenominator>
+        <ScaleDenominator>4367830.187724348</ScaleDenominator>
         <TopLeftCorner>-20037508.3427892 20037508.3427892</TopLeftCorner>
         <TileWidth>512</TileWidth>
         <TileHeight>512</TileHeight>
@@ -375,7 +375,7 @@
       </TileMatrix>
       <TileMatrix>
         <ows:Identifier>7</ows:Identifier>
-        <ScaleDenominator>2183915.0938622</ScaleDenominator>
+        <ScaleDenominator>2183915.093862174</ScaleDenominator>
         <TopLeftCorner>-20037508.3427892 20037508.3427892</TopLeftCorner>
         <TileWidth>512</TileWidth>
         <TileHeight>512</TileHeight>
@@ -384,7 +384,7 @@
       </TileMatrix>
       <TileMatrix>
         <ows:Identifier>8</ows:Identifier>
-        <ScaleDenominator>1091957.5469311</ScaleDenominator>
+        <ScaleDenominator>1091957.546931087</ScaleDenominator>
         <TopLeftCorner>-20037508.3427892 20037508.3427892</TopLeftCorner>
         <TileWidth>512</TileWidth>
         <TileHeight>512</TileHeight>
@@ -393,7 +393,7 @@
       </TileMatrix>
       <TileMatrix>
         <ows:Identifier>9</ows:Identifier>
-        <ScaleDenominator>545978.7734655</ScaleDenominator>
+        <ScaleDenominator>545978.7734655435</ScaleDenominator>
         <TopLeftCorner>-20037508.3427892 20037508.3427892</TopLeftCorner>
         <TileWidth>512</TileWidth>
         <TileHeight>512</TileHeight>
@@ -402,7 +402,7 @@
       </TileMatrix>
       <TileMatrix>
         <ows:Identifier>10</ows:Identifier>
-        <ScaleDenominator>272989.3867328</ScaleDenominator>
+        <ScaleDenominator>272989.38673277176</ScaleDenominator>
         <TopLeftCorner>-20037508.3427892 20037508.3427892</TopLeftCorner>
         <TileWidth>512</TileWidth>
         <TileHeight>512</TileHeight>
@@ -411,7 +411,7 @@
       </TileMatrix>
       <TileMatrix>
         <ows:Identifier>11</ows:Identifier>
-        <ScaleDenominator>136494.6933664</ScaleDenominator>
+        <ScaleDenominator>136494.69336638588</ScaleDenominator>
         <TopLeftCorner>-20037508.3427892 20037508.3427892</TopLeftCorner>
         <TileWidth>512</TileWidth>
         <TileHeight>512</TileHeight>
@@ -420,7 +420,7 @@
       </TileMatrix>
       <TileMatrix>
         <ows:Identifier>12</ows:Identifier>
-        <ScaleDenominator>68247.3466832</ScaleDenominator>
+        <ScaleDenominator>68247.34668319294</ScaleDenominator>
         <TopLeftCorner>-20037508.3427892 20037508.3427892</TopLeftCorner>
         <TileWidth>512</TileWidth>
         <TileHeight>512</TileHeight>
@@ -429,7 +429,7 @@
       </TileMatrix>
       <TileMatrix>
         <ows:Identifier>13</ows:Identifier>
-        <ScaleDenominator>34123.6733416</ScaleDenominator>
+        <ScaleDenominator>34123.67334159647</ScaleDenominator>
         <TopLeftCorner>-20037508.3427892 20037508.3427892</TopLeftCorner>
         <TileWidth>512</TileWidth>
         <TileHeight>512</TileHeight>
@@ -438,7 +438,7 @@
       </TileMatrix>
       <TileMatrix>
         <ows:Identifier>14</ows:Identifier>
-        <ScaleDenominator>17061.8366708</ScaleDenominator>
+        <ScaleDenominator>17061.836670798235</ScaleDenominator>
         <TopLeftCorner>-20037508.3427892 20037508.3427892</TopLeftCorner>
         <TileWidth>512</TileWidth>
         <TileHeight>512</TileHeight>
@@ -447,7 +447,7 @@
       </TileMatrix>
       <TileMatrix>
         <ows:Identifier>15</ows:Identifier>
-        <ScaleDenominator>8530.9183354</ScaleDenominator>
+        <ScaleDenominator>8530.918335399117</ScaleDenominator>
         <TopLeftCorner>-20037508.3427892 20037508.3427892</TopLeftCorner>
         <TileWidth>512</TileWidth>
         <TileHeight>512</TileHeight>
@@ -456,7 +456,7 @@
       </TileMatrix>
       <TileMatrix>
         <ows:Identifier>16</ows:Identifier>
-        <ScaleDenominator>4265.4591677</ScaleDenominator>
+        <ScaleDenominator>4265.459167699559</ScaleDenominator>
         <TopLeftCorner>-20037508.3427892 20037508.3427892</TopLeftCorner>
         <TileWidth>512</TileWidth>
         <TileHeight>512</TileHeight>
@@ -465,7 +465,7 @@
       </TileMatrix>
       <TileMatrix>
         <ows:Identifier>17</ows:Identifier>
-        <ScaleDenominator>2132.7295838</ScaleDenominator>
+        <ScaleDenominator>2132.7295838497794</ScaleDenominator>
         <TopLeftCorner>-20037508.3427892 20037508.3427892</TopLeftCorner>
         <TileWidth>512</TileWidth>
         <TileHeight>512</TileHeight>
@@ -474,7 +474,7 @@
       </TileMatrix>
       <TileMatrix>
         <ows:Identifier>18</ows:Identifier>
-        <ScaleDenominator>1066.3647919</ScaleDenominator>
+        <ScaleDenominator>1066.3647919248897</ScaleDenominator>
         <TopLeftCorner>-20037508.3427892 20037508.3427892</TopLeftCorner>
         <TileWidth>512</TileWidth>
         <TileHeight>512</TileHeight>
@@ -483,7 +483,7 @@
       </TileMatrix>
       <TileMatrix>
         <ows:Identifier>19</ows:Identifier>
-        <ScaleDenominator>533.1823960</ScaleDenominator>
+        <ScaleDenominator>533.1823959624448</ScaleDenominator>
         <TopLeftCorner>-20037508.3427892 20037508.3427892</TopLeftCorner>
         <TileWidth>512</TileWidth>
         <TileHeight>512</TileHeight>
@@ -492,7 +492,7 @@
       </TileMatrix>
       <TileMatrix>
         <ows:Identifier>20</ows:Identifier>
-        <ScaleDenominator>266.5911980</ScaleDenominator>
+        <ScaleDenominator>266.5911979812224</ScaleDenominator>
         <TopLeftCorner>-20037508.3427892 20037508.3427892</TopLeftCorner>
         <TileWidth>512</TileWidth>
         <TileHeight>512</TileHeight>
@@ -501,7 +501,7 @@
       </TileMatrix>
       <TileMatrix>
         <ows:Identifier>21</ows:Identifier>
-        <ScaleDenominator>133.2955990</ScaleDenominator>
+        <ScaleDenominator>133.2955989906112</ScaleDenominator>
         <TopLeftCorner>-20037508.3427892 20037508.3427892</TopLeftCorner>
         <TileWidth>512</TileWidth>
         <TileHeight>512</TileHeight>
@@ -510,7 +510,7 @@
       </TileMatrix>
       <TileMatrix>
         <ows:Identifier>22</ows:Identifier>
-        <ScaleDenominator>66.6477995</ScaleDenominator>
+        <ScaleDenominator>66.6477994953056</ScaleDenominator>
         <TopLeftCorner>-20037508.3427892 20037508.3427892</TopLeftCorner>
         <TileWidth>512</TileWidth>
         <TileHeight>512</TileHeight>

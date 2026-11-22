@@ -7,8 +7,8 @@
 //!
 //! CQL2 attribute filters use a caller-supplied column allowlist, and geographic
 //! bounding boxes add request-specific predicates. Filtered queries prepare their
-//! SQL for that request. Tile caching and concurrent miss coalescing belong to
-//! [`crate::sources::manager::SourceManager`].
+//! SQL for that request. With a durable edit revision, [`crate::control::CatalogService`]
+//! can cache tiles and coalesce concurrent misses for that revision.
 
 use std::sync::Arc;
 
@@ -22,7 +22,7 @@ use crate::cache::CacheZoomRange;
 use crate::error::{MaptileError, MaptileResult};
 use crate::sources::{
     MAX_TILE_BATCH_BYTES, TileCoord, TileEncoding, TileFormat, TileInfo, TileQuery, TileResponse,
-    TileSource, validate_source_request,
+    TileSource, request::validate_source_request,
 };
 use crate::transport::MAX_DECODED_TILE_BYTES;
 
@@ -93,6 +93,7 @@ pub struct TableInfo {
     pub extent: u32,
 }
 
+#[derive(Clone)]
 pub struct PostgresTableSource {
     cfg: PostgresTableConfig,
     info: TableInfo,
@@ -315,23 +316,6 @@ impl TileSource for PostgresTableSource {
         } else {
             CacheZoomRange::disabled()
         }
-    }
-
-    fn clone_source(&self) -> Box<dyn TileSource> {
-        Box::new(PostgresTableSource {
-            cfg: self.cfg.clone(),
-            info: self.info.clone(),
-            pool: self.pool.clone(),
-            tj: self.tj.clone(),
-            inline_query: self.inline_query.clone(),
-            batch_query: self.batch_query.clone(),
-            single_sql: self.single_sql.clone(),
-            batch_sql: self.batch_sql.clone(),
-            allowed_columns: self.allowed_columns.clone(),
-            info_meta: self.info_meta,
-            definition_version: self.definition_version,
-            content_version: self.content_version,
-        })
     }
 
     /// The physical table, rendered projection and durable edit revision

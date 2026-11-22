@@ -4,8 +4,7 @@ use crate::cache::ContentVersion;
 use crate::error::{MaptileError, MaptileResult};
 use crate::sources::archive_inspection::ArchiveSourceType;
 use crate::sources::pmtiles::{
-    PmtilesConfig, archive_tile_etag, pmt_compression_to_encoding, pmt_tile_type_to_format,
-    reader::Reader,
+    PmtilesConfig, pmt_compression_to_encoding, pmt_tile_type_to_format, reader::Reader,
 };
 use crate::sources::{SourceKind, TileCoord, TileInfo, TileQuery, TileResponse, TileSource};
 use async_trait::async_trait;
@@ -235,16 +234,12 @@ impl TileSource for CloudPmtilesSource {
         self.info
     }
 
-    fn clone_source(&self) -> Box<dyn TileSource> {
-        Box::new(self.clone())
-    }
-
     async fn get_tile(
         &self,
         xyz: TileCoord,
         query: Option<&TileQuery<'_>>,
     ) -> MaptileResult<TileResponse> {
-        crate::sources::validate_source_request(self, &[xyz], query)?;
+        crate::sources::request::validate_source_request(self, &[xyz], query)?;
         let coord = super::checked_coord(xyz)?;
         let bytes = self
             .reader
@@ -256,10 +251,6 @@ impl TileSource for CloudPmtilesSource {
             info: self.info,
             last_modified: None,
         })
-    }
-
-    fn tile_etag(&self, response: &TileResponse) -> String {
-        archive_tile_etag(self.content_version, response)
     }
 }
 

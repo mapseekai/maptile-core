@@ -22,7 +22,7 @@ pub use pmtiles::{Compression, PmTilesStreamWriter, PmTilesWriter, TileCoord, Ti
 use crate::cache::ContentVersion;
 use crate::error::{MaptileError, MaptileResult};
 use crate::sources::archive_inspection::{ArchiveSourceType, inspect_archive};
-use crate::sources::{TileEncoding, TileFormat, TileInfo, TileResponse};
+use crate::sources::{TileEncoding, TileFormat, TileInfo};
 use std::time::Duration;
 
 #[derive(Debug, Clone)]
@@ -114,15 +114,6 @@ fn archive_content_version(path: &str, validator: Option<&str>) -> ContentVersio
     hash.update(&(validator.len() as u64).to_le_bytes());
     hash.update(validator.as_bytes());
     ContentVersion::from_bytes(*hash.finalize().as_bytes())
-}
-
-/// Include both the archive identity and fetched bytes: different tiles from
-/// one archive must not share a strong HTTP validator.
-fn archive_tile_etag(version: ContentVersion, response: &TileResponse) -> String {
-    let mut hash = blake3::Hasher::new();
-    hash.update(version.to_hex().as_bytes());
-    hash.update(&response.data);
-    format!("\"{}\"", hash.finalize().to_hex())
 }
 
 async fn read_tilejson<B>(

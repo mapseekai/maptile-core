@@ -754,6 +754,81 @@ async fn cumulative_decoded_budget_rejects_two_large_valid_members() {
 }
 
 #[tokio::test]
+async fn in_flight_composite_keeps_both_members_from_its_admitted_generation() {
+    struct PauseRead {
+        entered: Arc<Notify>,
+        resume: Arc<Notify>,
+    }
+    #[async_trait::async_trait]
+    impl TileLayer for PauseRead {
+        async fn read(
+            &self,
+            _: &ValidatedTileRequest<'_>,
+            next: TileService<'_>,
+        ) -> MaptileResult<TileOutcome> {
+            self.entered.notify_one();
+            self.resume.notified().await;
+            next.read().await
+        }
+    }
+
+    let service = Arc::new(CatalogService::new(TileCache::new(1, None, None).unwrap()));
+    let publish = |extent: u32, declare: bool| {
+        let mut update = service.catalog().update();
+        for id in ["roads", "water"] {
+            let mut descriptor = strict_descriptor(id, &[id]);
+            let bytes = tile(id, extent);
+            descriptor.revision = ContentVersion::from_input(&bytes);
+            update
+                .put(Arc::new(TestDriver::new(descriptor, [Some(bytes)])))
+                .unwrap();
+        }
+        if declare {
+            update
+                .composite(decl(
+                    "map",
+                    &["roads", "water"],
+                    DuplicateLayer::Error,
+                    MemberFailurePolicy::FailFast,
+                ))
+                .unwrap();
+        }
+        service.catalog().publish(update).unwrap();
+    };
+    publish(2048, true);
+    let entered = Arc::new(Notify::new());
+    let resume = Arc::new(Notify::new());
+    let slow = TileStack::builder(service.clone())
+        .layer(PauseRead {
+            entered: entered.clone(),
+            resume: resume.clone(),
+        })
+        .build();
+    let current = TileStack::builder(service.clone()).build();
+    let (old, new) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(stack_read(&slow, "map", 0), async {
+            entered.notified().await;
+            publish(4096, false);
+            let new = stack_read(&current, "map", 0).await;
+            resume.notify_one();
+            new
+        })
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        present_data(old.unwrap()),
+        tile_layers(&[("roads", 2048), ("water", 2048)])
+    );
+    let expected = tile_layers(&[("roads", 4096), ("water", 4096)]);
+    assert_eq!(present_data(new.unwrap()), expected);
+    assert_eq!(
+        present_data(stack_read(&current, "map", 0).await.unwrap()),
+        expected
+    );
+}
+
+#[tokio::test]
 async fn temporary_composite_aliases_share_cache_fills_and_export_cursors() {
     struct CheckIdentity;
     #[async_trait::async_trait]

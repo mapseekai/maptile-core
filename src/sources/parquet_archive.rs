@@ -174,9 +174,6 @@ impl TileSource for ParquetArchiveSource {
     fn cache_zoom(&self) -> CacheZoomRange {
         self.cache_zoom
     }
-    fn clone_source(&self) -> Box<dyn TileSource> {
-        Box::new(self.clone())
-    }
     fn start_close(&self) {
         self.closed.store(true, Ordering::Release);
     }
@@ -186,7 +183,7 @@ impl TileSource for ParquetArchiveSource {
         xyz: TileCoord,
         query: Option<&TileQuery<'_>>,
     ) -> MaptileResult<TileResponse> {
-        super::validate_source_request(self, &[xyz], query)?;
+        super::request::validate_source_request(self, &[xyz], query)?;
         if self.closed.load(Ordering::Acquire) {
             return Err(MaptileError::Cancelled);
         }

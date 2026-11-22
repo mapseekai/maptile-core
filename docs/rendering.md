@@ -8,15 +8,15 @@
 
 | 目标 | 主要接口 | Feature |
 | --- | --- | --- |
-| 读取样式、调整资源 URL | `LocalStyleStore`、`StyleStore`、`rewrite_urls` | 默认构建 |
+| 读取样式、调整资源 URL | `LocalStyleStore`、`StyleStore`、`rewrite_urls`、`rewrite_style_for_native` | 默认构建 |
 | 构造地图请求、解析视口 | `RenderRequest`、`RenderCamera`、`StaticTarget` | 默认构建 |
-| 生成 WMTS 服务描述 | `WmtsService`、`WmtsLayer`、`build_capabilities` | 默认构建 |
 | 按地图样式输出图片 | `RendererPool`、`MapLibreRenderer` | `render` |
 | 单幅 COG 动态切片 | `AsyncCogSource` | `agtiff` |
 | 按目录搜索并镶嵌 COG | `StacSource` | `stac` |
-| 固定成员镶嵌、PostGIS OutDB | `MosaicSource`、`PostgresOutDbRasterSource` | `raster` |
+| 固定成员镶嵌 | `MosaicSource` | `agtiff` |
+| 读取 PostGIS OutDB 影像 | `PostgresOutDbRasterSource` | `postgres,raster` |
 
-默认构建可完成样式管理、请求构造和 WMTS XML 生成。执行地图图片渲染时启用 `render`，由工作线程持有原生渲染器。组合方式见[功能开关](features.md)，平台依赖和构建命令见[原生渲染构建](development.md#原生渲染构建)。
+默认构建提供样式管理和请求构造。执行地图图片渲染时启用 `render`，由工作线程持有原生渲染器。WMTS XML 由应用适配器生成。 [功能开关](features.md) · [原生渲染构建](development.md#原生渲染构建) · [WMTS 元数据示例](#生成-wmts-元数据)
 
 ## 从样式生成地图图片
 
@@ -76,6 +76,8 @@ bash scripts/ci/maptile-render-cargo.sh run --locked --features render --example
 
 `LocalStyleStore::new` 接收样式 ID 到 JSON 文件路径的映射；`get(id).await` 读取并解析文件，`list().await` 返回排序后的样式 ID。返回的 `Style` 包含 `id`、`name`、JSON 值和源文件路径。应用可通过 `StyleStore` 接口提供自己的存储实现。
 
+用 `styles::snapshot(&store, base_url, query_string).await` 生成 `StyleInfo` 列表。`base_url` 为 `Some` 时填入 `<base>/styles/<id>/style.json` 与查询后缀。如果服务需要在同一个响应中列出样式和源，应用可从 `CatalogSnapshot::descriptors()` 获取源列表并自行组装响应。 [样式列表实现](../src/styles/catalog.rs)
+
 调用方可按 `MaptileError` 变体区分失败原因：
 
 | 情况 | 错误 |
@@ -85,11 +87,11 @@ bash scripts/ci/maptile-render-cargo.sh run --locked --features render --example
 | `get` 解析 JSON 失败 | `StyleFile { id, path, source }`，`source` 为 `Json(error)`，可读取 `classify()`、`line()`、`column()` |
 | 构造或读取时样式文件超过 16 MiB | `StyleFile { id, path, source }`，`source` 为 `PayloadTooLarge { limit: 16777216 }` |
 
-`StyleFile.source.as_ref()` 可用于匹配上述底层错误；错误本身和 `snapshot_catalog` 返回值都带有样式 ID 与路径。已注册样式的文件随后被删除时，底层错误为 `Io(NotFound)`。应用对外输出错误时应隐藏内部文件路径。
+`StyleFile.source.as_ref()` 可用于匹配上述底层错误。`styles::snapshot` 同样返回带样式 ID 与路径的错误。已注册样式的文件随后被删除时，底层错误为 `Io(NotFound)`。应用对外输出错误时应隐藏内部文件路径。
 
 样式路径必须指向普通文件，指向普通文件的符号链接仍可使用。构造和读取都会校验类型；读取校验的是已打开句柄，Unix 上使用非阻塞打开，避免注册后路径被替换为 FIFO 时阻塞。目录和 FIFO 返回带上下文的文件错误。
 
-本地样式文件最大为 **16 MiB（16,777,216 字节，包含边界）**。构造和读取都会检查文件长度；实际读取最多取上限加 1 字节，超限即拒绝解析，防止检查后文件增长绕过限制。`snapshot_catalog` 使用同一读取路径。该限制针对文件字节数，不是 JSON 解析后的内存配额；原先超过上限的本地样式需要缩小文件或由应用提供自己的 `StyleStore` 实现。
+本地样式文件最大为 **16 MiB（16,777,216 字节，包含边界）**。构造和读取都会检查文件长度。实际读取最多取上限加 1 字节，超限即拒绝解析，防止检查后文件增长绕过限制。样式列表使用同一读取路径。对超过上限的文件，应用可缩小文件或提供自己的 `StyleStore` 实现。
 
 `rewrite_urls(&style, base_url, query_string)` 将以下字段中以 `/` 开头的资源地址转换为绝对 URL：
 
@@ -100,7 +102,7 @@ bash scripts/ci/maptile-render-cargo.sh run --locked --features render --example
 
 传入空字符串、单独的 `?` 或 `&` 可只补齐域名。参数值应已完成 URL 编码，例如值中的 `#` 应写为 `%23`；函数不会解析或编码参数。其他后缀保留直接追加的既有用途，例如 `.json` 会追加到完整资源字符串末尾，不参与查询串或片段合并。
 
-`rewrite_style_for_native(&style, base_url, &manager)` 处理指向已注册源的 `/data/<id>` 或 `/data/<id>.json` 引用：将其转换为瓦片 URL 模板，并从源元数据补充缺省的缩放范围、边界和署名。应用提供对应瓦片、字体和精灵图的资源访问路径。具体重写规则见 [`styles/store.rs`](../src/styles/store.rs)，源注册见[数据源与查询](sources.md)。
+应用从 `catalog.catalog().snapshot()` 取得目录快照，再调用 `rewrite_style_for_native(&style.value, base_url, &snapshot)`。函数对整个样式使用同一代快照，按普通源与组合的实际格式将已注册的 `/data/<id>` 或 `/data/<id>.json` 引用转成瓦片 URL 模板。函数还用描述符补充缺省的缩放范围、边界和署名。应用负责配置瓦片、字体和精灵图的可访问地址，并用描述符中的图层名填写 `source-layer`。 [样式重写实现](../src/styles/store.rs) · [数据源与查询](sources.md)
 
 ## 配置相机与覆盖物
 
@@ -129,7 +131,7 @@ bash scripts/ci/maptile-render-cargo.sh run --locked --features render --example
 
 | 配置 | 当前值或要求 | 使用方式 |
 | --- | --- | --- |
-| `for_tile` 逻辑尺寸 | 512 × 512 | 适合按 XYZ 渲染地图瓦片 |
+| `for_tile` 逻辑尺寸 | `RenderRequest::TILE_SIZE`（512）作为宽和高 | 适合按 XYZ 渲染地图瓦片 |
 | `width`、`height` | 均大于 0 | 静态图片按目标宽高设置 |
 | `scale` | 整数 1 到 4 | 输出尺寸为逻辑宽高乘以 `scale` |
 | 单边输出尺寸 | 最大 4096 像素 | 分别校验 `width × scale` 和 `height × scale` |
@@ -190,9 +192,9 @@ OutDB 每次请求都会查询当前资产，因此始终绕过瓦片结果缓�
 
 ## 生成 WMTS 元数据
 
-`build_capabilities(&service, &layers)` 生成 WMTS 1.0.0 GetCapabilities XML。`WmtsService` 描述服务标题、摘要和访问地址；每个 `WmtsLayer` 提供图层标识、瓦片 URL 模板、图片 MIME 类型、缩放范围和可选 WGS84 边界。应用将生成的 XML 与对应瓦片入口一起提供给客户端。
+`archive_http` 示例的 `/wmts.xml` 返回 WMTS 1.0.0 GetCapabilities XML。应用适配器用已配置的公开地址生成服务与瓦片链接，并从目录描述符读取图层标识、MIME 类型、缩放范围和 WGS84 边界。示例中的 XML 组装和回归测试位于同一模块。 [HTTP 路由](../examples/archive_http.rs) · [WMTS 实现](../examples/archive_http/wmts.rs)
 
-生成的矩阵集名为 `GoogleMapsCompatible`，使用 EPSG:3857、512 像素瓦片及 0 到 22 级矩阵。图层的 `min_zoom`、`max_zoom` 用于写出矩阵范围；配置时保持元数据与实际瓦片输出一致。实现及 XML 回归样例见 [`wmts.rs`](../src/protocol/wmts.rs) 和 [WMTS 测试](../tests/protocol/wmts.rs)。
+示例生成的 `GoogleMapsCompatible` 矩阵集使用 EPSG:3857，覆盖 0 到 22 级，并按归档的最大缩放级别扩展至最高 30 级。图层仍声明归档的缩放范围。MVT 与 MLT 使用 `RenderRequest::TILE_SIZE`（512）作为逻辑瓦片尺寸。PNG、JPEG 和 WebP 使用打开归档时读取或探测得到的 `tile_size`，例如原生 256 像素的 PNG。已发布的栅格源缺少有效尺寸时，示例路由返回 422。 [XML 回归样例](../examples/archive_http/wmts_golden.xml)
 
 ## 验证与后续接入
 

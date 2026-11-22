@@ -9,8 +9,8 @@
 //!   references and generates image tiles through GDAL.
 //!
 //! Configure connections with [`PoolSettings`] and share the pool across sources.
-//! Each source implements [`crate::sources::TileSource`] for registration with
-//! [`crate::sources::manager::SourceManager`].
+//! Publish opened sources through [`crate::control::CatalogService`] and serve
+//! tile requests through [`crate::service::TileStack`].
 
 mod function;
 mod pool;
