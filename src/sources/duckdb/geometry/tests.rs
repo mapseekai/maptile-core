@@ -340,6 +340,35 @@ async fn bbox_and_cql2_parameters_filter_geometry_before_encoding() {
 }
 
 #[tokio::test]
+async fn cached_tile_queries_rebind_filters_before_the_feature_limit() {
+    let fixture = fixture_points(&[(10.0, 60.0), (15.0, 61.0), (20.0, 62.0)], true);
+    let mut cfg = fixture.config();
+    cfg.query_options.pool_size = 1;
+    cfg.query_options.max_features = 1;
+    let source = GeoParquetSource::open(cfg).unwrap();
+
+    for (expression, id) in [("name = 'row-2'", 3), ("name = 'row-0'", 1)] {
+        let filter = crate::filter::parse_cql2(expression).unwrap();
+        let query = TileQuery {
+            filter: Some(&filter),
+            ..Default::default()
+        };
+        let data = source.get_tile(TILE, Some(&query)).await.unwrap().data;
+        let tile = mvt::decode(&data).unwrap();
+        let features = &tile.layers[0].features;
+        assert_eq!(features.len(), 1);
+        assert_eq!(features[0].id, Some(id));
+    }
+
+    for query in [None, Some(TileQuery::default())] {
+        assert!(matches!(
+            source.get_tile(TILE, query.as_ref()).await,
+            Err(MaptileError::Resource(_))
+        ));
+    }
+}
+
+#[tokio::test]
 async fn opening_uses_primary_column_and_calculates_point_bounds() {
     let fixture = fixture_points(&[(10.0, 60.0)], false);
     let mut config = fixture.config();

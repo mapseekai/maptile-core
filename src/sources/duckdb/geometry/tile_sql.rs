@@ -1,15 +1,47 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
+
+use duckdb::types::Value;
 
 use super::super::geoparquet::GeoParquetSourceConfig;
 use super::super::literal;
+use super::super::predicates::TilePredicates;
 use super::bounds::RADIUS;
 use super::resolver::{InputKind, ResolvedGeometry};
+use crate::error::MaptileResult;
+use crate::sources::{TileCoord, TileQuery};
 
 pub(super) struct SpatialQuery {
     pub(super) sql: Arc<str>,
     pub(super) bounds_sql: Arc<str>,
-    pub(super) filter_at: usize,
-    pub(super) projected: Arc<str>,
+    filter_at: usize,
+    projected: Arc<str>,
+}
+
+pub(super) struct BoundTileQuery {
+    pub(super) sql: Arc<str>,
+    pub(super) params: Vec<(String, Value)>,
+}
+
+impl SpatialQuery {
+    pub(super) fn bind_tile(
+        &self,
+        xyz: TileCoord,
+        query: Option<&TileQuery<'_>>,
+        fields: &BTreeMap<String, String>,
+    ) -> MaptileResult<BoundTileQuery> {
+        let TilePredicates {
+            sql: filter,
+            params,
+        } = TilePredicates::build(xyz, query, fields, &self.projected)?;
+        let sql = if filter.is_empty() {
+            Arc::clone(&self.sql)
+        } else {
+            let (start, end) = self.sql.split_at(self.filter_at);
+            format!("{start}{filter}{end}").into()
+        };
+        Ok(BoundTileQuery { sql, params })
+    }
 }
 
 pub(super) fn build_sql(

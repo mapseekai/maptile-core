@@ -21,7 +21,6 @@ use self::tile_sql::{SpatialQuery, build_sql};
 use super::config;
 use super::geoparquet::GeoParquetSourceConfig;
 use super::pool::{DuckDbPoolStatus, QueryPool, SpatialManager};
-use super::predicates::TilePredicates;
 use super::query::{FinishQuery, GeoParquetQueryOptions, QueryControl};
 use super::remote::{DuckDbSecret, RemoteLocation, remote_error};
 use crate::error::{MaptileError, MaptileResult};
@@ -235,28 +234,20 @@ impl GeometrySource {
         query: Option<&TileQuery<'_>>,
     ) -> MaptileResult<bytes::Bytes> {
         let deadline = tokio::time::Instant::now() + Duration::from_millis(self.options.timeout_ms);
-        let TilePredicates {
-            sql: filter,
-            params,
-        } = TilePredicates::build(xyz, query, &self.fields, &self.query.projected)?;
-        let sql = if filter.is_empty() {
-            self.query.sql.clone()
-        } else {
-            let (start, end) = self.query.sql.split_at(self.query.filter_at);
-            format!("{start}{filter}{end}").into()
-        };
+        let bound = self.query.bind_tile(xyz, query, &self.fields)?;
         let local = self.local.clone();
         let options = self.options.clone();
         let result = self
             .pool
             .run(deadline, file_lease, move |conn| {
                 check_stamp(&local)?;
-                let params = params
+                let params = bound
+                    .params
                     .iter()
                     .map(|(name, value)| (name.as_str(), value as &dyn ToSql))
                     .collect::<Vec<_>>();
                 let result = conn
-                    .prepare_cached(&sql)
+                    .prepare_cached(&bound.sql)
                     .and_then(|mut s| {
                         s.query_row(params.as_slice(), |r| {
                             Ok((r.get::<_, Option<Vec<u8>>>(0)?, r.get::<_, i64>(1)?))
