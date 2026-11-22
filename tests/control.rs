@@ -67,6 +67,14 @@ fn driver(
     error: Option<MaptileError>,
     reads: Arc<AtomicUsize>,
 ) -> Arc<dyn TileDriver> {
+    Arc::new(TestDriver {
+        descriptor: strict_descriptor(id, names),
+        tiles,
+        error,
+        reads,
+    })
+}
+fn strict_descriptor(id: &str, names: &[&str]) -> SourceDescriptor {
     let info = TileInfo {
         format: TileFormat::Mvt,
         encoding: TileEncoding::Uncompressed,
@@ -80,12 +88,7 @@ fn driver(
             .map(|name| tilejson::VectorLayer::new((*name).into(), Default::default()))
             .collect(),
     );
-    Arc::new(TestDriver {
-        descriptor,
-        tiles,
-        error,
-        reads,
-    })
+    descriptor
 }
 fn decl(
     id: &str,
@@ -695,6 +698,192 @@ async fn stale_failure_cannot_admit_a_second_probe() {
     assert_eq!(driver.calls.load(Ordering::SeqCst), 3);
     driver.probe.notify_one();
     assert!(probe.await.is_ok());
+}
+
+#[tokio::test]
+async fn nested_fail_fast_holds_leaf_capacity_until_abandoned_blocking_work_finishes() {
+    use maptile_core::{control::CompositeLimits, transport};
+    use std::{
+        sync::{Mutex, atomic::AtomicBool, mpsc},
+        task::{Context, Wake, Waker},
+        time::Duration,
+    };
+    use tokio::sync::Notify;
+
+    struct HeldGzip {
+        data: Bytes,
+        entered: Arc<Notify>,
+        release: mpsc::Receiver<()>,
+    }
+    impl AsRef<[u8]> for HeldGzip {
+        fn as_ref(&self) -> &[u8] {
+            &self.data
+        }
+    }
+    impl Drop for HeldGzip {
+        fn drop(&mut self) {
+            self.entered.notify_one();
+            let _ = self.release.recv_timeout(Duration::from_secs(10));
+        }
+    }
+
+    enum LeafRead {
+        Gzip(Mutex<Option<Bytes>>),
+        Timeout(Arc<Notify>),
+        Sibling {
+            started: Arc<AtomicUsize>,
+            resume: tokio_util::sync::CancellationToken,
+            data: Bytes,
+        },
+    }
+    struct ControlledLeaf(SourceDescriptor, LeafRead);
+    #[async_trait::async_trait]
+    impl TileDriver for ControlledLeaf {
+        fn descriptor(&self) -> SourceDescriptor {
+            self.0.clone()
+        }
+        async fn read(
+            &self,
+            _: TileCoord,
+            _: Option<&TileQuery<'_>>,
+        ) -> MaptileResult<Option<TileResponse>> {
+            let data = match &self.1 {
+                LeafRead::Gzip(data) => data.lock().unwrap().take().unwrap(),
+                LeafRead::Timeout(fail) => {
+                    fail.notified().await;
+                    return Err(MaptileError::Deadline);
+                }
+                LeafRead::Sibling {
+                    started,
+                    resume,
+                    data,
+                } => {
+                    started.fetch_add(1, Ordering::SeqCst);
+                    resume.cancelled().await;
+                    data.clone()
+                }
+            };
+            Ok(Some(TileResponse {
+                data,
+                info: self.0.info,
+                last_modified: None,
+            }))
+        }
+    }
+    struct Woken(AtomicBool);
+    impl Wake for Woken {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    let valid = transport::encode_as(&tile("gzip", 4096), TileEncoding::Gzip).unwrap();
+    for input in [valid.clone(), valid.slice(..valid.len() - 1)] {
+        let limits = CompositeLimits {
+            max_concurrency: 2,
+            ..CompositeLimits::default()
+        };
+        let engine = Arc::new(
+            CatalogService::with_limits(TileCache::new(1, None, None).unwrap(), limits).unwrap(),
+        );
+        let mut update = engine.catalog().update();
+        let entered = Arc::new(Notify::new());
+        let (release, released) = mpsc::channel();
+        let descriptor = |id| strict_descriptor(id, &[id]);
+        let mut gzip = descriptor("gzip");
+        gzip.info.encoding = TileEncoding::Gzip;
+        let bytes = Bytes::from_owner(HeldGzip {
+            data: input,
+            entered: entered.clone(),
+            release: released,
+        });
+        update
+            .put(Arc::new(ControlledLeaf(
+                gzip,
+                LeafRead::Gzip(Mutex::new(Some(bytes))),
+            )))
+            .unwrap();
+        let fail = Arc::new(Notify::new());
+        update
+            .put(Arc::new(ControlledLeaf(
+                descriptor("timeout"),
+                LeafRead::Timeout(fail.clone()),
+            )))
+            .unwrap();
+        let siblings = Arc::new(AtomicUsize::new(0));
+        let resume = tokio_util::sync::CancellationToken::new();
+        for name in ["roads", "water"] {
+            let read = LeafRead::Sibling {
+                started: siblings.clone(),
+                resume: resume.clone(),
+                data: tile(name, 4096),
+            };
+            update
+                .put(Arc::new(ControlledLeaf(descriptor(name), read)))
+                .unwrap();
+        }
+        update
+            .composite(decl(
+                "inner",
+                &["gzip", "timeout"],
+                DuplicateLayer::Error,
+                MemberFailurePolicy::FailFast,
+            ))
+            .unwrap();
+        update
+            .composite(decl(
+                "outer",
+                &["inner", "roads", "water"],
+                DuplicateLayer::Error,
+                MemberFailurePolicy::SkipTransient,
+            ))
+            .unwrap();
+        engine.catalog().publish(update).unwrap();
+        let stack = TileStack::builder(engine).build();
+        let mut request = Box::pin(stack_read(&stack, "outer", 0));
+        tokio::select! {
+            result = request.as_mut() => panic!("request finished before decoding: {result:?}"),
+            () = entered.notified() => {},
+            () = tokio::time::sleep(Duration::from_secs(10)) => panic!("decoder did not start"),
+        }
+        fail.notify_one();
+
+        // Poll all leaves made ready by the timeout while the abandoned decoder still holds its input.
+        let woken = Arc::new(Woken(true.into()));
+        let waker = Waker::from(woken.clone());
+        while woken.0.swap(false, Ordering::SeqCst) {
+            assert!(
+                request
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
+        }
+        let started_before_release = siblings.load(Ordering::SeqCst);
+        release.send(()).unwrap();
+        resume.cancel();
+        let outcome = tokio::time::timeout(Duration::from_secs(10), request)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(started_before_release, 1);
+        assert_eq!(siblings.load(Ordering::SeqCst), 2);
+        let TileOutcome::Partial {
+            tile: Some(tile),
+            failures,
+        } = outcome
+        else {
+            panic!("expected partial tile")
+        };
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].source.as_ref(), "inner");
+        assert!(matches!(failures[0].error, MaptileError::Deadline));
+        let layers = Tile::decode(tile.data).unwrap().layers;
+        assert_eq!(
+            layers.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(),
+            ["roads", "water"]
+        );
+    }
 }
 
 #[tokio::test]

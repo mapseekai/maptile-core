@@ -54,8 +54,15 @@ pub struct TileRequest<'a> {
     pub coord: TileCoord,
 }
 
+#[derive(Clone, Copy)]
+enum ReadMode {
+    Online,
+    Export,
+}
+
 pub struct ValidatedTileRequest<'a> {
     request: TileRequest<'a>,
+    mode: ReadMode,
     snapshot: &'a CatalogSnapshot,
     entry: &'a Arc<CatalogEntry>,
 }
@@ -145,7 +152,8 @@ impl TileStack {
     pub async fn read(&self, request: TileRequest<'_>) -> MaptileResult<TileOutcome> {
         let snapshot = self.engine.catalog().snapshot();
         let entry = snapshot.entry(request.target.source, self.engine.limits())?;
-        self.dispatch(&snapshot, &entry, request).await
+        self.dispatch(&snapshot, &entry, request, ReadMode::Online)
+            .await
     }
 
     async fn dispatch(
@@ -153,6 +161,7 @@ impl TileStack {
         snapshot: &CatalogSnapshot,
         entry: &Arc<CatalogEntry>,
         request: TileRequest<'_>,
+        mode: ReadMode,
     ) -> MaptileResult<TileOutcome> {
         validate_tile_request(&[request.coord], request.target.query)?;
         entry.descriptor().validate_query(request.target.query)?;
@@ -162,6 +171,7 @@ impl TileStack {
                 ..request.target
             }
             .at(request.coord),
+            mode,
             snapshot,
             entry,
         };

@@ -31,9 +31,13 @@ pub struct CompositeDeclaration {
 pub struct CompositeLimits {
     pub max_depth: usize,
     pub max_leaves: usize,
+    /// Maximum concurrent leaf reads in one request, including layer validation.
     pub max_concurrency: usize,
     pub max_compressed_bytes: usize,
     pub max_decoded_bytes: usize,
+    /// Maximum total byte reservations for encoded inputs, decoded payloads and composed output.
+    /// Decoding rechecks admission before retaining its output. Codec state and temporary
+    /// parser allocations use additional memory.
     pub max_work_bytes: usize,
 }
 impl Default for CompositeLimits {

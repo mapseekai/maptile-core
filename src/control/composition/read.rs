@@ -14,7 +14,9 @@ use futures_util::{
 };
 use tokio::sync::Semaphore;
 
-use super::{CompiledComposite, CompositeLimits, Member, MemberFailurePolicy, SourceSlot};
+use super::{
+    CompiledComposite, CompositeLimits, Member, MemberFailurePolicy, SourceDescriptor, SourceSlot,
+};
 use crate::{
     core::response::{MemberFailure, TileOutcome},
     error::{ErrorKind, MaptileError, MaptileResult},
@@ -26,7 +28,7 @@ use crate::{
 struct ReadBudget(Arc<BudgetState>);
 struct BudgetState {
     limits: CompositeLimits,
-    semaphore: Semaphore,
+    semaphore: Arc<Semaphore>,
     decode_lock: Mutex<()>,
     compressed: AtomicUsize,
     decoded: AtomicUsize,
@@ -35,7 +37,9 @@ struct BudgetState {
 impl ReadBudget {
     fn new(limits: CompositeLimits) -> Self {
         Self(Arc::new(BudgetState {
-            semaphore: Semaphore::new(limits.max_concurrency.clamp(1, Semaphore::MAX_PERMITS)),
+            semaphore: Arc::new(Semaphore::new(
+                limits.max_concurrency.clamp(1, Semaphore::MAX_PERMITS),
+            )),
             decode_lock: Mutex::new(()),
             compressed: AtomicUsize::new(0),
             decoded: AtomicUsize::new(0),
@@ -230,13 +234,12 @@ async fn read_leaf(
     query: Option<&TileQuery<'_>>,
     budget: &ReadBudget,
 ) -> MaptileResult<Held> {
-    let _permit = budget
-        .semaphore
-        .acquire()
+    let permit = Arc::clone(&budget.semaphore)
+        .acquire_owned()
         .await
         .map_err(MaptileError::backend)?;
     let outcome = slot.read(coord, query).await?;
-    let mut tile = match outcome {
+    let tile = match outcome {
         TileOutcome::Present(tile) => tile,
         TileOutcome::NoTile => {
             return Ok(Held {
@@ -264,65 +267,77 @@ async fn read_leaf(
     let descriptor = slot.descriptor().clone();
     let budget = budget.clone();
     transport::run_blocking(move || {
-        let _lock = budget
-            .decode_lock
-            .lock()
-            .map_err(|_| MaptileError::BackendMsg("composite decode lock poisoned".into()))?;
-        let remaining = budget
-            .limits
-            .max_decoded_bytes
-            .min(transport::MAX_DECODED_TILE_BYTES)
-            .saturating_sub(budget.decoded.load(Ordering::Acquire));
-        let work_remaining = budget
-            .limits
-            .max_work_bytes
-            .saturating_sub(budget.work.load(Ordering::Acquire));
-        let raw = transport::decode_with_limit(
-            &tile.data,
-            tile.info.encoding,
-            remaining.min(work_remaining),
-        )?;
-        ReadBudget::charge(
-            &budget.decoded,
-            raw.len(),
-            budget
-                .limits
-                .max_decoded_bytes
-                .min(transport::MAX_DECODED_TILE_BYTES),
-        )?;
-        let raw_work = budget.reserve(raw.len())?;
-        if !raw.is_empty() {
-            let parsed = MvtSource::from_mvt_with_compression(
-                descriptor.id.to_string(),
-                &raw,
-                Compression::None,
-            )
-            .map_err(|e| MaptileError::InvalidMetadata(format!("invalid MVT: {e}")))?;
-            let declared = descriptor
-                .tilejson
-                .vector_layers
-                .as_ref()
-                .expect("validated at build");
-            let mut seen = HashSet::new();
-            for layer in parsed.layers() {
-                let name = layer.as_ref();
-                if !seen.insert(name) || !declared.iter().any(|d| d.id == name) {
-                    return Err(MaptileError::InvalidMetadata(format!(
-                        "unexpected or duplicate layer {name} in {}",
-                        descriptor.id
-                    )));
-                }
-            }
-        }
-        tile.data = raw;
-        tile.info.encoding = TileEncoding::Uncompressed;
-        drop(encoded_work);
-        Ok(Held {
-            outcome: TileOutcome::Present(tile),
-            work: vec![raw_work],
-        })
+        let _permit = permit;
+        decode_member(&budget, &descriptor, encoded_work, tile)
     })
     .await
+}
+
+fn decode_member(
+    budget: &ReadBudget,
+    descriptor: &SourceDescriptor,
+    encoded_work: Work,
+    tile: TileResponse,
+) -> MaptileResult<Held> {
+    let lock = budget
+        .decode_lock
+        .lock()
+        .map_err(|_| MaptileError::BackendMsg("composite decode lock poisoned".into()))?;
+    let remaining = budget
+        .limits
+        .max_decoded_bytes
+        .min(transport::MAX_DECODED_TILE_BYTES)
+        .saturating_sub(budget.decoded.load(Ordering::Acquire));
+    let work_remaining = budget
+        .limits
+        .max_work_bytes
+        .saturating_sub(budget.work.load(Ordering::Acquire));
+    let raw = transport::decode_with_limit(
+        &tile.data,
+        tile.info.encoding,
+        remaining.min(work_remaining),
+    )?;
+    ReadBudget::charge(
+        &budget.decoded,
+        raw.len(),
+        budget
+            .limits
+            .max_decoded_bytes
+            .min(transport::MAX_DECODED_TILE_BYTES),
+    )?;
+    let raw_work = budget.reserve(raw.len())?;
+    let mut tile = tile;
+    tile.data = raw;
+    tile.info.encoding = TileEncoding::Uncompressed;
+    drop(encoded_work);
+    drop(lock);
+    if !tile.data.is_empty() {
+        let parsed = MvtSource::from_mvt_with_compression(
+            descriptor.id.to_string(),
+            &tile.data,
+            Compression::None,
+        )
+        .map_err(|e| MaptileError::InvalidMetadata(format!("invalid MVT: {e}")))?;
+        let declared = descriptor
+            .tilejson
+            .vector_layers
+            .as_ref()
+            .expect("validated at build");
+        let mut seen = HashSet::new();
+        for layer in parsed.layers() {
+            let name = layer.as_ref();
+            if !seen.insert(name) || !declared.iter().any(|d| d.id == name) {
+                return Err(MaptileError::InvalidMetadata(format!(
+                    "unexpected or duplicate layer {name} in {}",
+                    descriptor.id
+                )));
+            }
+        }
+    }
+    Ok(Held {
+        outcome: TileOutcome::Present(tile),
+        work: vec![raw_work],
+    })
 }
 
 #[cfg(feature = "metrics")]

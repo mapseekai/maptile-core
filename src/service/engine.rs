@@ -1,6 +1,6 @@
 use futures_util::FutureExt;
 
-use super::ValidatedTileRequest;
+use super::{ReadMode, ValidatedTileRequest};
 use crate::{
     cache::{
         ContentVersion, Flights, StyleHash, TileCache, TileCacheKey, hashing::canonical_render_hash,
@@ -82,22 +82,18 @@ impl CatalogService {
             coord.y,
             style_hash,
         );
-        if let Some(tile) = self.cache.get_validated(&key).await? {
-            return Ok(TileOutcome::Present(tile));
+        let online = matches!(pinned.mode, ReadMode::Online);
+        if let Some(hit) = self.cache.get_validated(&key, online).await? {
+            return Ok(TileOutcome::Present(hit));
         }
-
         let has_query = query.is_some();
         let requested_hash = query.and_then(|q| q.style_hash);
         self.flights
-            .get_or_fill(key.clone(), pinned.generation(), || {
-                let cache = self.cache.clone();
+            .get_or_fill(&self.cache, key, pinned.generation(), online, || {
                 let entry = pinned.entry.clone();
                 let limits = self.limits();
                 let style = style.cloned();
                 async move {
-                    if let Some(tile) = cache.get_validated(&key).await? {
-                        return Ok(TileOutcome::Present(tile));
-                    }
                     let query = TileQuery {
                         style: style.as_ref(),
                         style_hash: requested_hash,
@@ -112,13 +108,12 @@ impl CatalogService {
                         )
                         .await?;
                     check_output(&result).await?;
-                    if let TileOutcome::Present(tile) = &result {
-                        cache.insert_validated(key, tile.clone()).await;
-                    }
                     Ok(result)
                 }
                 .boxed()
             })
+            // Keep the miss and admission state out of the future for a cache hit.
+            .boxed()
             .await
     }
 }

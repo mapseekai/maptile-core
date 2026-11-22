@@ -465,6 +465,206 @@ async fn one_waiter_can_leave_a_shared_fill_and_the_remaining_waiter_gets_the_ti
 }
 
 #[tokio::test]
+async fn fallback_export_reuses_online_cache_and_online_batch_populates_it() {
+    let driver = Arc::new(Driver::new(
+        "sample",
+        "v1",
+        Bytes::from_static(b"canonical"),
+    ));
+    let service = engine(driver.clone());
+    let plain = TileStack::builder(service.clone()).build();
+    let layered = TileStack::builder(service).layer(Rewrite).build();
+    let target = ReadTarget::new("sample", "public");
+    let warm = TileCoord { z: 1, x: 0, y: 0 };
+    let coords = [warm, ORIGIN];
+    plain.read(target.at(warm)).await.unwrap();
+
+    let export = layered.begin_export(target).unwrap();
+    let page = export.read_page(&coords).await.unwrap();
+    assert_eq!(page.consumed, 2);
+    for outcome in page.tiles {
+        assert_eq!(outcome.tile().unwrap().data, &b"rewritten"[..]);
+    }
+    assert_eq!(driver.calls.load(Ordering::SeqCst), 2);
+
+    let (page, cursor) = layered
+        .read_export_page(target, &coords, None)
+        .await
+        .unwrap();
+    assert_eq!(page.consumed, 2);
+    assert!(cursor.is_none());
+    assert_eq!(driver.calls.load(Ordering::SeqCst), 3);
+
+    assert_eq!(
+        layered.read_batch(target, &coords).await.unwrap().consumed,
+        2
+    );
+    assert_eq!(driver.calls.load(Ordering::SeqCst), 4);
+    assert_eq!(
+        plain
+            .read(target.at(ORIGIN))
+            .await
+            .unwrap()
+            .tile()
+            .unwrap()
+            .data,
+        &b"canonical"[..]
+    );
+    assert_eq!(driver.calls.load(Ordering::SeqCst), 4);
+}
+
+#[tokio::test]
+async fn online_waiters_cache_an_export_led_flight() {
+    let hold = Arc::new(Notify::new());
+    let driver = Arc::new(Driver {
+        hold: Some(hold.clone()),
+        ..Driver::new("sample", "v1", Bytes::from_static(b"shared"))
+    });
+    let stack = TileStack::builder(engine(driver.clone())).build();
+    let target = ReadTarget::new("sample", "public");
+    let export = stack.begin_export(target).unwrap();
+    let coords = [ORIGIN];
+    let req = target.at(ORIGIN);
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let mut exporting = Box::pin(export.read_page(&coords));
+        while driver.calls.load(Ordering::SeqCst) == 0 {
+            assert!(futures::poll!(exporting.as_mut()).is_pending());
+            tokio::task::yield_now().await;
+        }
+        let mut online = Box::pin(stack.read(req));
+        assert!(futures::poll!(online.as_mut()).is_pending());
+        assert_eq!(driver.calls.load(Ordering::SeqCst), 1);
+        hold.notify_one();
+        let (page, read) = tokio::join!(exporting, online);
+        let page = page.unwrap();
+        assert_eq!(page.tiles[0].tile().unwrap().data, &b"shared"[..]);
+        assert_eq!(read.unwrap().tile().unwrap().data, &b"shared"[..]);
+        assert_eq!(
+            stack.read(req).await.unwrap().tile().unwrap().data,
+            &b"shared"[..]
+        );
+    })
+    .await
+    .unwrap();
+    assert_eq!(driver.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn export_and_online_cancellation_keep_the_other_waiter_alive() {
+    use tokio_util::sync::CancellationToken;
+
+    for cancel_export in [true, false] {
+        let hold = Arc::new(Notify::new());
+        let driver = Arc::new(Driver {
+            hold: Some(hold.clone()),
+            ..Driver::new("sample", "v1", Bytes::from_static(b"shared"))
+        });
+        let stack = TileStack::builder(engine(driver.clone())).build();
+        let target = ReadTarget::new("sample", "public");
+        let cancel = CancellationToken::new();
+        let cancellable = ReadTarget {
+            cancellation: Some(&cancel),
+            ..target
+        };
+        let export = stack
+            .begin_export(if cancel_export { cancellable } else { target })
+            .unwrap();
+        let online_target = if cancel_export { target } else { cancellable };
+        let coords = [ORIGIN];
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let mut exporting = Box::pin(export.read_page(&coords));
+            while driver.calls.load(Ordering::SeqCst) == 0 {
+                assert!(futures::poll!(exporting.as_mut()).is_pending());
+                tokio::task::yield_now().await;
+            }
+            let mut online = Box::pin(stack.read(online_target.at(ORIGIN)));
+            assert!(futures::poll!(online.as_mut()).is_pending());
+            assert_eq!(driver.calls.load(Ordering::SeqCst), 1);
+
+            cancel.cancel();
+            if cancel_export {
+                assert_eq!(exporting.await.unwrap_err().kind(), ErrorKind::Cancelled);
+                hold.notify_one();
+                assert_eq!(online.await.unwrap().tile().unwrap().data, &b"shared"[..]);
+                assert_eq!(
+                    stack
+                        .read(target.at(ORIGIN))
+                        .await
+                        .unwrap()
+                        .tile()
+                        .unwrap()
+                        .data,
+                    &b"shared"[..]
+                );
+                assert_eq!(driver.calls.load(Ordering::SeqCst), 1);
+            } else {
+                assert_eq!(online.await.unwrap_err().kind(), ErrorKind::Cancelled);
+                hold.notify_one();
+                let page = exporting.await.unwrap();
+                assert_eq!(page.tiles[0].tile().unwrap().data, &b"shared"[..]);
+                let mut retry = Box::pin(stack.read(target.at(ORIGIN)));
+                assert!(futures::poll!(retry.as_mut()).is_pending());
+                assert_eq!(driver.calls.load(Ordering::SeqCst), 2);
+                hold.notify_one();
+                assert_eq!(retry.await.unwrap().tile().unwrap().data, &b"shared"[..]);
+            }
+        })
+        .await
+        .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn an_old_export_flight_does_not_block_a_republished_revision() {
+    let hold = Arc::new(Notify::new());
+    let old = Arc::new(Driver {
+        hold: Some(hold.clone()),
+        ..Driver::new("sample", "v1", Bytes::from_static(b"same revision"))
+    });
+    let service = engine(old.clone());
+    let stack = TileStack::builder(service.clone()).build();
+    let target = ReadTarget::new("sample", "public");
+    let export = stack.begin_export(target).unwrap();
+    let coords = [ORIGIN];
+    let mut exporting = Box::pin(export.read_page(&coords));
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while old.calls.load(Ordering::SeqCst) == 0 {
+            assert!(futures::poll!(exporting.as_mut()).is_pending());
+            tokio::task::yield_now().await;
+        }
+        let new = Arc::new(Driver::new(
+            "sample",
+            "v1",
+            Bytes::from_static(b"same revision"),
+        ));
+        let mut update = service.catalog().update();
+        update.put(new.clone()).unwrap();
+        service.catalog().publish(update).unwrap();
+        assert_eq!(
+            stack
+                .read(target.at(ORIGIN))
+                .await
+                .unwrap()
+                .tile()
+                .unwrap()
+                .data,
+            &b"same revision"[..]
+        );
+        assert_eq!(new.calls.load(Ordering::SeqCst), 1);
+
+        hold.notify_one();
+        let page = exporting.await.unwrap();
+        assert_eq!(page.tiles[0].tile().unwrap().data, &b"same revision"[..]);
+        assert_eq!(old.calls.load(Ordering::SeqCst), 1);
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn export_pages_keep_their_generation_and_preserve_empty_positions() {
     let service = engine(Arc::new(Driver::new(
         "sample",

@@ -152,7 +152,12 @@ impl TileCache {
     pub(crate) async fn get_validated(
         &self,
         key: &TileCacheKey,
+        record_miss: bool,
     ) -> MaptileResult<Option<TileResponse>> {
+        // Keep one-off export misses out of the cache's frequency estimate.
+        if !record_miss && !self.cache.contains_key(key) {
+            return Ok(None);
+        }
         match self.cache.get(key).await {
             Some(cached) => cached.into_validated().await.map(Some),
             None => Ok(None),

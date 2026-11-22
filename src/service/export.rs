@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use super::{
-    ReadTarget, TileStack, bounded,
+    ReadMode, ReadTarget, TileStack, bounded,
     engine::{check_output, render_identity},
 };
 use crate::{
@@ -18,12 +18,16 @@ impl TileStack {
         target: ReadTarget<'_>,
         coords: &[TileCoord],
     ) -> MaptileResult<BatchPage> {
-        self.session(target, false)?.read_page(coords).await
+        self.session(target, ReadMode::Online)?
+            .read_page(coords)
+            .await
     }
 
     /// Pin the entry and every transitive source across pages. Mutable drivers must opt in.
+    /// Fallback pages reuse cached tiles and refresh their idle time on a hit.
+    /// A miss fills the cache only if an online request also waits for that tile.
     pub fn begin_export<'a>(&self, target: ReadTarget<'a>) -> MaptileResult<ExportSession<'a>> {
-        self.session(target, true)
+        self.session(target, ReadMode::Export)
     }
 
     /// Resume a caller-owned, stable coordinate sequence after a process or request boundary.
@@ -72,14 +76,14 @@ impl TileStack {
     fn session<'a>(
         &self,
         target: ReadTarget<'a>,
-        consistent: bool,
+        mode: ReadMode,
     ) -> MaptileResult<ExportSession<'a>> {
         validate_tile_request(&[], target.query)?;
         let snapshot = self.engine.catalog().snapshot();
         let entry = snapshot.entry(target.source, self.engine.limits())?;
         let descriptor = entry.descriptor();
         descriptor.validate_query(target.query)?;
-        if consistent && !descriptor.capabilities.consistent_export {
+        if matches!(mode, ReadMode::Export) && !descriptor.capabilities.consistent_export {
             return Err(MaptileError::Unsupported(format!(
                 "{} cannot pin its data for export",
                 descriptor.id
@@ -87,6 +91,7 @@ impl TileStack {
         }
         Ok(ExportSession {
             stack: self.clone(),
+            mode,
             target,
             snapshot,
             entry,
@@ -114,6 +119,7 @@ impl ExportCursor {
 
 pub struct ExportSession<'a> {
     stack: TileStack,
+    mode: ReadMode,
     target: ReadTarget<'a>,
     snapshot: Arc<CatalogSnapshot>,
     entry: Arc<CatalogEntry>,
@@ -163,7 +169,12 @@ impl ExportSession<'_> {
         for &coord in coords {
             let outcome = self
                 .stack
-                .dispatch(&self.snapshot, &self.entry, self.target.at(coord))
+                .dispatch(
+                    &self.snapshot,
+                    &self.entry,
+                    self.target.at(coord),
+                    self.mode,
+                )
                 .await?;
             bytes += outcome.tile().map_or(0, |t| t.data.len());
             tiles.push(outcome);

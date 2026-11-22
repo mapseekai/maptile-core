@@ -8,8 +8,10 @@ use futures_util::{
     future::{BoxFuture, Shared},
 };
 
-use super::TileCacheKey;
-use crate::{core::response::TileOutcome, error::MaptileResult};
+use tokio::sync::OnceCell;
+
+use super::{TileCache, TileCacheKey};
+use crate::{core::response::TileOutcome, error::MaptileResult, sources::TileResponse};
 
 #[derive(Clone, Eq, Hash, PartialEq)]
 struct FlightKey {
@@ -22,7 +24,14 @@ pub(crate) struct Flights(Arc<FlightTable>);
 struct Flight {
     table: Weak<FlightTable>,
     key: FlightKey,
-    result: Shared<BoxFuture<'static, MaptileResult<TileOutcome>>>,
+    result: Shared<BoxFuture<'static, MaptileResult<FlightResult>>>,
+    cached: OnceCell<()>,
+}
+
+#[derive(Clone)]
+enum FlightResult {
+    Cached(TileResponse),
+    Loaded(TileOutcome),
 }
 
 impl Drop for Flight {
@@ -42,18 +51,47 @@ impl Drop for Flight {
 impl Flights {
     pub(crate) async fn get_or_fill(
         &self,
+        cache: &TileCache,
         tile: TileCacheKey,
         generation: u64,
-        fill: impl FnOnce() -> BoxFuture<'static, MaptileResult<TileOutcome>>,
+        populate_cache: bool,
+        load: impl FnOnce() -> BoxFuture<'static, MaptileResult<TileOutcome>>,
     ) -> MaptileResult<TileOutcome> {
-        let flight = self.join(FlightKey { tile, generation }, fill);
-        flight.result.clone().await
+        let key = FlightKey {
+            tile: tile.clone(),
+            generation,
+        };
+        let flight = self.join(key, || {
+            let cache = cache.clone();
+            let tile = tile.clone();
+            let load = load();
+            async move {
+                if let Some(hit) = cache.get_validated(&tile, populate_cache).await? {
+                    return Ok(FlightResult::Cached(hit));
+                }
+                load.await.map(FlightResult::Loaded)
+            }
+            .boxed()
+        });
+        match flight.result.clone().await? {
+            FlightResult::Cached(hit) => Ok(TileOutcome::Present(hit)),
+            FlightResult::Loaded(outcome) => {
+                if populate_cache && let TileOutcome::Present(loaded) = &outcome {
+                    // Any online waiter can admit the result, including when export started the read.
+                    flight
+                        .cached
+                        .get_or_init(|| cache.insert_validated(tile, loaded.clone()))
+                        .await;
+                }
+                Ok(outcome)
+            }
+        }
     }
 
     fn join(
         &self,
         key: FlightKey,
-        fill: impl FnOnce() -> BoxFuture<'static, MaptileResult<TileOutcome>>,
+        fill: impl FnOnce() -> BoxFuture<'static, MaptileResult<FlightResult>>,
     ) -> Arc<Flight> {
         let mut table = self.0.lock().unwrap();
         if let Some(active) = table.get(&key).and_then(Weak::upgrade) {
@@ -63,6 +101,7 @@ impl Flights {
             table: Arc::downgrade(&self.0),
             key: key.clone(),
             result: fill().shared(),
+            cached: OnceCell::new(),
         });
         table.insert(key, Arc::downgrade(&flight));
         flight

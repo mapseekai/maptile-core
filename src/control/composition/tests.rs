@@ -19,12 +19,15 @@ use crate::{
 
 use geozero::mvt::Message;
 use tilejson::{TileJSON, VectorLayer};
+use tokio::sync::Barrier;
 
 #[derive(Clone)]
 struct Fake {
     id: String,
     tj: TileJSON,
     data: Result<Bytes, MaptileError>,
+    encoding: TileEncoding,
+    read_barrier: Option<Arc<Barrier>>,
 }
 #[async_trait::async_trait]
 impl TileDriver for Fake {
@@ -35,7 +38,7 @@ impl TileDriver for Fake {
             tilejson: self.tj.clone(),
             info: TileInfo {
                 format: TileFormat::Mvt,
-                encoding: TileEncoding::Uncompressed,
+                encoding: self.encoding,
             },
             revision: ContentVersion::from_input(self.id.as_bytes()),
             cache_zoom: CacheZoomRange::default(),
@@ -50,6 +53,9 @@ impl TileDriver for Fake {
         _: TileCoord,
         _: Option<&TileQuery<'_>>,
     ) -> MaptileResult<Option<TileResponse>> {
+        if let Some(barrier) = &self.read_barrier {
+            barrier.wait().await;
+        }
         match &self.data {
             Ok(data) => Ok(Some(TileResponse {
                 data: data.clone(),
@@ -80,6 +86,15 @@ fn tile(layers: &[(&str, u32)]) -> Bytes {
     Bytes::from(bytes)
 }
 fn source(id: &str, declared: &[&str], data: Result<Bytes, MaptileError>) -> Arc<SourceSlot> {
+    fixture_source(id, declared, data, TileEncoding::Uncompressed, None)
+}
+fn fixture_source(
+    id: &str,
+    declared: &[&str],
+    data: Result<Bytes, MaptileError>,
+    encoding: TileEncoding,
+    read_barrier: Option<Arc<Barrier>>,
+) -> Arc<SourceSlot> {
     let mut tj = tilejson::tilejson! { tiles: vec![] };
     tj.vector_layers = Some(
         declared
@@ -91,6 +106,8 @@ fn source(id: &str, declared: &[&str], data: Result<Bytes, MaptileError>) -> Arc
         id: id.into(),
         tj,
         data,
+        encoding,
+        read_barrier,
     };
     Arc::new(SourceSlot::new(Arc::new(fake)).unwrap())
 }
@@ -272,22 +289,30 @@ async fn conflicts_are_selected_from_actual_per_tile_layers() {
 #[tokio::test]
 async fn rejects_undeclared_actual_layer_even_when_error_policy_declares_no_conflict() {
     let a = source("a", &["roads"], Ok(tile(&[("roads", 1)])));
-    let b = source("b", &["water"], Ok(tile(&[("roads", 2)])));
-    let graph = nodes(
-        vec![a, b],
-        &[decl(
-            "x",
-            &["a", "b"],
-            DuplicateLayer::Error,
-            MemberFailurePolicy::FailFast,
-            false,
-        )],
-    )
-    .unwrap();
-    assert!(matches!(
-        read(&graph["x"]).await,
-        Err(MaptileError::InvalidMetadata(_))
-    ));
+    for encoding in [TileEncoding::Uncompressed, TileEncoding::Gzip] {
+        let b = fixture_source(
+            "b",
+            &["water"],
+            crate::transport::encode_as(&tile(&[("roads", 2)]), encoding),
+            encoding,
+            None,
+        );
+        let graph = nodes(
+            vec![a.clone(), b],
+            &[decl(
+                "x",
+                &["a", "b"],
+                DuplicateLayer::Error,
+                MemberFailurePolicy::FailFast,
+                false,
+            )],
+        )
+        .unwrap();
+        assert!(matches!(
+            read(&graph["x"]).await,
+            Err(MaptileError::InvalidMetadata(_))
+        ));
+    }
     let duplicate = source(
         "duplicate",
         &["roads"],
@@ -443,6 +468,115 @@ async fn all_skipped_is_an_error_and_invalid_input_is_never_skipped() {
         Err(MaptileError::InvalidRequest(_))
     ));
 }
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compressed_members_respect_work_and_decoded_limits() {
+    use std::io::Write;
+
+    fn roads(name: &str, offset: u32) -> Bytes {
+        let features = (0..3000)
+            .map(|index| {
+                let x = (131 * index + offset) % 3500;
+                let y = (253 * index + offset) % 3500;
+                proto::Feature {
+                    id: Some(u64::from(index) + 1),
+                    tags: vec![0, index % 2],
+                    r#type: Some(proto::GeomType::Linestring as i32),
+                    geometry: vec![9, 2 * x, 2 * y, 26, 6, 8, 14, 10, 4, 6],
+                }
+            })
+            .collect();
+        mvt::encode(&proto::Tile {
+            layers: vec![proto::Layer {
+                version: 2,
+                name: name.into(),
+                features,
+                keys: vec!["class".into()],
+                values: ["primary", "local"]
+                    .map(|class| proto::Value {
+                        string_value: Some(class.into()),
+                        ..Default::default()
+                    })
+                    .into(),
+                extent: Some(4096),
+            }],
+        })
+    }
+
+    let raw = [roads("streets", 0), roads("paths", 721)];
+    let compressed = raw.each_ref().map(|raw| {
+        let mut encoder = flate2::GzBuilder::new()
+            .extra(vec![0; 65_000])
+            .write(Vec::new(), flate2::Compression::default());
+        encoder.write_all(raw).unwrap();
+        Bytes::from(encoder.finish().unwrap())
+    });
+    let decoded_bytes = raw[0].len() + raw[1].len();
+    let encoded_bytes = compressed[0].len() + compressed[1].len();
+    let work_bytes = 2 * decoded_bytes;
+    assert!(encoded_bytes > decoded_bytes);
+    assert!(encoded_bytes + raw[0].len().max(raw[1].len()) < work_bytes);
+
+    let barrier = Arc::new(Barrier::new(2));
+    let graph = nodes(
+        vec![
+            fixture_source(
+                "a",
+                &["streets"],
+                Ok(compressed[0].clone()),
+                TileEncoding::Gzip,
+                Some(barrier.clone()),
+            ),
+            fixture_source(
+                "b",
+                &["paths"],
+                Ok(compressed[1].clone()),
+                TileEncoding::Gzip,
+                Some(barrier),
+            ),
+        ],
+        &[decl(
+            "x",
+            &["a", "b"],
+            DuplicateLayer::Error,
+            MemberFailurePolicy::FailFast,
+            false,
+        )],
+    )
+    .unwrap();
+    let limits = CompositeLimits {
+        max_work_bytes: work_bytes,
+        max_decoded_bytes: decoded_bytes,
+        ..CompositeLimits::default()
+    };
+    let expected = [raw[0].as_ref(), raw[1].as_ref()].concat();
+    let mut rejected = 0;
+    for x in 0..32 {
+        let coord = TileCoord { z: 6, x, y: 0 };
+        match graph["x"].read(coord, None, limits).await {
+            Ok(outcome) => assert_eq!(data(outcome), expected),
+            Err(MaptileError::PayloadTooLarge { .. }) => rejected += 1,
+            Err(error) => panic!("unexpected error for {coord:?}: {error}"),
+        }
+    }
+    assert_eq!(rejected, 0, "valid tiles rejected at the exact work limit");
+
+    for limits in [
+        CompositeLimits {
+            max_work_bytes: work_bytes - 1,
+            ..limits
+        },
+        CompositeLimits {
+            max_decoded_bytes: decoded_bytes - 1,
+            ..limits
+        },
+    ] {
+        assert!(matches!(
+            graph["x"].read(coord(), None, limits).await,
+            Err(MaptileError::PayloadTooLarge { .. })
+        ));
+    }
+}
+
 #[tokio::test]
 async fn cumulative_decoded_budget_rejects_two_large_valid_members() {
     fn large(name: &str) -> Bytes {
