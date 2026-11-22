@@ -148,10 +148,14 @@ impl TileSource for CompositeSource {
         xyz: TileCoord,
         query: Option<&TileQuery<'_>>,
     ) -> MaptileResult<TileResponse> {
-        self.get_tile_with(xyz, query, |source, query| async move {
+        let read = self.get_tile_with(xyz, query, |source, query| async move {
             source.get_tile(xyz, query).await
-        })
-        .await
+        });
+        if super::lazy_composite::needs_raster_style_members(self, query) {
+            super::validate_source_request(self, &[xyz], query)?;
+            return Box::pin(super::lazy_composite::with_raster_style_members(self, read)).await;
+        }
+        read.await
     }
 
     async fn read_tile_batch(
@@ -160,7 +164,7 @@ impl TileSource for CompositeSource {
         query: Option<&TileQuery<'_>>,
     ) -> MaptileResult<Vec<TileResponse>> {
         super::validate_source_request(self, coords, query)?;
-        read_tile_batch_with(coords, self.tile_info(), |coord| async move {
+        let read = read_tile_batch_with(coords, self.tile_info(), |coord| async move {
             let mut results = Vec::new();
             let mut remaining = MAX_COMPOSITE_BYTES;
             for child in &self.children {
@@ -174,8 +178,11 @@ impl TileSource for CompositeSource {
                 retain_tile(child, result, &mut results, &mut remaining)?;
             }
             self.merge_tiles(coord, results).await
-        })
-        .await
+        });
+        if super::lazy_composite::needs_raster_style_members(self, query) {
+            return Box::pin(super::lazy_composite::with_raster_style_members(self, read)).await;
+        }
+        read.await
     }
 
     fn tile_etag(&self, response: &TileResponse) -> String {
@@ -192,6 +199,18 @@ impl TileSource for CompositeSource {
 
     fn supports_filter(&self) -> bool {
         self.children.iter().all(|c| c.source.supports_filter())
+    }
+
+    fn supports_raster_style(&self) -> bool {
+        self.children
+            .iter()
+            .all(|c| c.source.supports_raster_style())
+    }
+
+    fn supports_catalog_raster_style(&self) -> bool {
+        self.children
+            .iter()
+            .all(|c| c.source.supports_catalog_raster_style())
     }
 }
 

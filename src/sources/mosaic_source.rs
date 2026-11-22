@@ -528,6 +528,10 @@ impl TileSource for MosaicSource {
         self.immutable
     }
 
+    fn supports_raster_style(&self) -> bool {
+        true
+    }
+
     #[tracing::instrument(name = "mosaic.get_tile", skip_all, fields(z = %xyz.z, x = %xyz.x, y = %xyz.y))]
     async fn get_tile(
         &self,

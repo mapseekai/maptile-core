@@ -8,8 +8,10 @@ use super::{
 use crate::cache::ContentVersion;
 use crate::error::{MaptileError, MaptileResult};
 use crate::sources::archive_inspection::ArchiveSourceType;
-use crate::sources::strong_http_etag as strong_etag;
-use crate::sources::{SourceKind, TileCoord, TileInfo, TileQuery, TileResponse, TileSource};
+use crate::sources::{
+    SourceKind, TileCoord, TileInfo, TileQuery, TileResponse, TileSource,
+    has_identity_content_encoding, range_http_client_builder, strong_http_etag as strong_etag,
+};
 use async_trait::async_trait;
 use bytes::BytesMut;
 use pmtiles::reqwest::{self, StatusCode, header};
@@ -37,8 +39,7 @@ impl AsyncBackend for HttpBackend {
         let mut request = self
             .client
             .get(&self.url)
-            .header(header::RANGE, format!("bytes={offset}-{end}"))
-            .header(header::ACCEPT_ENCODING, "identity");
+            .header(header::RANGE, format!("bytes={offset}-{end}"));
         if let Some((etag, _, _)) = self.identity.get() {
             request = request.header(header::IF_MATCH, etag);
         }
@@ -55,11 +56,7 @@ impl AsyncBackend for HttpBackend {
         if response.status() != StatusCode::PARTIAL_CONTENT {
             return Err(PmtError::RangeRequestsUnsupported);
         }
-        if response
-            .headers()
-            .get(header::CONTENT_ENCODING)
-            .is_some_and(|value| value != "identity")
-        {
+        if !has_identity_content_encoding(response.headers()) {
             return Err(PmtError::RangeRequestsUnsupported);
         }
         let (expected, total) = content_range(response.headers(), offset, end)?;
@@ -164,7 +161,7 @@ impl std::fmt::Debug for HttpPmtilesSource {
 
 impl HttpPmtilesSource {
     pub async fn open(cfg: PmtilesConfig) -> MaptileResult<Self> {
-        let client = reqwest::Client::builder()
+        let client = range_http_client_builder()
             .user_agent(concat!("maptile-core/", env!("CARGO_PKG_VERSION")))
             .timeout(IO_TIMEOUT)
             .build()
@@ -301,7 +298,7 @@ mod tests {
             }
         });
         let backend = HttpBackend {
-            client: reqwest::Client::new(),
+            client: range_http_client_builder().build().unwrap(),
             url: format!("http://{addr}/tiles"),
             identity: OnceLock::new(),
         };

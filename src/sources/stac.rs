@@ -307,6 +307,10 @@ impl TileSource for StacSource {
         Box::new(self.clone())
     }
 
+    fn supports_raster_style(&self) -> bool {
+        true
+    }
+
     async fn get_tile(
         &self,
         xyz: TileCoord,

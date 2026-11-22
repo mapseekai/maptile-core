@@ -9,10 +9,12 @@ use moka::future::Cache;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::OnceCell;
 
 use super::{ContentVersion, StyleHash};
 use crate::error::{MaptileError, MaptileResult};
 use crate::sources::TileResponse;
+use crate::transport::{self, MAX_DECODED_TILE_BYTES};
 
 /// Cache key: uniquely identifies a tile across all sources.
 ///
@@ -53,7 +55,37 @@ impl TileCacheKey {
 /// Byte-weighted, TTL-evicting tile cache.
 #[derive(Clone)]
 pub struct TileCache {
-    cache: Cache<TileCacheKey, TileResponse>,
+    cache: Cache<TileCacheKey, CachedTile>,
+}
+
+#[derive(Clone)]
+struct CachedTile {
+    tile: TileResponse,
+    compression_check: Option<Arc<OnceCell<()>>>,
+}
+
+impl CachedTile {
+    fn new(mut tile: TileResponse, decoded_size_validated: bool) -> Self {
+        // A small slice may retain an entire archive or oversized Vec.
+        tile.data = bytes::Bytes::copy_from_slice(&tile.data);
+        let compression_check =
+            (!decoded_size_validated && tile.info.encoding.is_encoded()).then(Arc::default);
+        Self {
+            tile,
+            compression_check,
+        }
+    }
+
+    async fn into_validated(self) -> MaptileResult<TileResponse> {
+        if let Some(check) = self.compression_check {
+            check
+                .get_or_try_init(|| transport::validate_tile_payload(&self.tile))
+                .await?;
+        } else {
+            transport::check_decoded_size(self.tile.data.len(), MAX_DECODED_TILE_BYTES)?;
+        }
+        Ok(self.tile)
+    }
 }
 
 impl TileCache {
@@ -82,14 +114,20 @@ impl TileCache {
         let mut builder = Cache::builder()
             .name("tile_cache")
             .max_capacity(max_bytes)
-            .weigher(|k: &TileCacheKey, v: &TileResponse| -> u32 {
+            .weigher(|k: &TileCacheKey, v: &CachedTile| -> u32 {
+                // The Arc allocation also contains its strong and weak counters.
+                let compression_check = v.compression_check.as_ref().map_or(0, |_| {
+                    std::mem::size_of::<([std::sync::atomic::AtomicUsize; 2], OnceCell<()>)>()
+                });
                 // Account for key/value storage, source id, and cache bookkeeping
                 // even when a tile has an empty payload.
-                v.data
+                v.tile
+                    .data
                     .len()
                     .saturating_add(k.source_id.len())
                     .saturating_add(std::mem::size_of::<TileCacheKey>())
-                    .saturating_add(std::mem::size_of::<TileResponse>())
+                    .saturating_add(std::mem::size_of::<CachedTile>())
+                    .saturating_add(compression_check)
                     .saturating_add(128)
                     .try_into()
                     .unwrap_or(u32::MAX)
@@ -108,13 +146,26 @@ impl TileCache {
 
     /// Look up a tile. Returns `None` on miss or after TTL expiry.
     pub async fn get(&self, key: &TileCacheKey) -> Option<TileResponse> {
-        self.cache.get(key).await
+        self.cache.get(key).await.map(|value| value.tile)
+    }
+
+    pub(crate) async fn get_validated(
+        &self,
+        key: &TileCacheKey,
+    ) -> MaptileResult<Option<TileResponse>> {
+        match self.cache.get(key).await {
+            Some(cached) => cached.into_validated().await.map(Some),
+            None => Ok(None),
+        }
     }
 
     /// Insert a tile. Eviction happens asynchronously in the background.
-    pub async fn insert(&self, key: TileCacheKey, mut value: TileResponse) {
-        value.data = bytes::Bytes::copy_from_slice(&value.data);
-        self.cache.insert(key, value).await;
+    pub async fn insert(&self, key: TileCacheKey, value: TileResponse) {
+        self.cache.insert(key, CachedTile::new(value, false)).await;
+    }
+
+    pub(crate) async fn insert_validated(&self, key: TileCacheKey, value: TileResponse) {
+        self.cache.insert(key, CachedTile::new(value, true)).await;
     }
 
     /// Cache-coordinated read-or-compute. Multiple concurrent waiters
@@ -124,16 +175,6 @@ impl TileCache {
     /// On compute error, all waiters receive `Arc<E>` cloning the same
     /// error reference. Caller is responsible for converting `Arc<E>`
     /// to its own error type if needed.
-    #[tracing::instrument(
-        level = "debug",
-        skip_all,
-        fields(
-            source.id = %key.source_id,
-            tile.z = key.z,
-            tile.x = key.x,
-            tile.y = key.y,
-        )
-    )]
     pub async fn get_or_insert<F, Fut, E>(
         &self,
         key: TileCacheKey,
@@ -144,20 +185,49 @@ impl TileCache {
         Fut: std::future::Future<Output = Result<TileResponse, E>> + Send,
         E: Send + Sync + 'static,
     {
+        self.get_or_insert_entry(key, async move {
+            Ok::<_, E>(CachedTile::new(compute().await?, false))
+        })
+        .await
+        .map(|entry| entry.tile)
+    }
+
+    pub(crate) async fn get_or_insert_validated(
+        &self,
+        key: TileCacheKey,
+        compute: impl Future<Output = MaptileResult<TileResponse>>,
+    ) -> MaptileResult<TileResponse> {
+        let entry = self
+            .get_or_insert_entry(key, async move {
+                let tile = compute.await?;
+                transport::validate_tile_payload(&tile).await?;
+                Ok::<_, MaptileError>(CachedTile::new(tile, true))
+            })
+            .await
+            .map_err(|error| (*error).clone())?;
+        entry.into_validated().await
+    }
+
+    #[tracing::instrument(
+        name = "get_or_insert",
+        level = "debug",
+        skip_all,
+        fields(
+            source.id = %key.source_id,
+            tile.z = key.z,
+            tile.x = key.x,
+            tile.y = key.y,
+        )
+    )]
+    async fn get_or_insert_entry<E: Send + Sync + 'static>(
+        &self,
+        key: TileCacheKey,
+        compute: impl Future<Output = Result<CachedTile, E>>,
+    ) -> Result<CachedTile, Arc<E>> {
         #[cfg(feature = "metrics")]
         let zoom = key.z;
 
-        let entry = self
-            .cache
-            .entry(key)
-            .or_try_insert_with(async move {
-                let mut tile = compute().await?;
-                // A small slice may retain an entire archive or oversized Vec.
-                // Cache allocations must match the visible payload we weigh.
-                tile.data = bytes::Bytes::copy_from_slice(&tile.data);
-                Ok::<_, E>(tile)
-            })
-            .await?;
+        let entry = self.cache.entry(key).or_try_insert_with(compute).await?;
 
         #[cfg(feature = "metrics")]
         {

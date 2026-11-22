@@ -8,6 +8,8 @@
 //! [`AsyncCogSourceConfig`] accepts a shared decoded-block cache and a content
 //! identity supplied by the application. Each open pins an object snapshot
 //! and assigns a distinct rendered-tile cache revision.
+//! Direct point and coverage reads share the render admission budget and keep
+//! their request permits until the underlying reader work finishes.
 //! A TIFF or resource error from a raw point or coverage read can leave native
 //! work without a join handle. The catalog reports unconfirmed drain for that generation.
 
@@ -21,7 +23,7 @@ use bytes::Bytes;
 use object_store::{ObjectStore, path::Path as OsPath, prefix::PrefixStore};
 use tilejson::{TileJSON, tilejson};
 
-use super::agtiff_snapshot::RemoteSnapshot;
+use super::{agtiff_request::ReaderJobs, agtiff_snapshot::RemoteSnapshot};
 use crate::cache::ContentVersion;
 use crate::error::{MaptileError, MaptileResult};
 use crate::raster::agtiff_style::to_tile_style;
@@ -94,6 +96,7 @@ pub struct AsyncCogSource {
     id: String,
     tj: TileJSON,
     reader: Arc<CogReader>,
+    jobs: Arc<ReaderJobs>,
     tiler: Arc<Tiler>,
     cache_zoom: crate::cache::CacheZoomRange,
     content_version: ContentVersion,
@@ -140,8 +143,8 @@ impl LocalSnapshot {
 
 impl AsyncCogSource {
     #[cfg(test)]
-    pub(super) fn cpu_limiter(&self) -> async_geotiff::CpuLimiter {
-        self.reader.cpu_limiter()
+    pub(super) fn reader(&self) -> &Arc<CogReader> {
+        &self.reader
     }
 
     pub async fn open(cfg: AsyncCogSourceConfig) -> MaptileResult<Self> {
@@ -257,6 +260,7 @@ impl AsyncCogSource {
         Ok(Self {
             id: cfg.id,
             tj,
+            jobs: ReaderJobs::new(reader.cpu_limiter()),
             reader,
             tiler,
             cache_zoom: cfg.cache_zoom.unwrap_or_default(),
@@ -273,6 +277,14 @@ impl AsyncCogSource {
         let result = read.await;
         self.snapshot.check(&self.id).await?;
         result
+    }
+
+    async fn read_raw<T: Send + 'static>(
+        &self,
+        work: impl Future<Output = MaptileResult<T>> + Send + 'static,
+    ) -> MaptileResult<T> {
+        self.read_snapshot(super::agtiff_request::reader_call(self.jobs.clone(), work))
+            .await
     }
 }
 
@@ -309,6 +321,10 @@ impl TileSource for AsyncCogSource {
         self.content_version
     }
 
+    fn supports_raster_style(&self) -> bool {
+        true
+    }
+
     #[tracing::instrument(name = "cog.get_tile", skip_all, fields(z = %xyz.z, x = %xyz.x, y = %xyz.y))]
     async fn get_tile(
         &self,
@@ -322,6 +338,7 @@ impl TileSource for AsyncCogSource {
         // Validate the renderer's supported capabilities before reading pixels.
         let tile_style = to_tile_style(style)?;
         let out_format = out_tile_format(style.format);
+        self.jobs.admit()?;
 
         // Map an empty tiler result to TileNotFound so the application can
         // represent a coordinate outside the dataset or projection domain.
@@ -366,9 +383,9 @@ impl TileSource for AsyncCogSource {
     ) -> MaptileResult<super::raster_coverage::CoverageResponse> {
         let reader = self.reader.clone();
         let query = query.cloned();
-        self.read_snapshot(super::agtiff_request::reader_call(async move {
-            super::raster_coverage::read_coverage(reader, query.as_ref()).await
-        }))
+        self.read_raw(
+            async move { super::raster_coverage::read_coverage(reader, query.as_ref()).await },
+        )
         .await
     }
 
@@ -396,18 +413,18 @@ impl TileSource for AsyncCogSource {
         }
 
         let coord_crs = parse_coord_crs(&query.coord_crs)?;
-        let reader = self.reader.clone();
         let (x, y) = (query.x, query.y);
-        let crs = coord_crs.clone();
         let bidx = query.bidx.clone();
+        let reader = self.reader.clone();
+        let point_crs = coord_crs.clone();
         let point = self
-            .read_snapshot(super::agtiff_request::reader_call(async move {
+            .read_raw(async move {
                 reader
-                    .point(x, y, &crs, &bidx)
+                    .point(x, y, &point_crs, &bidx)
                     .await
                     .map_err(super::agtiff_request::mark_reader_error)
                     .map_err(crate::raster::agtiff_style::render_error)
-            }))
+            })
             .await?;
 
         match point {

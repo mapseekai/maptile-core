@@ -17,6 +17,7 @@ use tokio::sync::Semaphore;
 pub use crate::sources::{TileEncoding, TileFormat, TileInfo};
 
 use crate::error::{MaptileError, MaptileResult};
+use crate::sources::TileResponse;
 
 /// Maximum decoded tile payload retained by the transport layer.
 pub const MAX_DECODED_TILE_BYTES: usize = 16 * 1024 * 1024;
@@ -93,7 +94,7 @@ pub fn decode_with_limit(
     }
 }
 
-fn check_decoded_size(size: usize, max_bytes: usize) -> MaptileResult<()> {
+pub(crate) fn check_decoded_size(size: usize, max_bytes: usize) -> MaptileResult<()> {
     if size > max_bytes {
         return Err(MaptileError::PayloadTooLarge { limit: max_bytes });
     }
@@ -176,6 +177,14 @@ pub async fn decode_async(data: Bytes, encoding: TileEncoding) -> MaptileResult<
         return Ok(data);
     }
     run_blocking(move || decode(&data, encoding)).await
+}
+
+pub(crate) async fn validate_tile_payload(tile: &TileResponse) -> MaptileResult<()> {
+    check_decoded_size(tile.data.len(), MAX_DECODED_TILE_BYTES)?;
+    if tile.info.encoding.is_encoded() {
+        decode_async(tile.data.clone(), tile.info.encoding).await?;
+    }
+    Ok(())
 }
 
 /// Encode on a bounded blocking worker. Uncompressed output shares its input.

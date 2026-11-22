@@ -1,14 +1,17 @@
 use bytes::Bytes;
 use geozero::mvt::{Message, Tile, tile::Layer};
 use maptile_core::{
-    cache::{ContentVersion, TileCache},
+    cache::{ContentVersion, StyleHash, TileCache},
     control::{
         CatalogService, CompositeDeclaration, DiscoveredDataset, DuplicateLayer, Inventory,
         MemberFailurePolicy, SourceDescriptor, TileDriver,
     },
     error::{MaptileError, MaptileResult},
-    service::{ReadTarget, TileOutcome, TileStack},
-    sources::{TileCoord, TileEncoding, TileFormat, TileInfo, TileQuery, TileResponse},
+    service::{ReadTarget, TileLayer, TileOutcome, TileService, TileStack, ValidatedTileRequest},
+    sources::{
+        MAX_TILE_BATCH_COORDS, TileCoord, TileEncoding, TileFormat, TileInfo, TileQuery,
+        TileResponse,
+    },
 };
 use std::sync::{
     Arc,
@@ -70,6 +73,7 @@ fn driver(
     };
     let mut descriptor = SourceDescriptor::new(id, info, ContentVersion::from_input(id.as_bytes()));
     descriptor.capabilities.strict_mvt = true;
+    descriptor.capabilities.consistent_export = true;
     descriptor.tilejson.vector_layers = Some(
         names
             .iter()
@@ -154,6 +158,21 @@ async fn public_stack_composite_uses_actual_layers_and_keeps_partial_out_of_cach
         .unwrap();
     service.catalog().publish(update).unwrap();
     let stack = TileStack::builder(service.clone()).build();
+    let query = TileQuery {
+        style_hash: Some(StyleHash::from_bytes([3; 32])),
+        ..Default::default()
+    };
+    let styled = ReadTarget {
+        query: Some(&query),
+        ..ReadTarget::new("merged", "scope")
+    };
+    assert!(matches!(
+        stack
+            .read_batch(styled, &[TileCoord { z: 1, x: 0, y: 0 }])
+            .await,
+        Err(MaptileError::Unsupported(_))
+    ));
+    assert_eq!(reads_a.load(Ordering::SeqCst), 0);
     for (x, expected) in [(0, 11), (1, 22)] {
         let TileOutcome::Present(tile) = stack_read(&stack, "merged", x).await.unwrap() else {
             panic!("expected present")
@@ -199,6 +218,83 @@ async fn public_stack_composite_uses_actual_layers_and_keeps_partial_out_of_cach
     );
     assert!(service.catalog().snapshot().describe("a,c").is_none());
     assert_eq!(service.catalog().snapshot().generation(), generation + 1);
+}
+
+#[tokio::test]
+async fn temporary_composite_aliases_share_cache_fills_and_export_cursors() {
+    struct CheckIdentity;
+    #[async_trait::async_trait]
+    impl TileLayer for CheckIdentity {
+        async fn read(
+            &self,
+            request: &ValidatedTileRequest<'_>,
+            next: TileService<'_>,
+        ) -> MaptileResult<TileOutcome> {
+            let id = request.descriptor().id.as_ref();
+            assert!(matches!(id, "a,b" | "b,a"));
+            assert_eq!(request.request().target.source, id);
+            next.read().await
+        }
+    }
+
+    let service = Arc::new(CatalogService::new(TileCache::new(1, None, None).unwrap()));
+    let mut update = service.catalog().update();
+    let a = Arc::new(AtomicUsize::new(0));
+    let b = Arc::new(AtomicUsize::new(0));
+    for (id, name, reads) in [("a", "roads", a.clone()), ("b", "water", b.clone())] {
+        update
+            .put(driver(
+                id,
+                &[name],
+                [Some(tile(name, 4096)), None],
+                None,
+                reads,
+            ))
+            .unwrap();
+    }
+    service.catalog().publish(update).unwrap();
+    let stack = TileStack::builder(service).layer(CheckIdentity).build();
+    let xyz = TileCoord { z: 1, x: 0, y: 0 };
+    let canonical = ReadTarget::new("a,b", "scope");
+    let spaced = ReadTarget::new("  a ,\tb  ", "scope");
+    let (first, alias) = tokio::join!(stack.read(canonical.at(xyz)), stack.read(spaced.at(xyz)));
+    assert_eq!(
+        first.unwrap().tile().unwrap().data,
+        alias.unwrap().tile().unwrap().data
+    );
+
+    let coords = vec![xyz; MAX_TILE_BATCH_COORDS + 1];
+    let (first_page, cursor) = stack.read_export_page(spaced, &coords, None).await.unwrap();
+    assert_eq!(first_page.consumed, MAX_TILE_BATCH_COORDS);
+    let cursor = cursor.unwrap();
+    let (second_page, end) = stack
+        .read_export_page(canonical, &coords, Some(&cursor))
+        .await
+        .unwrap();
+    assert_eq!(second_page.consumed, 1);
+    assert!(end.is_none());
+    assert_eq!(a.load(Ordering::SeqCst), 1);
+    assert_eq!(b.load(Ordering::SeqCst), 1);
+
+    let reverse = ReadTarget::new("b , a", "scope");
+    assert!(matches!(
+        stack
+            .read_export_page(reverse, &coords, Some(&cursor))
+            .await,
+        Err(MaptileError::VersionChanged(_))
+    ));
+    let reversed = stack.read(reverse.at(xyz)).await.unwrap();
+    let decoded = Tile::decode(reversed.tile().unwrap().data.clone()).unwrap();
+    assert_eq!(
+        decoded
+            .layers
+            .iter()
+            .map(|layer| layer.name.as_str())
+            .collect::<Vec<_>>(),
+        ["water", "roads"]
+    );
+    assert_eq!(a.load(Ordering::SeqCst), 2);
+    assert_eq!(b.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]

@@ -5,7 +5,7 @@
 use maptile_core::sources::pmtiles::{HttpPmtilesSource, PmtilesConfig};
 use maptile_core::sources::{TileCoord, TileFormat, TileSource};
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -21,6 +21,7 @@ const FIXTURE_PATH: &str = "tests/fixtures/sample.pmtiles";
 async fn start_range_server(
     data: Arc<Vec<u8>>,
     unavailable: Arc<AtomicBool>,
+    content_encoding: Arc<Mutex<&'static str>>,
 ) -> (u16, tokio::sync::oneshot::Sender<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -33,7 +34,10 @@ async fn start_range_server(
                 res = listener.accept() => {
                     let (stream, _) = res.unwrap();
                     let data = data.clone();
-                    tokio::spawn(handle_connection(stream, data, unavailable.load(Ordering::Acquire)));
+                    let content_encoding = *content_encoding.lock().unwrap();
+                    tokio::spawn(handle_connection(
+                        stream, data, unavailable.load(Ordering::Acquire), content_encoding,
+                    ));
                 }
             }
         }
@@ -42,12 +46,18 @@ async fn start_range_server(
     (port, shutdown_tx)
 }
 
-async fn handle_connection(stream: tokio::net::TcpStream, data: Arc<Vec<u8>>, unavailable: bool) {
+async fn handle_connection(
+    stream: tokio::net::TcpStream,
+    data: Arc<Vec<u8>>,
+    unavailable: bool,
+    content_encoding: &str,
+) {
     let (reader, mut writer) = stream.into_split();
     let mut buf_reader = BufReader::new(reader);
 
     // Read request headers until blank line.
     let mut range_header: Option<String> = None;
+    let mut accept_encoding = None;
     loop {
         let mut line = String::new();
         if buf_reader.read_line(&mut line).await.unwrap_or(0) == 0 {
@@ -61,7 +71,11 @@ async fn handle_connection(stream: tokio::net::TcpStream, data: Arc<Vec<u8>>, un
         if lower.starts_with("range:") {
             range_header = Some(trimmed["range:".len()..].trim().to_string());
         }
+        if let Some(value) = lower.strip_prefix("accept-encoding:") {
+            accept_encoding = Some(value.trim().to_owned());
+        }
     }
+    assert_eq!(accept_encoding.as_deref(), Some("identity"));
 
     if unavailable {
         writer.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
@@ -94,6 +108,7 @@ async fn handle_connection(stream: tokio::net::TcpStream, data: Arc<Vec<u8>>, un
          Content-Length: {content_len}\r\n\
          ETag: \"fixture-v1\"\r\n\
          {content_range}\
+         {content_encoding}\
          Accept-Ranges: bytes\r\n\
          Connection: close\r\n\
          \r\n"
@@ -112,7 +127,8 @@ async fn open_and_get_tile_over_http() {
     let data = Arc::new(bytes);
 
     let unavailable = Arc::new(AtomicBool::new(false));
-    let (port, _shutdown) = start_range_server(data, unavailable.clone()).await;
+    let (port, _shutdown) =
+        start_range_server(data, unavailable.clone(), Arc::new(Mutex::new(""))).await;
 
     let cfg = PmtilesConfig {
         id: "h".into(),
@@ -136,4 +152,45 @@ async fn open_and_get_tile_over_http() {
         .await
         .unwrap_err();
     assert_eq!(error.kind(), maptile_core::error::ErrorKind::Unavailable);
+}
+
+#[tokio::test]
+async fn rejects_non_identity_codings_on_open_and_tile_read() {
+    use maptile_core::error::MaptileError;
+
+    let data = Arc::new(tokio::fs::read(FIXTURE_PATH).await.unwrap());
+    let identity = "Content-Encoding: iDeNtItY,\tIDENTITY\r\nContent-Encoding: identity\r\n";
+    let codings = Arc::new(Mutex::new(identity));
+    let (port, _shutdown) =
+        start_range_server(data, Arc::new(AtomicBool::new(false)), codings.clone()).await;
+    let cfg = PmtilesConfig {
+        id: "coded".into(),
+        path: format!("http://127.0.0.1:{port}/sample.pmtiles"),
+        serve_as: None,
+        description: None,
+    };
+    let source = HttpPmtilesSource::open(cfg.clone()).await.unwrap();
+    let xyz = TileCoord { z: 0, x: 0, y: 0 };
+    let expected = source.get_tile(xyz, None).await.unwrap().data;
+    let assert_encoded_range = |error: MaptileError| {
+        assert!(
+            matches!(
+                &error,
+                MaptileError::Backend(cause)
+                    if matches!(cause.downcast_ref(), Some(pmtiles::PmtError::RangeRequestsUnsupported))
+            ),
+            "{error:?}"
+        );
+    };
+    for encoded in [
+        "Content-Encoding: gzip\r\n",
+        "Content-Encoding: identity\r\nContent-Encoding: gzip\r\n",
+        "Content-Encoding: identity, BR\r\n",
+    ] {
+        *codings.lock().unwrap() = encoded;
+        assert_encoded_range(HttpPmtilesSource::open(cfg.clone()).await.unwrap_err());
+        assert_encoded_range(source.get_tile(xyz, None).await.unwrap_err());
+    }
+    *codings.lock().unwrap() = identity;
+    assert_eq!(source.get_tile(xyz, None).await.unwrap().data, expected);
 }

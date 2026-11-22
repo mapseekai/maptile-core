@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use maptile_core::{
-    cache::{ContentVersion, TileCache},
+    cache::{ContentVersion, StyleHash, TileCache},
     control::*,
     error::{ErrorKind, MaptileError, MaptileResult},
     service::*,
@@ -14,10 +14,19 @@ use std::sync::{
 use tokio::sync::Notify;
 
 const ORIGIN: TileCoord = TileCoord { z: 0, x: 0, y: 0 };
+const MVT: TileInfo = TileInfo {
+    format: TileFormat::Mvt,
+    encoding: TileEncoding::Uncompressed,
+};
+const GZIP_MVT: TileInfo = TileInfo {
+    encoding: TileEncoding::Gzip,
+    ..MVT
+};
+
 fn tile(bytes: Bytes) -> TileResponse {
     TileResponse {
         data: bytes,
-        info: TileInfo::new(TileFormat::Mvt, TileEncoding::Uncompressed),
+        info: MVT,
         last_modified: None,
     }
 }
@@ -26,6 +35,8 @@ struct Driver {
     name: &'static str,
     revision: &'static str,
     bytes: Bytes,
+    info: TileInfo,
+    raster_style: bool,
     calls: AtomicUsize,
     hold: Option<Arc<Notify>>,
 }
@@ -35,6 +46,8 @@ impl Driver {
             name,
             revision,
             bytes: data,
+            info: MVT,
+            raster_style: false,
             calls: AtomicUsize::new(0),
             hold: None,
         }
@@ -45,22 +58,37 @@ impl TileDriver for Driver {
     fn descriptor(&self) -> SourceDescriptor {
         let mut d = SourceDescriptor::new(
             self.name,
-            tile(Bytes::new()).info,
+            self.info,
             ContentVersion::from_input(self.revision.as_bytes()),
         );
         d.capabilities.consistent_export = true;
+        d.capabilities.raster_style = self.raster_style;
         d
     }
     async fn read(
         &self,
         coord: TileCoord,
-        _: Option<&TileQuery<'_>>,
+        query: Option<&TileQuery<'_>>,
     ) -> MaptileResult<Option<TileResponse>> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         if let Some(hold) = &self.hold {
             hold.notified().await;
         }
-        Ok((coord.y == 0).then(|| tile(self.bytes.clone())))
+        Ok((coord.y == 0).then(|| {
+            let data = if self.raster_style {
+                let query = query.unwrap();
+                let size = query.style.unwrap().tile_size as u8;
+                let hash = query.style_hash.unwrap();
+                Bytes::copy_from_slice(&[size, hash.as_bytes()[0]])
+            } else {
+                self.bytes.clone()
+            };
+            TileResponse {
+                data,
+                info: self.info,
+                last_modified: None,
+            }
+        }))
     }
 }
 fn engine(driver: Arc<Driver>) -> Arc<CatalogService> {
@@ -111,6 +139,33 @@ impl TileLayer for Short {
         _: TileService<'_>,
     ) -> MaptileResult<TileOutcome> {
         self.0.clone().map(TileOutcome::Present)
+    }
+}
+
+struct ReplaceAfterRead(TileResponse);
+#[async_trait]
+impl TileLayer for ReplaceAfterRead {
+    async fn read(
+        &self,
+        _: &ValidatedTileRequest<'_>,
+        next: TileService<'_>,
+    ) -> MaptileResult<TileOutcome> {
+        next.read().await?;
+        Ok(TileOutcome::Present(self.0.clone()))
+    }
+}
+
+fn oversized_gzip_tile() -> TileResponse {
+    use std::io::{self, Read};
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    io::copy(
+        &mut io::repeat(0).take(maptile_core::transport::MAX_DECODED_TILE_BYTES as u64 + 1),
+        &mut encoder,
+    )
+    .unwrap();
+    TileResponse {
+        info: GZIP_MVT,
+        ..tile(Bytes::from(encoder.finish().unwrap()))
     }
 }
 
@@ -189,12 +244,7 @@ async fn admission_precedes_layers_and_shortcuts_obey_the_decoded_limit() {
         ErrorKind::Unsupported
     );
     let data = vec![0; maptile_core::transport::MAX_DECODED_TILE_BYTES + 1];
-    use std::io::Write;
-    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-    encoder.write_all(&data).unwrap();
-    let mut gz = tile(Bytes::from(encoder.finish().unwrap()));
-    gz.info.encoding = TileEncoding::Gzip;
-    for invalid in [gz, tile(Bytes::from(data))] {
+    for invalid in [oversized_gzip_tile(), tile(Bytes::from(data))] {
         let stack = TileStack::builder(service.clone())
             .layer(Short(Ok(invalid)))
             .build();
@@ -204,6 +254,186 @@ async fn admission_precedes_layers_and_shortcuts_obey_the_decoded_limit() {
         );
     }
     assert_eq!(driver.calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn compressed_hot_tile_passes_through_layers_without_a_blocking_worker() {
+    use maptile_core::cache::{CACHE_SCHEMA_VERSION, TileCacheKey, hashing::canonical_render_hash};
+    use std::time::Duration;
+    use tokio::sync::oneshot;
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let data = maptile_core::transport::encode_as(b"canonical", TileEncoding::Gzip).unwrap();
+        let driver = Arc::new(Driver {
+            info: GZIP_MVT,
+            ..Driver::new("sample", "v1", data.clone())
+        });
+        let cache = TileCache::new(1, None, None).unwrap();
+        let service = Arc::new(CatalogService::new(cache.clone()));
+        let mut edit = service.catalog().update();
+        edit.put(driver.clone()).unwrap();
+        service.catalog().publish(edit).unwrap();
+        let snapshot = service.catalog().snapshot();
+        let descriptor = snapshot.describe("sample").unwrap();
+        let mut identity = blake3::Hasher::new();
+        identity.update(&CACHE_SCHEMA_VERSION.to_le_bytes());
+        identity.update(&hex::decode(descriptor.revision.to_hex()).unwrap());
+        identity.update(b"public");
+        let key = TileCacheKey::new(
+            descriptor.id.clone(),
+            ContentVersion::from_bytes(*identity.finalize().as_bytes()),
+            ORIGIN.z,
+            ORIGIN.x,
+            ORIGIN.y,
+            canonical_render_hash(None, None, 256, 1, 0),
+        );
+        let req = ReadTarget::new("sample", "public").at(ORIGIN);
+        let plain = TileStack::builder(service.clone()).build();
+        let stack = TileStack::builder(service)
+            .layer(Record("outer", Arc::default()))
+            .layer(Record("inner", Arc::default()))
+            .build();
+        stack.read(req).await.unwrap();
+        assert!(cache.get(&key).await.is_some());
+
+        let seeded =
+            maptile_core::transport::encode_as(b"public cache write", TileEncoding::Gzip).unwrap();
+        for (expected, seed) in [(&data, false), (&seeded, true)] {
+            if seed {
+                cache
+                    .insert(
+                        key.clone(),
+                        TileResponse {
+                            info: GZIP_MVT,
+                            ..tile(seeded.clone())
+                        },
+                    )
+                    .await;
+                let cold = stack.read(req).await.unwrap();
+                assert_eq!(&cold.tile().unwrap().data, expected);
+            }
+            let (started, ready) = oneshot::channel();
+            let (release, done) = oneshot::channel();
+            let occupied = tokio::task::spawn_blocking(move || {
+                started.send(()).unwrap();
+                let _ = done.blocking_recv();
+            });
+            ready.await.unwrap();
+            let warm = tokio::time::timeout(Duration::from_secs(2), stack.read(req)).await;
+            release.send(()).unwrap();
+            occupied.await.unwrap();
+            let outcome = warm.expect("warm read started a second decode").unwrap();
+            assert_eq!(&outcome.tile().unwrap().data, expected);
+        }
+
+        cache.insert(key, oversized_gzip_tile()).await;
+        for stack in [plain, stack] {
+            assert_eq!(
+                stack.read(req).await.unwrap_err().kind(),
+                ErrorKind::ResourceLimit
+            );
+        }
+        assert_eq!(driver.calls.load(Ordering::SeqCst), 1);
+    });
+}
+
+#[tokio::test]
+async fn compressed_fills_and_changed_layer_outputs_are_checked() {
+    let invalid = oversized_gzip_tile();
+    let driver = Arc::new(Driver {
+        info: GZIP_MVT,
+        ..Driver::new("invalid", "v1", invalid.data.clone())
+    });
+    let stack = TileStack::builder(engine(driver.clone())).build();
+    for _ in 0..2 {
+        assert!(matches!(
+            stack
+                .read(ReadTarget::new("invalid", "public").at(ORIGIN))
+                .await,
+            Err(MaptileError::PayloadTooLarge { .. })
+        ));
+    }
+    assert_eq!(driver.calls.load(Ordering::SeqCst), 2);
+
+    let data = maptile_core::transport::encode_as(b"canonical", TileEncoding::Gzip).unwrap();
+    let service = engine(Arc::new(Driver {
+        info: GZIP_MVT,
+        ..Driver::new("sample", "v1", data.clone())
+    }));
+    for (scope, replacement) in [
+        ("different-bytes", invalid),
+        (
+            "shortened-view",
+            TileResponse {
+                data: data.slice(..data.len() - 1),
+                info: GZIP_MVT,
+                last_modified: None,
+            },
+        ),
+        (
+            "different-encoding",
+            TileResponse {
+                data: data.clone(),
+                info: TileInfo {
+                    encoding: TileEncoding::Zlib,
+                    ..MVT
+                },
+                last_modified: None,
+            },
+        ),
+    ] {
+        let stack = TileStack::builder(service.clone())
+            .layer(ReplaceAfterRead(replacement))
+            .build();
+        let error = stack
+            .read(ReadTarget::new("sample", scope).at(ORIGIN))
+            .await
+            .unwrap_err();
+        if scope == "different-bytes" {
+            assert!(matches!(error, MaptileError::PayloadTooLarge { .. }));
+        } else {
+            assert!(matches!(error, MaptileError::Transcode(_)));
+        }
+    }
+}
+
+#[tokio::test]
+async fn custom_driver_can_apply_raster_style_independent_of_advertised_tile_format() {
+    use maptile_core::raster::style::EffectiveStyle;
+
+    let driver = Arc::new(Driver {
+        raster_style: true,
+        ..Driver::new("sample", "v1", Bytes::new())
+    });
+    let stack = TileStack::builder(engine(driver.clone())).build();
+    let document = raster_style::Style::from_value(serde_json::json!({
+        "version": "3.0", "extensions": [raster_style::TILE_SCHEMA_URL],
+        "renderer": {"type": "gray", "bidx": [1]},
+        "raster:tile": {"format": "png", "tilesize": 128}
+    }))
+    .unwrap();
+    let style = EffectiveStyle::from_raster_style(document).unwrap();
+    for (tag, expected_calls) in [(3, 1), (3, 1), (7, 2)] {
+        let query = TileQuery {
+            style: Some(&style),
+            style_hash: Some(StyleHash::from_bytes([tag; 32])),
+            ..Default::default()
+        };
+        let target = ReadTarget {
+            query: Some(&query),
+            ..ReadTarget::new("sample", "public")
+        };
+        let page = stack.read_batch(target, &[ORIGIN]).await.unwrap();
+        let tile = page.tiles[0].tile().unwrap();
+        assert_eq!(tile.info.format, TileFormat::Mvt);
+        assert_eq!(tile.data.as_ref(), &[128, tag]);
+        assert_eq!(driver.calls.load(Ordering::SeqCst), expected_calls);
+    }
 }
 
 #[tokio::test]
@@ -457,6 +687,19 @@ async fn native_batch_cancellation_covers_output_validation() {
         cancellation: Some(&cancel),
         ..ReadTarget::new("native", "scope")
     };
+    let query = TileQuery {
+        style_hash: Some(StyleHash::from_bytes([7; 32])),
+        ..Default::default()
+    };
+    let styled = ReadTarget {
+        query: Some(&query),
+        ..req
+    };
+    assert!(matches!(
+        stack.read_batch(styled, &[ORIGIN]).await,
+        Err(MaptileError::Unsupported(_))
+    ));
+    assert!(!cancel.is_cancelled());
     let result = stack.read_batch(req, &[ORIGIN]).await;
     assert!(matches!(result, Err(MaptileError::Cancelled)), "{result:?}");
 }

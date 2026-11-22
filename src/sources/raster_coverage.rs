@@ -185,7 +185,11 @@ pub(crate) async fn read_coverage(
         .iter()
         .map(|v| (v.scale, v.offset))
         .collect::<Vec<_>>();
+    let active = super::agtiff_request::ACTIVE_RASTER_REQUEST
+        .try_with(Arc::clone)
+        .ok();
     let data = crate::transport::run_blocking(move || {
+        let _active = active;
         let _permit = permit;
         encode_geotiff(&pixels, &query, &scales)
     })

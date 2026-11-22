@@ -5,19 +5,17 @@ use crate::control::{CatalogEntry, CatalogService, CatalogSnapshot, SourceDescri
 use crate::error::{MaptileError, MaptileResult};
 use crate::sources::{
     MAX_TILE_BATCH_BYTES, MAX_TILE_BATCH_COORDS, MosaicPixelSelection, RasterPointQuery,
-    RasterPointResponse, TileCoord, TileEncoding, TileQuery, TileResponse,
-    effective_pixel_selection,
+    RasterPointResponse, TileCoord, TileQuery, TileResponse, effective_pixel_selection,
     raster_coverage::{CoverageQuery, CoverageResponse, MAX_COVERAGE_BYTES},
     tile_math::validate_tile_request,
 };
-use crate::transport::MAX_DECODED_TILE_BYTES;
 use futures_util::{
     FutureExt,
     future::{BoxFuture, Shared},
 };
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, Weak},
+    sync::{Arc, Mutex, OnceLock, Weak},
 };
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -117,6 +115,7 @@ pub struct TileService<'a> {
     layers: &'a [Arc<dyn TileLayer>],
     engine: &'a CatalogService,
     request: &'a ValidatedTileRequest<'a>,
+    checked: &'a OnceLock<TileResponse>,
 }
 
 impl TileService<'_> {
@@ -127,7 +126,15 @@ impl TileService<'_> {
                     .read(self.request, TileService { layers, ..self })
                     .await
             }
-            None => self.engine.read_canonical(self.request).await,
+            None => {
+                let result = self.engine.read_canonical(self.request).await?;
+                if let Some(tile) = result.tile()
+                    && tile.info.encoding.is_encoded()
+                {
+                    let _ = self.checked.set(tile.clone());
+                }
+                Ok(result)
+            }
         }
     }
 }
@@ -179,19 +186,36 @@ impl TileStack {
         validate_tile_request(&[request.coord], request.target.query)?;
         entry.descriptor().validate_query(request.target.query)?;
         let pinned = ValidatedTileRequest {
-            request,
+            request: ReadTarget {
+                source: &entry.descriptor().id,
+                ..request.target
+            }
+            .at(request.coord),
             snapshot,
             entry,
         };
         let read = async {
+            if self.layers.is_empty() {
+                return self.engine.read_canonical(&pinned).await;
+            }
+            let checked = OnceLock::new();
             let result = TileService {
                 layers: &self.layers,
                 engine: &self.engine,
                 request: &pinned,
+                checked: &checked,
             }
             .read()
             .await?;
-            if !self.layers.is_empty() {
+            // Retain the checked allocation so its pointer cannot be reused by a rewrite.
+            if !checked
+                .get()
+                .zip(result.tile())
+                .is_some_and(|(before, after)| {
+                    before.info.encoding == after.info.encoding
+                        && std::ptr::eq(before.data.as_ref(), after.data.as_ref())
+                })
+            {
                 check_output(&result).await?;
             }
             Ok(result)
@@ -284,7 +308,7 @@ impl TileStack {
         serde_json::to_writer(
             &mut hash,
             &(
-                target.source,
+                descriptor.id.as_ref(),
                 target.scope,
                 target.query.and_then(|q| q.filter),
                 target.query.and_then(|q| q.url_query),
@@ -294,7 +318,7 @@ impl TileStack {
         .map_err(MaptileError::backend)?;
         let revision = *hash.finalize().as_bytes();
         if cursor.is_some_and(|c| c.revision != revision) {
-            return Err(MaptileError::VersionChanged(target.source.into()));
+            return Err(MaptileError::VersionChanged(descriptor.id.to_string()));
         }
         let start = cursor.map_or(0, |c| c.position);
         let rest = coords.get(start..).ok_or_else(|| {
@@ -449,18 +473,7 @@ async fn check_output(outcome: &TileOutcome) -> MaptileResult<()> {
     let Some(tile) = outcome.tile() else {
         return Ok(());
     };
-    if tile.data.len() > MAX_DECODED_TILE_BYTES {
-        return Err(MaptileError::PayloadTooLarge {
-            limit: MAX_DECODED_TILE_BYTES,
-        });
-    }
-    if !matches!(
-        tile.info.encoding,
-        TileEncoding::Internal | TileEncoding::Uncompressed
-    ) {
-        crate::transport::decode_async(tile.data.clone(), tile.info.encoding).await?;
-    }
-    Ok(())
+    crate::transport::validate_tile_payload(tile).await
 }
 
 #[derive(Clone, Eq, Hash, PartialEq)]
@@ -577,7 +590,7 @@ impl CatalogService {
             coord.y,
             style_hash,
         );
-        if let Some(tile) = self.cache.get(&key).await {
+        if let Some(tile) = self.cache.get_validated(&key).await? {
             return Ok(TileOutcome::Present(tile));
         }
 
@@ -594,7 +607,7 @@ impl CatalogService {
                 let limits = self.limits();
                 let style = style.cloned();
                 async move {
-                    if let Some(tile) = cache.get(&key).await {
+                    if let Some(tile) = cache.get_validated(&key).await? {
                         return Ok(TileOutcome::Present(tile));
                     }
                     let query = TileQuery {
@@ -612,7 +625,7 @@ impl CatalogService {
                         .await?;
                     check_output(&result).await?;
                     if let TileOutcome::Present(tile) = &result {
-                        cache.insert(key, tile.clone()).await;
+                        cache.insert_validated(key, tile.clone()).await;
                     }
                     Ok(result)
                 }

@@ -20,11 +20,13 @@
 
 ## 瓦片读取过程
 
-一次读取固定当前 `CatalogSnapshot`、源描述符及组合成员。`TileStack` 检查 XYZ、过滤能力和请求预算，然后按注册顺序进入 `TileLayer`，并按逆序返回。提前返回的瓦片也受大小检查。没有自定义层时直接进入默认 `CatalogService`。
+一次读取固定当前 `CatalogSnapshot`、源描述符及组合成员。`TileStack` 检查 XYZ、查询能力和请求预算，再按注册顺序进入 `TileLayer`，并按逆序返回。没有自定义层时直接进入默认 `CatalogService`。短路或改写的瓦片仍须通过 16 MiB 大小检查。透传规范结果时，同一字节视图和编码可以复用已完成的校验。
+
+`TileQuery::style` 和 `style_hash` 仅适用于声明 `raster_style` 能力的驱动。COG、固定镶嵌、STAC 和 PostGIS OutDB 使用该能力。目录读取在进入应用层或读取缓存前为不支持样式的源返回 `Unsupported`。自定义 `TileDriver` 在 `SourceDescriptor.capabilities` 中声明能力，自定义 `TileSource` 实现 `supports_raster_style()`。固定组合要求所有成员都支持。兼容接口的 `LazyCompositeSource` 在样式读取开始前固定并校验本次所有嵌套成员。用 `catalog.put` 发布含有 `LazyCompositeSource` 的旧组合时，目录拒绝样式请求。使用 `CompositeDeclaration` 的目录组合在发布时固定成员。
 
 `TileOutcome::NoTile`、`Present` 与 `Partial` 分别表示无瓦片、完整瓦片和组合降级。合法零字节 MVT 可作为 `Present`。部分结果可包含瓦片，也可没有瓦片。服务端必须对部分结果发送 `Cache-Control: no-store`，不生成强 ETag，并在条件请求时返回部分结果而非 304。
 
-`read_batch` 保留输入顺序和空位，`BatchPage.consumed` 表示已处理的坐标数。调用方从该位置继续。`begin_export` 固定跨页的目录条目；仅声明支持一致导出的源可使用。`read_export_page` 的游标检查源修订和请求身份，调用方必须保留稳定的坐标序列、相同的层配置，并对每次请求重新鉴权。
+`read_batch` 保留输入顺序和空位，`BatchPage.consumed` 表示已处理的坐标数。调用方从该位置继续。`begin_export` 固定跨页的目录条目；仅声明支持一致导出的源可使用。`read_export_page` 的游标检查源修订和请求身份，调用方必须保留稳定的坐标序列、相同的层配置，并对每次请求重新鉴权。临时组合从去掉每个成员首尾空白后的 ID 按输入顺序生成身份。例如 `a,b` 和 ` a, b ` 共用描述符 ID、缓存、在途读取和游标。
 
 [`SourceManager`](../src/sources/manager.rs) 和其 `get_tile_with_etag` 仍为兼容接口；新接入应使用 `TileStack`，由 HTTP 适配器针对最终表示生成验证标识。两个接口的缓存和生命周期各自独立。
 
@@ -34,9 +36,13 @@
 
 源修订必须随数据或影响元数据的配置变化而更新。文件源使用文件身份或打开代次；数据库源可使用持久化编辑修订号；COG 应使用版本化地址或内容标识。远端归档需要不可变对象、固定版本或强 ETag，确保同一次打开的多个 Range 属于同一版本。
 
-`TileCache::new` 接收按 MiB 计量的容量、TTL 和 TTI。容量不包含连接池、渲染器和其他分配。缓存命中不主动检查文件变化；更新数据后先打开新源并发布新目录。`invalidate_source` 和 `invalidate_all` 发起异步维护，测试可通过 `run_pending_tasks().await` 等待。
+`TileCache::new` 接收按 MiB 计量的容量、TTL 和 TTI。容量不包含连接池、渲染器和其他分配。`TileStack` 和 `SourceManager` 首次读取通过缓存公开接口写入的压缩瓦片时会校验负载。校验结果只适用于该缓存条目。缓存命中不主动检查文件变化；更新数据后先打开新源并发布新目录。`invalidate_source` 和 `invalidate_all` 发起异步维护，测试可通过 `run_pending_tasks().await` 等待。
 
 ## 并发额度
+
+COG、Mosaic 和 STAC 的瓦片渲染，以及 COG 的点查和覆盖导出，共享进程内的 64 个栅格请求名额。直接调用数据源和通过 `TileStack` 读取遵循相同规则，名额用尽时返回 `CapacityExhausted`。调用方取消读取后，仍在执行的原生工作继续持有名额和对应的源租约。
+
+取消 COG 点查或覆盖导出会停止等待对象数据。若取消时可能还有原生解码或投影在执行，async-geotiff 0.13 仅提供当前 reader 的 CPU 使用计数。该 reader 暂时拒绝新请求，直到已提交的工作排空。其他已打开的 COG 可以继续读取。
 
 `transport::configure_blocking_concurrency(limit)` 配置本 crate 经统一阻塞任务入口运行的解码、编码和其他 CPU/阻塞工作的进程共享额度。应用应在打开源或启动相关异步工作前调用一次；未配置时默认使用可用并行度，最多 16。显式配置可超过 16，须为正数且不超过 Tokio 信号量上限。重复配置或首次使用后配置返回 `Config`。同步编解码入口不经过此额度，原生渲染器仍使用其独立的池配置。
 

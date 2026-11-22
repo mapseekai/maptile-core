@@ -53,6 +53,33 @@ fn strong_http_etag(headers: &reqwest::header::HeaderMap) -> Option<&str> {
     .then_some(etag)
 }
 
+#[cfg(any(feature = "pmtiles", feature = "agtiff", feature = "duckdb"))]
+fn has_identity_content_encoding(headers: &reqwest::header::HeaderMap) -> bool {
+    headers
+        .get_all(reqwest::header::CONTENT_ENCODING)
+        .iter()
+        .all(|value| {
+            value
+                .as_bytes()
+                .split(|&byte| byte == b',')
+                .all(|coding| coding.trim_ascii().eq_ignore_ascii_case(b"identity"))
+        })
+}
+
+#[cfg(any(feature = "pmtiles", feature = "agtiff", feature = "duckdb"))]
+fn range_http_client_builder() -> reqwest::ClientBuilder {
+    use reqwest::header::{ACCEPT_ENCODING, HeaderMap, HeaderValue};
+    let mut headers = HeaderMap::new();
+    headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
+    // Keep Content-Encoding visible when downstream crates enable reqwest's codecs.
+    reqwest::Client::builder()
+        .default_headers(headers)
+        .no_gzip()
+        .no_brotli()
+        .no_zstd()
+        .no_deflate()
+}
+
 #[cfg(feature = "agtiff")]
 pub mod mosaic_source;
 #[cfg(feature = "agtiff")]
@@ -166,7 +193,7 @@ pub fn parse_composite_id_list(s: &str) -> Option<Vec<&str>> {
 }
 
 #[async_trait::async_trait]
-pub trait TileSource: Send + Sync + 'static {
+pub trait TileSource: std::any::Any + Send + Sync {
     fn id(&self) -> &str;
 
     fn source_kind(&self) -> SourceKind {
@@ -292,6 +319,17 @@ pub trait TileSource: Send + Sync + 'static {
     /// Whether the source consumes `TileQuery.filter` (CQL2).
     fn supports_filter(&self) -> bool {
         false
+    }
+
+    /// Whether the source applies a per-request [`TileQuery::style`].
+    fn supports_raster_style(&self) -> bool {
+        false
+    }
+
+    /// Whether the opened capability remains valid for every catalog read.
+    #[doc(hidden)]
+    fn supports_catalog_raster_style(&self) -> bool {
+        self.supports_raster_style()
     }
 
     fn supports_bbox(&self) -> bool {
@@ -426,11 +464,11 @@ pub struct TileQuery<'a> {
     /// (see spec D6) and ANDed into source SQL as
     /// `geom && ST_MakeEnvelope(w,s,e,n,4326)`.
     pub bbox: Option<[f64; 4]>,
-    /// Per-request raster styling. Joins the tile cache key by
-    /// [`crate::raster::style::EffectiveStyle::style_hash`]; does not
-    /// bypass the cache. Raster sources reject requests without this value.
+    /// Per-request raster styling. Participates in the cache identity.
+    /// Dynamic raster renderers require this value.
     pub style: Option<&'a crate::raster::style::EffectiveStyle>,
     /// Dataset-authoritative hash for a complete typed raster request.
+    /// Only sources that support per-request raster styling accept it.
     pub style_hash: Option<crate::cache::StyleHash>,
     /// Per-request mosaic composition. Borrowed query state carries this
     /// `Copy` value without cloning; the manager rejects it for non-mosaic sources
@@ -439,6 +477,10 @@ pub struct TileQuery<'a> {
 }
 
 impl<'a> TileQuery<'a> {
+    pub(crate) fn has_raster_style(&self) -> bool {
+        self.style.is_some() || self.style_hash.is_some()
+    }
+
     /// True when the request carries inputs that make the response
     /// non-cacheable as a whole — currently `url_query`, `filter`, and
     /// `bbox` (these alter the data, not just the rendering). `style` is

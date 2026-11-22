@@ -51,6 +51,8 @@ pub struct SourceCapabilities {
     pub filter: bool,
     pub bbox: bool,
     pub url_query: bool,
+    /// The driver applies per-request Raster Style. Defaults to `false`.
+    pub raster_style: bool,
     pub pixel_selection: Option<MosaicPixelSelection>,
     pub strict_mvt: bool,
     pub consistent_export: bool,
@@ -95,6 +97,7 @@ impl SourceCapabilities {
             filter: source.supports_filter(),
             bbox: source.supports_bbox(),
             url_query: source.supports_url_query(),
+            raster_style: source.supports_raster_style(),
             pixel_selection: source.mosaic_pixel_selection(),
             strict_mvt: source.strict_mvt(),
             consistent_export: source.consistent_export(),
@@ -116,6 +119,8 @@ impl SourceCapabilities {
             "bbox"
         } else if query.url_query.is_some() && !c.url_query {
             "custom parameters"
+        } else if query.has_raster_style() && !c.raster_style {
+            "raster style"
         } else if query.pixel_selection.is_some() && c.pixel_selection.is_none() {
             "pixel selection"
         } else {
@@ -167,6 +172,8 @@ impl<S: TileSource + ?Sized> TileDriver for S {
         if revision == ContentVersion::from_input(self.id().as_bytes()) {
             revision = ContentVersion::new_generation();
         }
+        let mut capabilities = SourceCapabilities::from_source(self);
+        capabilities.raster_style = self.supports_catalog_raster_style();
         SourceDescriptor {
             id: self.id().into(),
             kind: self.source_kind(),
@@ -174,7 +181,7 @@ impl<S: TileSource + ?Sized> TileDriver for S {
             info: self.tile_info(),
             revision,
             cache_zoom: self.cache_zoom(),
-            capabilities: SourceCapabilities::from_source(self),
+            capabilities,
         }
     }
     async fn read(
@@ -512,19 +519,47 @@ impl Drop for DriverInstance {
 fn spawn_cleanup(work: impl Future<Output = ()> + Send + 'static) {
     if let Ok(runtime) = tokio::runtime::Handle::try_current() {
         runtime.spawn(work);
-    } else {
-        static FALLBACK: std::sync::OnceLock<std::io::Result<tokio::runtime::Runtime>> =
-            std::sync::OnceLock::new();
-        if let Ok(runtime) = FALLBACK.get_or_init(|| {
-            tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(1)
-                .thread_name("maptile-drain")
-                .enable_all()
-                .build()
-        }) {
-            runtime.spawn(work);
-        }
+    } else if let Ok(runtime) = cleanup_runtime() {
+        runtime.spawn(work);
     }
+}
+
+pub(crate) fn cleanup_runtime() -> MaptileResult<&'static tokio::runtime::Handle> {
+    static RUNTIME: std::sync::OnceLock<tokio::runtime::Handle> = std::sync::OnceLock::new();
+    static INIT: Mutex<()> = Mutex::new(());
+    if let Some(runtime) = RUNTIME.get() {
+        return Ok(runtime);
+    }
+    let _init = INIT.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(runtime) = RUNTIME.get() {
+        return Ok(runtime);
+    }
+    let handle = start_cleanup_runtime(std::thread::Builder::new().name("maptile-drain".into()))
+        .map_err(|error| {
+            MaptileError::SourceUnavailable(format!("cannot start cleanup runtime: {error}"))
+        })?;
+    Ok(RUNTIME.get_or_init(|| handle))
+}
+
+fn start_cleanup_runtime(thread: std::thread::Builder) -> std::io::Result<tokio::runtime::Handle> {
+    let (started, ready) = std::sync::mpsc::sync_channel(1);
+    // A fallible OS thread starts the single scheduler that orders raw COG cancellation and decode.
+    thread.spawn(move || {
+        match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => {
+                if started.send(Ok(runtime.handle().clone())).is_ok() {
+                    runtime.block_on(std::future::pending::<()>());
+                }
+            }
+            Err(error) => {
+                let _ = started.send(Err(error));
+            }
+        }
+    })?;
+    ready.recv().map_err(std::io::Error::other)?
 }
 
 struct RegisteredDriver {
@@ -696,6 +731,7 @@ impl CatalogSnapshot {
             }
             members.push(Arc::<str>::from(member));
         }
+        let id: SourceId = members.join(",").into();
         let mut needed = Vec::new();
         let mut visited = HashSet::new();
         let mut pending = members.clone();
@@ -709,7 +745,7 @@ impl CatalogSnapshot {
             }
         }
         needed.push(CompositeDeclaration {
-            id: id.into(),
+            id: id.clone(),
             members,
             lazy: false,
             duplicate_layer: DuplicateLayer::Error,
@@ -717,7 +753,7 @@ impl CatalogSnapshot {
         });
         let mut compiled = compile_graph(&self.sources, &needed, limits)?;
         Ok(Arc::new(CatalogEntry::Composite(
-            compiled.remove(id).expect("compiled requested composite"),
+            compiled.remove(&id).expect("compiled requested composite"),
         )))
     }
 }
@@ -1164,6 +1200,13 @@ impl CatalogService {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[test]
+    fn cleanup_worker_creation_failure_returns_an_error() {
+        let thread = std::thread::Builder::new().stack_size(1 << 60);
+        assert!(super::start_cleanup_runtime(thread).is_err());
+    }
+
     use super::*;
     use crate::service::{ReadTarget, TileStack};
     use crate::sources::{TileEncoding, TileFormat};

@@ -362,17 +362,9 @@ pub(super) async fn capture_http_at_etag(
         header::IF_MATCH,
         HeaderValue::from_str(etag).map_err(|_| config("invalid ETag"))?,
     );
-    request_headers.insert(
-        header::ACCEPT_ENCODING,
-        HeaderValue::from_static("identity"),
-    );
-    let client = reqwest::Client::builder()
+    let client = super::range_http_client_builder()
         .default_headers(request_headers)
         .no_proxy()
-        .no_gzip()
-        .no_brotli()
-        .no_zstd()
-        .no_deflate()
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|_| config("cannot configure HTTP snapshot client"))?;
@@ -416,11 +408,7 @@ pub(super) async fn capture_http_at_etag(
         {
             return Err(changed_snapshot());
         }
-        if headers
-            .get_all(header::CONTENT_ENCODING)
-            .iter()
-            .any(|v| !v.as_bytes().eq_ignore_ascii_case(b"identity"))
-        {
+        if !super::has_identity_content_encoding(headers) {
             return Err(MaptileError::InvalidMetadata(
                 "encoded GeoParquet snapshot range".into(),
             ));

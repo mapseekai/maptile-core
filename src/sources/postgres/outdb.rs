@@ -62,6 +62,12 @@ impl PostgresOutDbRasterSource {
         pool: Arc<PostgresPool>,
         config: &PostgresOutDbRasterConfig,
     ) -> MaptileResult<Self> {
+        if config.cache_zoom.is_some_and(|range| !range.is_disabled()) {
+            return Err(MaptileError::Config(format!(
+                "PostgreSQL OutDB raster source {:?} always bypasses the tile cache. Remove cache_zoom or set its minzoom greater than its maxzoom.",
+                config.id,
+            )));
+        }
         super::pool::validate_source_window(
             Some(config.minzoom),
             Some(config.maxzoom),
@@ -448,6 +454,10 @@ impl TileSource for PostgresOutDbRasterSource {
 
     fn clone_source(&self) -> Box<dyn TileSource> {
         Box::new(self.clone())
+    }
+
+    fn supports_raster_style(&self) -> bool {
+        true
     }
 
     async fn get_tile(

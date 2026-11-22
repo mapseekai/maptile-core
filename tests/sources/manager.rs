@@ -104,6 +104,82 @@ fn register_overwrites_same_id() {
 }
 
 #[test]
+fn shared_cache_entries_are_validated_before_legacy_reads() {
+    use maptile_core::{
+        cache::{TileCache, TileCacheKey, hashing::canonical_render_hash},
+        sources::TileEtagResponse,
+        transport::encode_as,
+    };
+    use std::time::Duration;
+    use tokio::sync::oneshot;
+
+    tokio::runtime::Builder::new_current_thread()
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let cache = Arc::new(TileCache::new(1, None, None).unwrap());
+            let manager = SourceManager::new().with_cache(cache.clone());
+            let source = Stub::arc("archive");
+            let coord = TileCoord { z: 0, x: 0, y: 0 };
+            let key = TileCacheKey::new(
+                source.id().into(),
+                source.content_version(),
+                coord.z,
+                coord.x,
+                coord.y,
+                canonical_render_hash(None, None, 256, 1, 1),
+            );
+            manager.register(source);
+            let mut tile = TileResponse {
+                data: Bytes::from_static(b"invalid compressed bytes"),
+                info: TileInfo::new(TileFormat::Mvt, TileEncoding::Gzip),
+                last_modified: None,
+            };
+            cache.insert(key.clone(), tile.clone()).await;
+            assert!(matches!(
+                manager.get_tile("archive", coord, None).await,
+                Err(MaptileError::Transcode(_))
+            ));
+            assert!(matches!(
+                manager
+                    .get_tile_with_etag("archive", coord, None, None)
+                    .await,
+                Err(MaptileError::Transcode(_))
+            ));
+            tile.data = encode_as(b"valid cache write", TileEncoding::Gzip).unwrap();
+            cache.insert(key, tile.clone()).await;
+            assert_eq!(
+                manager.get_tile("archive", coord, None).await.unwrap().data,
+                tile.data
+            );
+
+            let (started, ready) = oneshot::channel();
+            let (release, done) = oneshot::channel();
+            let blocked = tokio::task::spawn_blocking(move || {
+                started.send(()).unwrap();
+                let _ = done.blocking_recv();
+            });
+            ready.await.unwrap();
+            let warm = tokio::time::timeout(
+                Duration::from_secs(2),
+                manager.get_tile_with_etag("archive", coord, None, None),
+            )
+            .await;
+            release.send(()).unwrap();
+            blocked.await.unwrap();
+            let TileEtagResponse::Fresh { resp, .. } =
+                warm.expect("warm read started a second decode").unwrap()
+            else {
+                panic!("expected the validated compressed tile");
+            };
+            assert_eq!(resp.data, tile.data);
+            assert_eq!(resp.info, tile.info);
+        });
+}
+
+#[test]
 fn conditional_failure_only_retires_the_observed_instance() {
     let manager = SourceManager::new();
     let old = Stub::arc("a");

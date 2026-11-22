@@ -182,6 +182,8 @@ bash scripts/ci/maptile-render-cargo.sh run --locked --features render --example
 
 `stac` 包含 `agtiff`；固定镶嵌通过 `agtiff` 启用。OutDB 同时需要 `postgres` 和 `raster`。STAC 和固定镶嵌提供 `first`、`highest`、`lowest`、`mean`、`median` 像元组合方式，应用可通过 `TileQuery.pixel_selection` 选择请求使用的方式。
 
+OutDB 每次请求都会查询当前资产，因此始终绕过瓦片结果缓存。省略 `cache_zoom`，或通过 `CacheZoomRange::disabled()` 显式禁用。对应 JSON 值为 `{"minzoom":255,"maxzoom":0}`。启用缓存的旧配置值仍可反序列化，打开源时会收到配置错误。
+
 固定镶嵌先按成员 WGS84 范围筛选每瓦片候选，但全局统计仍使用全部成员，并继续受上游默认 64 个资产的统计发现限制。跨日期线、未知范围和缓存版本规则见[成员范围说明](sources.md#固定栅格镶嵌与成员范围)。
 
 各入口的配置与处理流程见 [`stac.rs`](../src/sources/stac.rs)、[`mosaic_source.rs`](../src/sources/mosaic_source.rs)、[`outdb.rs`](../src/sources/postgres/outdb.rs)。数据库连接复用方式见[数据源与查询](sources.md)。

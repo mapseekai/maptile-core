@@ -578,6 +578,7 @@ fn build_node(
         filter: true,
         bbox: true,
         url_query: true,
+        raster_style: !members.is_empty(),
         strict_mvt: true,
         consistent_export: true,
         ..Default::default()
@@ -641,6 +642,7 @@ fn build_node(
         caps.filter &= d.capabilities.filter;
         caps.bbox &= d.capabilities.bbox;
         caps.url_query &= d.capabilities.url_query;
+        caps.raster_style &= d.capabilities.raster_style;
         caps.consistent_export &= d.capabilities.consistent_export;
         zoom = zoom.intersection(d.cache_zoom);
         hash.update(&(d.id.len() as u64).to_le_bytes());

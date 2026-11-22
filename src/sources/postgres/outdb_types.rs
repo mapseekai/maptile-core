@@ -16,7 +16,9 @@ pub struct PostgresOutDbRasterConfig {
     #[serde(default = "default_maxzoom")]
     pub maxzoom: u8,
     pub bounds: Option<[f64; 4]>,
-    /// Per-source cache zoom policy. `None` ≡ cache every zoom.
+    /// OutDB always bypasses the tile cache because its assets are resolved per request.
+    /// Omit this field or set it to [`crate::cache::CacheZoomRange::disabled()`].
+    /// Legacy ranges still deserialize. Source construction rejects ranges that enable caching.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_zoom: Option<crate::cache::CacheZoomRange>,
 }
@@ -49,5 +51,19 @@ mod cache_zoom_tests {
         let json = r#"{ "id": "test_outdb" }"#;
         let cfg: PostgresOutDbRasterConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.cache_zoom, None);
+    }
+
+    #[test]
+    fn config_round_trips_explicitly_disabled_cache_zoom() {
+        let json = serde_json::json!({
+            "id": "test_outdb",
+            "cache_zoom": {"minzoom": 255, "maxzoom": 0}
+        });
+        let cfg: PostgresOutDbRasterConfig = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(cfg.cache_zoom, Some(CacheZoomRange::disabled()));
+        assert_eq!(
+            serde_json::to_value(cfg).unwrap()["cache_zoom"],
+            json["cache_zoom"]
+        );
     }
 }

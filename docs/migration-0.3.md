@@ -12,9 +12,15 @@
 
 打开数据源后，用 `CatalogService` 的更新对象 `put` 并 `publish`，通过 `TileStack::builder(catalog).build()` 读取。将调用方自定义操作注册为 `TileLayer`。固定可见范围、鉴权和 HTTP 条件请求留在应用。每个授权范围使用不同的 `ReadTarget::scope`，防止共用缓存跨范围返回数据。
 
+为应用逐请求 Raster Style 的自定义驱动声明 `SourceCapabilities::raster_style`，或在 `TileSource` 上实现 `supports_raster_style()`。调用方只向具备该能力的源发送 `style` 和 `style_hash`。归档读取沿用归档保存的表示。
+
+兼容 `SourceManager` 的动态 `LazyCompositeSource` 在样式请求开始前固定并检查本次所有嵌套成员，组级结果绕过缓存。通过 `catalog.put` 发布的旧动态组合只接受无样式的目录读取。需要在目录中读取组合样式时，改用 `CompositeDeclaration` 并保证所有成员都声明相应能力。
+
 处理 `TileOutcome::NoTile`、`Present` 和 `Partial`。合法零字节瓦片与无瓦片不同。部分结果禁止写入规范缓存，HTTP 层发送 `Cache-Control: no-store`，不生成强 ETag，也不因 `If-None-Match` 返回 304。
 
 将旧组合声明改为 `CompositeDeclaration`。严格组合要求每个成员保证 MVT 合规并完整声明层名。普通外部归档仍可独立读取，生产端能保证所有坐标的 MVT 合规并完整声明层名时，应用才可通过 `put_trusted_mvt` 显式授予严格组合准入。默认 `DuplicateLayer::Error` 拒绝重名；原来依赖后层覆盖时使用 `KeepLast` 并比对结果。严格组合不在运行时添加 `layer_prefix`，先调整生产端图层名和样式的 `source-layer` 引用。检查原有按逗号动态组合的调用和所有成员的过滤能力。
+
+临时组合 ID 现在按成员顺序拼接各自去掉首尾空白的 ID。旧版按带空白的组合 ID 生成的无状态导出游标需要从第一页重新开始。
 
 ## 发布版本和处理 HTTP
 

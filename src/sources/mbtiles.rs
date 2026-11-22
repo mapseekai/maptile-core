@@ -51,11 +51,14 @@ use crate::sources::{
     validate_source_request,
 };
 use crate::transport::{
-    CATALOG_BUILD_LEASE, MAX_DECODED_TILE_BYTES, SOURCE_READ_LEASE, decode_async,
+    CATALOG_BUILD_LEASE, MAX_DECODED_TILE_BYTES, SOURCE_READ_LEASE, decode_async, run_blocking,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
-use mbtiles::sqlx::{Connection, SqliteConnection, SqlitePool, sqlite::SqliteConnectOptions};
+use mbtiles::sqlx::{
+    Connection, Sqlite, SqliteConnection, SqlitePool, pool::PoolConnection,
+    sqlite::SqliteConnectOptions,
+};
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -72,32 +75,38 @@ pub struct MbtilesConfig {
 
 #[derive(Clone, Debug)]
 pub struct MbtilesSource {
-    cfg: MbtilesConfig,
     pool: SqlitePool,
     tj: TileJSON,
     info: TileInfo,
     default_encoding: TileEncoding,
-    archive_path: PathBuf,
-    wal_path: PathBuf,
-    stamp: ArchiveStamp,
+    archive: Arc<ArchiveSnapshot>,
     content_version: ContentVersion,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug)]
+struct ArchiveSnapshot {
+    id: String,
+    alias: PathBuf,
+    main: PathBuf,
+    wal: PathBuf,
+    stamp: ArchiveStamp,
+}
+
+#[derive(Debug, PartialEq, Eq)]
 struct ArchiveStamp {
     main: FileStamp,
     wal: Option<FileStamp>,
 }
 
-struct CheckoutLease {
-    worker_started: Cell<bool>,
+struct ConnectionLease {
+    completion_unconfirmed: Cell<bool>,
     read: Option<Arc<SourceReadLease>>,
     build: Option<Arc<CatalogBuildLease>>,
 }
 
-impl Drop for CheckoutLease {
+impl Drop for ConnectionLease {
     fn drop(&mut self) {
-        if self.worker_started.get() {
+        if self.completion_unconfirmed.get() {
             if let Some(read) = &self.read {
                 read.mark_unconfirmed();
             }
@@ -109,7 +118,55 @@ impl Drop for CheckoutLease {
 }
 
 tokio::task_local! {
-    static CHECKOUT_LEASE: CheckoutLease;
+    static CHECKOUT_LEASE: ConnectionLease;
+}
+
+// Keep the connection out of the pool until the last archive check passes.
+struct UncheckedConnection {
+    pending: Option<(PoolConnection<Sqlite>, ConnectionLease)>,
+    cleanup: &'static tokio::runtime::Handle,
+}
+
+impl UncheckedConnection {
+    fn get_mut(&mut self) -> &mut SqliteConnection {
+        let (connection, _) = self
+            .pending
+            .as_mut()
+            .expect("unchecked connection is present");
+        connection
+    }
+
+    fn release(mut self) {
+        drop(self.pending.take());
+    }
+}
+
+impl Drop for UncheckedConnection {
+    fn drop(&mut self) {
+        if let Some((connection, lease)) = self.pending.take() {
+            lease.completion_unconfirmed.set(true);
+            // SQLx's pooled connection Drop needs a live Tokio context.
+            self.cleanup.spawn(async move {
+                if connection.close().await.is_ok() {
+                    lease.completion_unconfirmed.set(false);
+                }
+            });
+        }
+    }
+}
+
+impl ArchiveSnapshot {
+    async fn check(self: &Arc<Self>) -> MaptileResult<()> {
+        let archive = self.clone();
+        run_blocking(move || {
+            if matches_archive(&archive.alias, &archive.main, &archive.wal, &archive.stamp) {
+                Ok(())
+            } else {
+                Err(MaptileError::VersionChanged(archive.id.clone()))
+            }
+        })
+        .await
+    }
 }
 
 impl ArchiveStamp {
@@ -145,7 +202,7 @@ impl MbtilesSource {
             .read_only(true)
             .thread_name(|id| {
                 // SQLx calls this when establishing a worker, after any pool admission wait.
-                let _ = CHECKOUT_LEASE.try_with(|lease| lease.worker_started.set(true));
+                let _ = CHECKOUT_LEASE.try_with(|lease| lease.completion_unconfirmed.set(true));
                 format!("sqlx-sqlite-worker-{id}")
             });
         let archive = mbtiles::Mbtiles::new(&archive_path).map_err(MaptileError::backend)?;
@@ -234,29 +291,19 @@ impl MbtilesSource {
         );
 
         Ok(Self {
-            cfg,
             pool: SqlitePool::connect_lazy_with(options),
             tj: inspection.tilejson,
             info,
             default_encoding,
-            archive_path,
-            wal_path,
-            stamp,
+            archive: Arc::new(ArchiveSnapshot {
+                id: cfg.id,
+                alias: cfg.path,
+                main: archive_path,
+                wal: wal_path,
+                stamp,
+            }),
             content_version,
         })
-    }
-
-    fn check_file(&self) -> MaptileResult<()> {
-        if matches_archive(
-            &self.cfg.path,
-            &self.archive_path,
-            &self.wal_path,
-            &self.stamp,
-        ) {
-            Ok(())
-        } else {
-            Err(MaptileError::VersionChanged(self.cfg.id.clone()))
-        }
     }
 }
 
@@ -279,7 +326,7 @@ fn parse_format_str(s: &str) -> Option<TileFormat> {
 #[async_trait]
 impl TileSource for MbtilesSource {
     fn id(&self) -> &str {
-        &self.cfg.id
+        &self.archive.id
     }
 
     fn source_kind(&self) -> SourceKind {
@@ -317,29 +364,31 @@ impl TileSource for MbtilesSource {
         query: Option<&TileQuery<'_>>,
     ) -> MaptileResult<TileResponse> {
         validate_source_request(self, &[xyz], query)?;
-        self.check_file()?;
+        self.archive.check().await?;
+        let cleanup = crate::control::cleanup_runtime()?;
         let pool = self.pool.clone();
-        let checkout = CheckoutLease {
-            worker_started: Cell::new(false),
+        let lease = ConnectionLease {
+            completion_unconfirmed: Cell::new(false),
             read: SOURCE_READ_LEASE.try_with(Arc::clone).ok(),
             build: CATALOG_BUILD_LEASE.try_with(Arc::clone).ok(),
         };
         // The SQLite worker may start before the pool can return its connection.
-        let mut connection = tokio::spawn(CHECKOUT_LEASE.scope(checkout, async move {
-            let result = pool.acquire().await;
+        let checkout = CHECKOUT_LEASE.scope(lease, async move { pool.acquire().await });
+        let connection = tokio::spawn(async move {
+            let mut checkout = std::pin::pin!(checkout);
+            let result = checkout.as_mut().await;
+            let lease = checkout.take_value().expect("checkout lease is present");
             if !matches!(result, Err(mbtiles::sqlx::Error::PoolTimedOut)) {
-                CHECKOUT_LEASE.with(|lease| lease.worker_started.set(false));
+                lease.completion_unconfirmed.set(false);
             }
-            result
-        }))
+            result.map(|connection| UncheckedConnection {
+                pending: Some((connection, lease)),
+                cleanup,
+            })
+        })
         .await
         .map_err(MaptileError::backend)?;
-        if let Err(error) = self.check_file() {
-            if let Ok(connection) = &mut connection {
-                connection.close_on_drop();
-            }
-            return Err(error);
-        }
+        self.archive.check().await?;
         let mut connection = connection.map_err(|error| match error {
             mbtiles::sqlx::Error::PoolClosed => MaptileError::Cancelled,
             mbtiles::sqlx::Error::PoolTimedOut => MaptileError::CapacityExhausted,
@@ -355,13 +404,10 @@ impl TileSource for MbtilesSource {
         .bind(i64::from(xyz.z))
         .bind(i64::from(xyz.x))
         .bind(i64::from(mbtiles::invert_y_value(xyz.z, xyz.y)))
-        .fetch_optional(&mut *connection)
+        .fetch_optional(connection.get_mut())
         .await;
-        if let Err(error) = self.check_file() {
-            connection.close_on_drop();
-            return Err(error);
-        }
-        drop(connection);
+        self.archive.check().await?;
+        connection.release();
         let missing = MaptileError::TileNotFound(xyz.z, xyz.x, xyz.y);
         let Some((kind, size, data)) = row.map_err(MaptileError::backend)? else {
             return Err(missing);
@@ -385,17 +431,13 @@ impl TileSource for MbtilesSource {
         if encoding.is_encoded() {
             decode_async(data.clone(), encoding).await?;
         }
+        let stamp = &self.archive.stamp;
         Ok(TileResponse {
             data,
             info: self.info.encoding(encoding),
-            last_modified: Some(
-                self.stamp
-                    .wal
-                    .as_ref()
-                    .map_or(self.stamp.main.modified, |wal| {
-                        self.stamp.main.modified.max(wal.modified)
-                    }),
-            ),
+            last_modified: Some(stamp.wal.as_ref().map_or(stamp.main.modified, |wal| {
+                stamp.main.modified.max(wal.modified)
+            })),
         })
     }
 }
@@ -407,6 +449,7 @@ mod tests {
     use crate::control::CatalogService;
     use crate::service::{ReadTarget, TileStack};
     use mbtiles::sqlx::sqlite::SqlitePoolOptions;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Notify;
     use tokio::time::{Duration, Instant, timeout};
 
@@ -443,6 +486,200 @@ mod tests {
         service.catalog().publish(update).unwrap();
         let stack = TileStack::builder(service.clone()).build();
         (service, stack)
+    }
+
+    #[test]
+    fn changed_archive_check_waits_for_blocking_budget() {
+        const CHILD: &str = "MAPTILE_MBTILES_BLOCKING_BUDGET_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "sources::mbtiles::tests::changed_archive_check_waits_for_blocking_budget",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        crate::transport::configure_blocking_concurrency(1).unwrap();
+        let budget_owner = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .build()
+            .unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (archive, source) = open_fixture().await;
+                archive.close().unwrap();
+                let (entered, started) = tokio::sync::oneshot::channel();
+                let (release, wait) = std::sync::mpsc::channel();
+                let job = budget_owner.spawn(run_blocking(move || {
+                    entered.send(()).unwrap();
+                    wait.recv().unwrap();
+                    Ok(())
+                }));
+                timeout(Duration::from_secs(3), started)
+                    .await
+                    .unwrap()
+                    .unwrap();
+
+                let read = source.get_tile(TileCoord { z: 0, x: 0, y: 0 }, None);
+                tokio::pin!(read);
+                assert!(futures_util::poll!(read.as_mut()).is_pending());
+                // The request must wait for admission while this runtime's blocking worker is free.
+                tokio::task::spawn_blocking(|| ()).await.unwrap();
+                assert!(futures_util::poll!(read.as_mut()).is_pending());
+                release.send(()).unwrap();
+                assert!(matches!(
+                    timeout(Duration::from_secs(3), read).await.unwrap(),
+                    Err(MaptileError::VersionChanged(id)) if id == "sqlite"
+                ));
+                job.await.unwrap().unwrap();
+            });
+    }
+
+    fn pause_first_checkout(
+        source: &mut MbtilesSource,
+    ) -> (Arc<Notify>, Arc<Notify>, Arc<AtomicUsize>) {
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let opens = Arc::new(AtomicUsize::new(0));
+        source.pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .after_connect({
+                let (entered, release, opens) = (entered.clone(), release.clone(), opens.clone());
+                move |_, _| {
+                    let first = opens.fetch_add(1, Ordering::Relaxed) == 0;
+                    let (entered, release) = (entered.clone(), release.clone());
+                    Box::pin(async move {
+                        if first {
+                            entered.notify_one();
+                            release.notified().await;
+                        }
+                        Ok(())
+                    })
+                }
+            })
+            .connect_lazy_with((*source.pool.connect_options()).clone());
+        (entered, release, opens)
+    }
+
+    #[tokio::test]
+    async fn cancelled_checkout_discards_unchecked_connection() {
+        let (_archive, mut source) = open_fixture().await;
+        let (entered, release, opens) = pause_first_checkout(&mut source);
+        let pool = source.pool.clone();
+        let read =
+            tokio::spawn(
+                async move { source.get_tile(TileCoord { z: 0, x: 0, y: 0 }, None).await },
+            );
+        timeout(Duration::from_secs(3), entered.notified())
+            .await
+            .unwrap();
+        read.abort();
+        assert!(read.await.unwrap_err().is_cancelled());
+        release.notify_one();
+        let connection = timeout(Duration::from_secs(3), pool.acquire())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(opens.load(Ordering::Relaxed), 2);
+        drop(connection);
+        pool.close().await;
+    }
+
+    #[test]
+    fn dropping_a_pending_archive_check_outside_tokio_closes_the_connection() {
+        use std::task::{Context, Wake, Waker};
+
+        struct CheckoutReady(Notify);
+        impl Wake for CheckoutReady {
+            fn wake(self: Arc<Self>) {
+                self.0.notify_one();
+            }
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (_archive, mut source) = runtime.block_on(open_fixture());
+        let (entered, release, opens) =
+            runtime.block_on(async { pause_first_checkout(&mut source) });
+        let coord = TileCoord { z: 0, x: 0, y: 0 };
+        let mut read = source.get_tile(coord, None);
+        runtime.block_on(async {
+            timeout(Duration::from_secs(3), async {
+                tokio::select! {
+                    () = entered.notified() => {},
+                    result = read.as_mut() => panic!("read finished during checkout: {result:?}"),
+                }
+            })
+            .await
+            .unwrap();
+        });
+
+        let (started, waiting) = tokio::sync::oneshot::channel();
+        let (unblock, blocked) = std::sync::mpsc::channel();
+        runtime.spawn_blocking(move || {
+            started.send(()).unwrap();
+            let _ = blocked.recv();
+        });
+        runtime.block_on(async {
+            timeout(Duration::from_secs(3), waiting)
+                .await
+                .unwrap()
+                .unwrap()
+        });
+
+        let ready = Arc::new(CheckoutReady(Notify::new()));
+        let waker = Waker::from(ready.clone());
+        let mut context = Context::from_waker(&waker);
+        {
+            let _runtime = runtime.enter();
+            assert!(read.as_mut().poll(&mut context).is_pending());
+        }
+        release.notify_one();
+        runtime.block_on(async {
+            timeout(Duration::from_secs(3), ready.0.notified())
+                .await
+                .unwrap()
+        });
+        {
+            let _runtime = runtime.enter();
+            assert!(read.as_mut().poll(&mut context).is_pending());
+        }
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        drop(read);
+        unblock.send(()).unwrap();
+        drop(runtime);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let tile = timeout(Duration::from_secs(3), source.get_tile(coord, None))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(tile.data.is_empty());
+            assert_eq!(opens.load(Ordering::Relaxed), 2);
+            source.close().await.unwrap();
+        });
     }
 
     #[tokio::test]

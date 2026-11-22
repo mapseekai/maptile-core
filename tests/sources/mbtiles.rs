@@ -171,6 +171,96 @@ mod mbtiles {
     }
 
     #[tokio::test]
+    async fn png_archive_rejects_raster_style_before_layers_and_batch_reads() {
+        use maptile_core::{
+            cache::{StyleHash, TileCache},
+            control::CatalogService,
+            error::MaptileResult,
+            raster::style::EffectiveStyle,
+            service::{
+                ReadTarget, TileLayer, TileOutcome, TileService, TileStack, ValidatedTileRequest,
+            },
+            sources::TileQuery,
+        };
+        use std::sync::Arc;
+
+        struct UnreachableLayer;
+        #[async_trait::async_trait]
+        impl TileLayer for UnreachableLayer {
+            async fn read(
+                &self,
+                _: &ValidatedTileRequest<'_>,
+                _: TileService<'_>,
+            ) -> MaptileResult<TileOutcome> {
+                panic!("style admission must precede layers")
+            }
+        }
+
+        let fixture = fixture();
+        let source = Arc::new(
+            MbtilesSource::open(MbtilesConfig {
+                id: "archive".into(),
+                path: fixture.path().to_path_buf(),
+                serve_as: None,
+                description: None,
+            })
+            .await
+            .unwrap(),
+        );
+        assert_eq!(source.tile_info().format, TileFormat::Png);
+        let service = Arc::new(CatalogService::new(TileCache::new(1, None, None).unwrap()));
+        let mut update = service.catalog().update();
+        update.put(source.clone()).unwrap();
+        service.catalog().publish(update).unwrap();
+        let coord = TileCoord { z: 0, x: 0, y: 0 };
+        let target = ReadTarget::new("archive", "public");
+        let stack = TileStack::builder(service.clone()).build();
+        let original = stack.read(target.at(coord)).await.unwrap();
+        let layered = TileStack::builder(service).layer(UnreachableLayer).build();
+        let document = raster_style::Style::from_json(
+            r#"{"version":"3.0","renderer":{"type":"gray","bidx":[1]}}"#,
+        )
+        .unwrap();
+        let style = EffectiveStyle::from_raster_style(document).unwrap();
+
+        for query in [
+            TileQuery {
+                style: Some(&style),
+                ..Default::default()
+            },
+            TileQuery {
+                style_hash: Some(StyleHash::from_bytes([7; 32])),
+                ..Default::default()
+            },
+        ] {
+            let styled = ReadTarget {
+                query: Some(&query),
+                ..target
+            };
+            let errors = [
+                layered.read(styled.at(coord)).await.unwrap_err(),
+                stack.read_batch(styled, &[coord]).await.unwrap_err(),
+                source.get_tile(coord, Some(&query)).await.unwrap_err(),
+                source
+                    .read_tile_batch(&[coord], Some(&query))
+                    .await
+                    .unwrap_err(),
+                source
+                    .get_tile_with_etag(coord, Some(&query), None)
+                    .await
+                    .unwrap_err(),
+            ];
+            assert!(
+                errors
+                    .into_iter()
+                    .all(|error| matches!(error, MaptileError::Unsupported(_)))
+            );
+        }
+        let warm = stack.read(target.at(coord)).await.unwrap();
+        assert_eq!(warm.tile().unwrap().data, original.tile().unwrap().data);
+    }
+
+    #[tokio::test]
     async fn get_tile_returns_not_found_for_missing_coord() {
         let fixture = fixture();
         let cfg = MbtilesConfig {

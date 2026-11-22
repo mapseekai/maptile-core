@@ -14,7 +14,11 @@
 //! registered) before the group exists, so the snapshot is complete; on cold
 //! start the server's preload builds vector_group sources last.
 
-use std::sync::{Arc, Weak};
+use std::{
+    any::Any,
+    collections::HashMap,
+    sync::{Arc, Weak},
+};
 
 use tilejson::{TileJSON, tilejson};
 
@@ -29,6 +33,78 @@ use crate::sources::{
 tokio::task_local! {
     // Each nested future scopes its own path, so sibling DAG branches do not conflict.
     static RESOLUTION_PATH: Vec<usize>;
+    // Read the same member instances whose style capabilities were checked.
+    static STYLE_MEMBERS: PinnedStyleMembers;
+}
+
+type ResolvedComposite = Option<(Arc<SourceManager>, Arc<CompositeSource>)>;
+type PinnedStyleMembers = HashMap<usize, (StyleMembers, bool)>;
+
+enum StyleMembers {
+    Fixed,
+    Live(ResolvedComposite),
+}
+
+pub(super) fn needs_raster_style_members(
+    source: &dyn TileSource,
+    query: Option<&TileQuery<'_>>,
+) -> bool {
+    query.is_some_and(TileQuery::has_raster_style)
+        && !STYLE_MEMBERS
+            .try_with(|members| members.contains_key(&std::ptr::from_ref(source).addr()))
+            .unwrap_or(false)
+        && !source.supports_catalog_raster_style()
+}
+
+pub(super) async fn with_raster_style_members<T>(
+    source: &dyn TileSource,
+    read: impl Future<Output = MaptileResult<T>>,
+) -> MaptileResult<T> {
+    let mut members = HashMap::new();
+    if !pin_style_members(source, &mut members, &mut Vec::new())? {
+        return Err(unsupported_raster_style(source.id()));
+    }
+    STYLE_MEMBERS.scope(members, read).await
+}
+
+fn pin_style_members(
+    source: &dyn TileSource,
+    members: &mut PinnedStyleMembers,
+    path: &mut Vec<usize>,
+) -> MaptileResult<bool> {
+    let identity = std::ptr::from_ref(source).addr();
+    if let Some((_, has_leaf)) = members.get(&identity) {
+        return Ok(*has_leaf);
+    }
+    let any = source as &dyn Any;
+    let resolved = if let Some(source) = any.downcast_ref::<LazyCompositeSource>() {
+        source.push_path(path)?;
+        let snapshot = snapshot(&source.id, &source.member_ids, &source.manager)?;
+        let has_leaf = if let Some((_, composite)) = &snapshot {
+            pin_style_members(composite.as_ref(), members, path)?
+        } else {
+            false
+        };
+        path.pop();
+        (StyleMembers::Live(snapshot), has_leaf)
+    } else if let Some(composite) = any.downcast_ref::<CompositeSource>() {
+        let mut has_leaf = false;
+        for child in composite.children() {
+            has_leaf |= pin_style_members(child.source.as_ref(), members, path)?;
+        }
+        (StyleMembers::Fixed, has_leaf)
+    } else if source.supports_raster_style() {
+        return Ok(true);
+    } else {
+        return Err(unsupported_raster_style(source.id()));
+    };
+    let has_leaf = resolved.1;
+    members.insert(identity, resolved);
+    Ok(has_leaf)
+}
+
+fn unsupported_raster_style(id: &str) -> MaptileError {
+    MaptileError::Unsupported(format!("{id} cannot apply raster style"))
 }
 
 pub struct LazyCompositeSource {
@@ -53,11 +129,7 @@ impl LazyCompositeSource {
         }
     }
 
-    async fn guard_cycle<T>(
-        &self,
-        read: impl std::future::Future<Output = MaptileResult<T>>,
-    ) -> MaptileResult<T> {
-        let mut path = RESOLUTION_PATH.try_with(Clone::clone).unwrap_or_default();
+    fn push_path(&self, path: &mut Vec<usize>) -> MaptileResult<()> {
         // A static composite can retain an older instance with the same source id.
         let instance = std::ptr::from_ref(self).addr();
         if path.contains(&instance) {
@@ -72,7 +144,36 @@ impl LazyCompositeSource {
             ));
         }
         path.push(instance);
+        Ok(())
+    }
+
+    async fn read_in_scope<T>(
+        &self,
+        query: Option<&TileQuery<'_>>,
+        read: impl Future<Output = MaptileResult<T>>,
+    ) -> MaptileResult<T> {
+        let mut path = RESOLUTION_PATH.try_with(Clone::clone).unwrap_or_default();
+        self.push_path(&mut path)?;
+        if needs_raster_style_members(self, query) {
+            return RESOLUTION_PATH
+                .scope(path, Box::pin(with_raster_style_members(self, read)))
+                .await;
+        }
         RESOLUTION_PATH.scope(path, read).await
+    }
+
+    fn read_snapshot(&self, query: Option<&TileQuery<'_>>) -> MaptileResult<ResolvedComposite> {
+        if query.is_some_and(TileQuery::has_raster_style)
+            && let Ok(Some(pinned)) = STYLE_MEMBERS.try_with(|members| {
+                match members.get(&std::ptr::from_ref(self).addr()) {
+                    Some((StyleMembers::Live(snapshot), _)) => Some(snapshot.clone()),
+                    _ => None,
+                }
+            })
+        {
+            return Ok(pinned);
+        }
+        snapshot(&self.id, &self.member_ids, &self.manager)
     }
 }
 
@@ -83,7 +184,7 @@ fn snapshot(
     id: &str,
     member_ids: &[String],
     manager: &Weak<SourceManager>,
-) -> MaptileResult<Option<(Arc<SourceManager>, CompositeSource)>> {
+) -> MaptileResult<ResolvedComposite> {
     let mgr = manager
         .upgrade()
         .ok_or_else(|| MaptileError::Config("source manager dropped".into()))?;
@@ -104,7 +205,7 @@ fn snapshot(
             Ok(None)
         };
     }
-    CompositeSource::new(id, children).map(|composite| Some((mgr, composite)))
+    CompositeSource::new(id, children).map(|composite| Some((mgr, Arc::new(composite))))
 }
 
 fn read_member<'a>(
@@ -157,6 +258,12 @@ impl TileSource for LazyCompositeSource {
     fn supports_url_query(&self) -> bool {
         true
     }
+    fn supports_raster_style(&self) -> bool {
+        true
+    }
+    fn supports_catalog_raster_style(&self) -> bool {
+        false
+    }
 
     fn cache_zoom(&self) -> crate::cache::CacheZoomRange {
         // Member registrations may change between key construction, rendering,
@@ -171,8 +278,9 @@ impl TileSource for LazyCompositeSource {
         query: Option<&TileQuery<'_>>,
     ) -> MaptileResult<TileResponse> {
         super::tile_math::validate_tile_request(&[xyz], query)?;
-        self.guard_cycle(async {
-            let (manager, composite) = snapshot(&self.id, &self.member_ids, &self.manager)?
+        self.read_in_scope(query, async {
+            let (manager, composite) = self
+                .read_snapshot(query)?
                 .ok_or(MaptileError::TileNotFound(xyz.z, xyz.x, xyz.y))?;
             composite
                 .get_tile_with(xyz, query, |source, query| {
@@ -189,12 +297,11 @@ impl TileSource for LazyCompositeSource {
         query: Option<&TileQuery<'_>>,
     ) -> MaptileResult<Vec<TileResponse>> {
         super::tile_math::validate_tile_request(coords, query)?;
-        if coords.is_empty() {
+        if coords.is_empty() && !query.is_some_and(TileQuery::has_raster_style) {
             return Ok(Vec::new());
         }
-        self.guard_cycle(async {
-            let Some((_manager, composite)) = snapshot(&self.id, &self.member_ids, &self.manager)?
-            else {
+        self.read_in_scope(query, async {
+            let Some((_manager, composite)) = self.read_snapshot(query)? else {
                 return Ok(coords
                     .iter()
                     .map(|_| TileResponse {
@@ -216,8 +323,9 @@ impl TileSource for LazyCompositeSource {
         if_none_match: Option<&str>,
     ) -> MaptileResult<TileEtagResponse> {
         super::tile_math::validate_tile_request(&[xyz], query)?;
-        self.guard_cycle(async {
-            let (manager, composite) = snapshot(&self.id, &self.member_ids, &self.manager)?
+        self.read_in_scope(query, async {
+            let (manager, composite) = self
+                .read_snapshot(query)?
                 .ok_or(MaptileError::TileNotFound(xyz.z, xyz.x, xyz.y))?;
             let resp = composite
                 .get_tile_with(xyz, query, |source, query| {

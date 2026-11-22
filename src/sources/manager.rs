@@ -535,7 +535,7 @@ impl SourceManager {
             let cached_style = query.and_then(|q| q.style);
             let cached_selection = effective_selection;
             return cache
-                .get_or_insert(key, move || async move {
+                .get_or_insert_validated(key, async move {
                     let inner = TileQuery {
                         style: cached_style,
                         style_hash: query.and_then(|q| q.style_hash),
@@ -543,12 +543,9 @@ impl SourceManager {
                         ..TileQuery::default()
                     };
                     let inner = (query.is_some() || cached_selection.is_some()).then_some(&inner);
-                    let tile = source_for_compute.get_tile(xyz, inner).await?;
-                    check_tile_size(&tile)?;
-                    Ok::<_, MaptileError>(tile)
+                    source_for_compute.get_tile(xyz, inner).await
                 })
-                .await
-                .map_err(|arc_err: std::sync::Arc<MaptileError>| (*arc_err).clone());
+                .await;
         }
 
         let tile = source.get_tile(xyz, query).await?;
@@ -654,6 +651,7 @@ mod tests {
         id: String,
         tj: tilejson::TileJSON,
         calls: Arc<AtomicUsize>,
+        raster_style: bool,
         mosaic_selection: Option<MosaicPixelSelection>,
         seen_selection: Arc<Mutex<Vec<Option<MosaicPixelSelection>>>>,
         on_close: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -666,6 +664,9 @@ mod tests {
         }
         fn supports_filter(&self) -> bool {
             true
+        }
+        fn supports_raster_style(&self) -> bool {
+            self.raster_style
         }
         fn id(&self) -> &str {
             &self.id
@@ -684,6 +685,7 @@ mod tests {
                 id: self.id.clone(),
                 tj: self.tj.clone(),
                 calls: self.calls.clone(),
+                raster_style: self.raster_style,
                 mosaic_selection: self.mosaic_selection,
                 seen_selection: self.seen_selection.clone(),
                 on_close: self.on_close.clone(),
@@ -724,6 +726,7 @@ mod tests {
             id: id.into(),
             tj: tilejson! { tiles: vec![] },
             calls: calls.clone(),
+            raster_style: false,
             mosaic_selection: None,
             seen_selection: Arc::new(Mutex::new(Vec::new())),
             on_close: None,
@@ -1153,6 +1156,7 @@ mod tests {
             id: id.into(),
             tj: tilejson! { tiles: vec![] },
             calls: calls.clone(),
+            raster_style: true,
             mosaic_selection: Some(fallback),
             seen_selection: seen_selection.clone(),
             on_close: None,
@@ -1361,7 +1365,8 @@ mod tests {
         let mgr = SourceManager::new().with_cache(Arc::new(
             TileCache::new(1, Some(Duration::from_secs(3600)), None).unwrap(),
         ));
-        let (src, calls) = counting_source("a");
+        let (mut src, calls) = counting_source("a");
+        Arc::get_mut(&mut src).unwrap().raster_style = true;
         mgr.register(src);
 
         let style_a = complete_style(
@@ -1934,6 +1939,7 @@ mod tests {
             id: "z".into(),
             tj: tilejson::tilejson! { tiles: vec![] },
             calls: calls.clone(),
+            raster_style: false,
             mosaic_selection: None,
             seen_selection: Arc::new(Mutex::new(Vec::new())),
             on_close: None,

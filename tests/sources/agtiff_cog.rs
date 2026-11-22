@@ -2,6 +2,7 @@
 #[path = "../common/raster.rs"]
 mod raster_fixture;
 
+use axum::http::{HeaderMap, header};
 use maptile_core::sources::{AsyncCogSource, AsyncCogSourceConfig, CogObjectSource, TileSource};
 use std::sync::Arc;
 
@@ -45,6 +46,82 @@ async fn opens_geotiff_and_queries_pixel_without_gdal() {
         .unwrap();
     assert!(point.valid);
     assert_eq!(point.values, vec![73.0]);
+}
+
+#[cfg(unix)]
+#[test]
+fn cleanup_runtime_retries_after_fd_limit_is_restored() {
+    use maptile_core::{error::MaptileError, sources::RasterPointQuery};
+    use object_store::{ObjectStoreExt, memory::InMemory, path::Path};
+
+    const CHILD: &str = "MAPTILE_TEST_COG_CLEANUP_LIMIT_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "cleanup_runtime_retries_after_fd_limit_is_restored",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let store = Arc::new(InMemory::new());
+            let key = Path::from("point.tif");
+            let data = bytes::Bytes::from_static(include_bytes!("../fixtures/cog_uint8_rgb.tif"));
+            store.put(&key, data.into()).await.unwrap();
+            let source = AsyncCogSource::open(cog_config(CogObjectSource::ObjectStore {
+                store,
+                key: key.to_string(),
+            }))
+            .await
+            .unwrap();
+            let bounds = source.tilejson().bounds.unwrap();
+            let point = RasterPointQuery {
+                x: (bounds.left + bounds.right) / 2.0,
+                y: (bounds.bottom + bounds.top) / 2.0,
+                coord_crs: "EPSG:4326".into(),
+                bidx: vec![1],
+            };
+
+            let mut original = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            // SAFETY: The writable limit structure lives through the call.
+            let status = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut original) };
+            assert_eq!(status, 0);
+            let exhausted = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: original.rlim_max,
+            };
+            // SAFETY: The limit pointer is valid and only the child changes its own soft limit.
+            let status = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &exhausted) };
+            assert_eq!(status, 0);
+            let first = source.query_raster_point(&point).await;
+            // SAFETY: The original limit structure is valid and the hard limit is preserved.
+            let status = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &original) };
+            assert_eq!(status, 0);
+            assert!(
+                matches!(&first, Err(MaptileError::SourceUnavailable(message))
+                    if message.starts_with("cannot start cleanup runtime")),
+                "{first:?}"
+            );
+            assert!(source.query_raster_point(&point).await.unwrap().valid);
+        });
 }
 
 #[tokio::test]
@@ -199,61 +276,142 @@ async fn remote_cog_replacement_preserves_the_version_error() {
     assert_eq!(error.kind(), ErrorKind::VersionChanged);
 }
 
-#[tokio::test]
-async fn http_cog_rechecks_successful_ranges_when_server_ignores_if_match() {
-    use axum::{
-        Router,
-        http::{HeaderMap, StatusCode, header},
-        routing::get,
-    };
-    use maptile_core::{error::ErrorKind, sources::RasterPointQuery};
-    use std::sync::atomic::{AtomicBool, Ordering};
+async fn start_cog_range_server<F: Future<Output = ()> + Send + 'static>(
+    before_response: impl Fn(&HeaderMap, &mut HeaderMap) -> F + Clone + Send + Sync + 'static,
+) -> (String, tokio::task::JoinHandle<()>) {
+    use axum::{Router, http::StatusCode, routing::get};
+
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("point.tif");
     raster_fixture::write_world_tiff(&path, |_| 73);
     let data = bytes::Bytes::from(std::fs::read(path).unwrap());
-    let changed = Arc::new(AtomicBool::new(false));
-    let handler = {
-        let changed = changed.clone();
-        move |headers: HeaderMap| {
-            let (data, changed) = (data.clone(), changed.clone());
-            async move {
-                let (a, b) = headers[header::RANGE]
-                    .to_str()
-                    .unwrap()
-                    .strip_prefix("bytes=")
-                    .unwrap()
-                    .split_once('-')
-                    .unwrap();
-                let start: usize = a.parse().unwrap();
-                let end = b.parse::<usize>().unwrap().min(data.len() - 1);
-                let mut out = HeaderMap::new();
-                if changed.load(Ordering::Acquire) {
-                    assert_eq!(headers[header::IF_MATCH], "\"one\"");
-                    out.append(header::ETAG, "\"one\"".parse().unwrap());
-                    out.append(header::ETAG, "\"two\"".parse().unwrap());
-                } else {
-                    out.insert(header::ETAG, "\"one\"".parse().unwrap());
-                }
-                out.insert(
-                    header::CONTENT_RANGE,
-                    format!("bytes {start}-{end}/{}", data.len())
-                        .parse()
-                        .unwrap(),
-                );
-                (StatusCode::PARTIAL_CONTENT, out, data.slice(start..=end))
-            }
+    let handler = move |headers: HeaderMap| {
+        let data = data.clone();
+        let before_response = before_response.clone();
+        async move {
+            assert_eq!(headers[header::ACCEPT_ENCODING], "identity");
+            let (a, b) = headers[header::RANGE]
+                .to_str()
+                .unwrap()
+                .strip_prefix("bytes=")
+                .unwrap()
+                .split_once('-')
+                .unwrap();
+            let start: usize = a.parse().unwrap();
+            let end = b.parse::<usize>().unwrap().min(data.len() - 1);
+            let mut out = HeaderMap::new();
+            out.insert(header::ETAG, "\"one\"".parse().unwrap());
+            out.insert(
+                header::CONTENT_RANGE,
+                format!("bytes {start}-{end}/{}", data.len())
+                    .parse()
+                    .unwrap(),
+            );
+            before_response(&headers, &mut out).await;
+            (StatusCode::PARTIAL_CONTENT, out, data.slice(start..=end))
         }
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let app = Router::new().route("/signed.tif", get(handler));
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let source = AsyncCogSource::open(cog_config(CogObjectSource::Http(format!(
-        "http://{addr}/signed.tif?version=one"
-    ))))
-    .await
-    .unwrap();
+    (format!("http://{addr}/signed.tif?version=one"), server)
+}
+
+#[tokio::test]
+async fn cancelled_cog_point_releases_catalog_while_range_is_pending() {
+    use maptile_core::{
+        cache::TileCache,
+        control::CatalogService,
+        error::MaptileError,
+        service::{ReadTarget, TileStack},
+        sources::RasterPointQuery,
+    };
+    use std::{sync::OnceLock, time::Duration};
+    use tokio::{sync::Notify, time::Instant};
+    use tokio_util::sync::CancellationToken;
+
+    let gate = Arc::new(OnceLock::<(Notify, Notify)>::new());
+    let (url, server) = start_cog_range_server({
+        let gate = gate.clone();
+        move |_, _| {
+            let gate = gate.clone();
+            async move {
+                if let Some((entered, release)) = gate.get() {
+                    entered.notify_one();
+                    release.notified().await;
+                }
+            }
+        }
+    })
+    .await;
+    let source = AsyncCogSource::open(cog_config(CogObjectSource::Http(url)))
+        .await
+        .unwrap();
+    let engine = Arc::new(CatalogService::new(TileCache::new(1, None, None).unwrap()));
+    let mut update = engine.catalog().update();
+    update.put(Arc::new(source)).unwrap();
+    engine.catalog().publish(update).unwrap();
+    let stack = TileStack::builder(engine.clone()).build();
+    let point = RasterPointQuery {
+        x: 0.0,
+        y: 0.0,
+        coord_crs: "EPSG:4326".into(),
+        bidx: vec![1],
+    };
+    gate.set((Notify::new(), Notify::new())).unwrap();
+    let (entered, release) = gate.get().unwrap();
+
+    let cancel = CancellationToken::new();
+    let target = ReadTarget::new("portable-cog", "public");
+    let mut read = Box::pin(stack.raster_point(
+        ReadTarget {
+            cancellation: Some(&cancel),
+            ..target
+        },
+        &point,
+    ));
+    tokio::select! {
+        result = read.as_mut() => panic!("point read finished before entering the range request: {result:?}"),
+        reached = tokio::time::timeout(Duration::from_secs(5), entered.notified()) => reached.unwrap(),
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    cancel.cancel();
+    assert!(matches!(
+        tokio::time::timeout_at(deadline, read).await.unwrap(),
+        Err(MaptileError::Cancelled)
+    ));
+    let observed = engine.catalog().snapshot();
+    engine
+        .catalog()
+        .revoke(&observed, target.source, deadline)
+        .await
+        .unwrap();
+    release.notify_one();
+    server.abort();
+}
+
+#[tokio::test]
+async fn http_cog_rechecks_successful_ranges_when_server_ignores_if_match() {
+    use maptile_core::{error::ErrorKind, sources::RasterPointQuery};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let changed = Arc::new(AtomicBool::new(false));
+    let (url, server) = start_cog_range_server({
+        let changed = changed.clone();
+        move |headers, out| {
+            if changed.load(Ordering::Acquire) {
+                assert_eq!(headers[header::IF_MATCH], "\"one\"");
+                out.append(header::ETAG, "\"two\"".parse().unwrap());
+            }
+            std::future::ready(())
+        }
+    })
+    .await;
+    let source = AsyncCogSource::open(cog_config(CogObjectSource::Http(url)))
+        .await
+        .unwrap();
     changed.store(true, Ordering::Release);
     let error = source
         .query_raster_point(&RasterPointQuery {
@@ -269,13 +427,67 @@ async fn http_cog_rechecks_successful_ranges_when_server_ignores_if_match() {
 }
 
 #[tokio::test]
-async fn cog_rejects_an_http_object_without_a_strong_validator() {
-    use axum::{
-        Router,
-        extract::Path,
-        http::{HeaderMap, StatusCode, header},
-        routing::get,
+async fn http_cog_rejects_encoded_probe_and_data_ranges() {
+    use maptile_core::{
+        error::{ErrorKind, MaptileError},
+        sources::RasterPointQuery,
     };
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering::Relaxed},
+    };
+
+    let point = RasterPointQuery {
+        x: 0.0,
+        y: 0.0,
+        coord_crs: "EPSG:4326".into(),
+        bidx: vec![1],
+    };
+    let identity = &["iDeNtItY,\tIDENTITY", "identity"][..];
+    for encoded in [&["gzip"][..], &["identity", "gzip"], &["identity, BR"]] {
+        let codings = Arc::new(Mutex::new(encoded));
+        let conditional_reads = Arc::new(AtomicUsize::new(0));
+        let (url, server) = start_cog_range_server({
+            let (codings, conditional_reads) = (codings.clone(), conditional_reads.clone());
+            move |request, response| {
+                if let Some(if_match) = request.get(header::IF_MATCH) {
+                    assert_eq!(if_match, "\"one\"");
+                    conditional_reads.fetch_add(1, Relaxed);
+                } else {
+                    assert_eq!(request[header::RANGE], "bytes=0-0");
+                }
+                for &coding in *codings.lock().unwrap() {
+                    response.append(header::CONTENT_ENCODING, coding.parse().unwrap());
+                }
+                std::future::ready(())
+            }
+        })
+        .await;
+        let open = || AsyncCogSource::open(cog_config(CogObjectSource::Http(url.clone())));
+        assert!(matches!(open().await, Err(MaptileError::Config(_))));
+        assert_eq!(conditional_reads.load(Relaxed), 0);
+
+        *codings.lock().unwrap() = identity;
+        let source = open().await.unwrap();
+        let reads_at_open = conditional_reads.load(Relaxed);
+        assert!(reads_at_open > 0);
+
+        *codings.lock().unwrap() = encoded;
+        let error = source.query_raster_point(&point).await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Backend);
+        assert!(conditional_reads.load(Relaxed) > reads_at_open);
+
+        *codings.lock().unwrap() = identity;
+        let recovered = source.query_raster_point(&point).await.unwrap();
+        assert!(recovered.valid);
+        assert_eq!(recovered.values, vec![73.0]);
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn cog_rejects_an_http_object_without_a_strong_validator() {
+    use axum::{Router, extract::Path, http::StatusCode, routing::get};
     use maptile_core::error::MaptileError;
     use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 

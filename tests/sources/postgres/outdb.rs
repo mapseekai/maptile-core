@@ -2,6 +2,8 @@
 
 use super::common;
 use maptile_core::{
+    cache::CacheZoomRange,
+    error::MaptileError,
     raster::style::EffectiveStyle,
     sources::{
         TileCoord, TileQuery, TileSource,
@@ -75,6 +77,25 @@ async fn quoted_schema_and_function_render_real_raster() {
     let source = PostgresOutDbRasterSource::new(pool.clone(), &config)
         .await
         .unwrap();
+    assert!(source.cache_zoom().is_disabled());
+    let mut config = config;
+    config.cache_zoom = Some(CacheZoomRange::disabled());
+    let explicitly_disabled = PostgresOutDbRasterSource::new(pool.clone(), &config)
+        .await
+        .unwrap();
+    assert!(explicitly_disabled.cache_zoom().is_disabled());
+    for range in [
+        CacheZoomRange::default(),
+        CacheZoomRange::new(Some(4), Some(14)),
+    ] {
+        config.cache_zoom = Some(range);
+        let error = PostgresOutDbRasterSource::new(pool.clone(), &config)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, MaptileError::Config(message) if message.contains("Remove cache_zoom"))
+        );
+    }
     pool.get()
         .await
         .unwrap()

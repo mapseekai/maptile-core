@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures_util::{
-    StreamExt,
+    StreamExt, TryStreamExt,
     stream::{self, BoxStream},
 };
 use object_store::{
@@ -25,6 +25,8 @@ use object_store::{
 use super::agtiff_request::ACTIVE_RASTER_REQUEST;
 use crate::error::{MaptileError, MaptileResult};
 use crate::transport::CATALOG_BUILD_LEASE;
+
+const LOCAL_READ_CHUNK_BYTES: u64 = 256 * 1024;
 
 /// async-geotiff checks each range internally, but erases transport errors before returning them.
 /// Observe the same responses to preserve a lost revision as a domain error.
@@ -55,13 +57,14 @@ impl RemoteSnapshot {
     }
 
     pub(super) async fn http(url: &str) -> MaptileResult<(Self, String)> {
-        use reqwest::{Client, StatusCode, header};
+        use reqwest::{StatusCode, header};
         let invalid = || {
             MaptileError::Config("HTTP COG requires a single-byte range and a strong ETag".into())
         };
         let url = url.to_owned();
         let client = crate::transport::run_blocking(|| {
-            Client::builder()
+            super::range_http_client_builder()
+                .connect_timeout(Duration::from_secs(10))
                 .timeout(Duration::from_secs(30))
                 .build()
                 .map_err(|_| MaptileError::Config("cannot build HTTP COG client".into()))
@@ -70,7 +73,6 @@ impl RemoteSnapshot {
         let response = client
             .get(url)
             .header(header::RANGE, "bytes=0-0")
-            .header(header::ACCEPT_ENCODING, "identity")
             .send()
             .await
             .map_err(|_| invalid())?;
@@ -80,6 +82,9 @@ impl RemoteSnapshot {
         let etag = super::strong_http_etag(response.headers())
             .ok_or_else(invalid)?
             .to_owned();
+        if !super::has_identity_content_encoding(response.headers()) {
+            return Err(MaptileError::Config("encoded HTTP COG range".into()));
+        }
         let url = response.url().clone();
         let identity = crate::cache::ContentVersion::from_input(url.as_str().as_bytes()).to_hex();
         let lost = Arc::<AtomicBool>::default();
@@ -89,7 +94,7 @@ impl RemoteSnapshot {
         let store = crate::transport::run_blocking(move || {
             let mut headers = header::HeaderMap::new();
             headers.insert(header::IF_MATCH, if_match);
-            let client = Client::builder()
+            let client = super::range_http_client_builder()
                 .default_headers(headers)
                 .connect_timeout(Duration::from_secs(10))
                 .timeout(Duration::from_secs(30))
@@ -157,6 +162,12 @@ impl HttpService for FixedClient {
                 std::io::Error::other("COG revision no longer available"),
             ));
         }
+        if status.is_success() && !super::has_identity_content_encoding(response.headers()) {
+            return Err(HttpError::new(
+                HttpErrorKind::Decode,
+                std::io::Error::other("encoded HTTP COG range"),
+            ));
+        }
         Ok(response)
     }
 }
@@ -196,6 +207,11 @@ impl ObjectStore for RemoteSnapshot {
                 options.extensions.insert(build);
             }
         }
+        let mut raw_read = if options.head {
+            None
+        } else {
+            super::agtiff_request::ActiveRasterRequest::object_read()
+        };
         let conditional = options.if_match.is_some() || options.version.is_some();
         let mut result = self.store.get_opts(path, options).await.map_err(|error| {
             if (conditional || self.opened.get().is_some() || self.http)
@@ -241,7 +257,7 @@ impl ObjectStore for RemoteSnapshot {
                             if let Some(start) = start {
                                 file.seek(SeekFrom::Start(start))?;
                             }
-                            let mut chunk = vec![0; remaining.min(8 * 1024) as usize];
+                            let mut chunk = vec![0; remaining.min(LOCAL_READ_CHUNK_BYTES) as usize];
                             file.read_exact(&mut chunk)?;
                             let remaining = remaining - chunk.len() as u64;
                             Ok(Some((Bytes::from(chunk), (file, None, remaining))))
@@ -253,6 +269,20 @@ impl ObjectStore for RemoteSnapshot {
                         })
                     },
                 )
+                .boxed(),
+            );
+        }
+        if raw_read.is_some()
+            && let GetResultPayload::Stream(body) = result.payload
+        {
+            result.payload = GetResultPayload::Stream(
+                body.inspect_ok(move |bytes| {
+                    if !bytes.is_empty()
+                        && let Some(active) = raw_read.take()
+                    {
+                        active.received_bytes();
+                    }
+                })
                 .boxed(),
             );
         }
@@ -288,5 +318,54 @@ impl ObjectStore for RemoteSnapshot {
     }
     async fn copy_opts(&self, _: &Path, _: &Path, _: CopyOptions) -> object_store::Result<()> {
         Err(read_error("read-only COG"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use object_store::{GetRange, local::LocalFileSystem};
+
+    #[tokio::test]
+    async fn local_range_stream_preserves_offsets_and_reports_short_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = "source.tif";
+        let path = dir.path().join(name);
+        let data: Vec<u8> = (0..3 * LOCAL_READ_CHUNK_BYTES)
+            .map(|n| (n % 251) as u8)
+            .collect();
+        std::fs::write(&path, &data).unwrap();
+        let store = RemoteSnapshot::local(Arc::new(
+            LocalFileSystem::new_with_prefix(dir.path()).unwrap(),
+        ));
+        let range = 1_043..1_823 + 2 * LOCAL_READ_CHUNK_BYTES;
+        let key = Path::from(name);
+        let options = GetOptions {
+            range: Some(GetRange::Bounded(range.clone())),
+            ..Default::default()
+        };
+        let result = store.get_opts(&key, options.clone()).await.unwrap();
+        assert_eq!(result.range, range);
+        assert_eq!(
+            result.bytes().await.unwrap(),
+            &data[range.start as usize..range.end as usize]
+        );
+
+        let mut chunks = store.get_opts(&key, options).await.unwrap().into_stream();
+        let first = chunks.next().await.unwrap().unwrap();
+        assert_eq!(first.len() as u64, LOCAL_READ_CHUNK_BYTES);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(range.start + LOCAL_READ_CHUNK_BYTES + 3)
+            .unwrap();
+        let error = chunks.next().await.unwrap().unwrap_err();
+        assert!(matches!(
+            error,
+            Error::Generic { source, .. }
+                if matches!(source.downcast_ref::<MaptileError>(), Some(MaptileError::Io(error))
+                    if error.kind() == std::io::ErrorKind::UnexpectedEof)
+        ));
     }
 }
