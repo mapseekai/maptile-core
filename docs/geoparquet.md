@@ -11,6 +11,8 @@
 | 本地 FlatGeobuf | `FlatGeobufSource::open` |
 | 本地预编码 Parquet | `ParquetArchiveSource::open` |
 
+GeoParquet 和 FlatGeobuf 共用 DuckDB 连接池与切片流程。维护时可分别定位到[几何列与 CRS 解析](../src/sources/duckdb/geometry/resolver.rs)、[数据范围计算](../src/sources/duckdb/geometry/bounds.rs)和[瓦片 SQL](../src/sources/duckdb/geometry/tile_sql.rs)。预编码归档使用独立的 [Arrow 读取器](../src/sources/parquet_archive.rs)。
+
 ## 准备 DuckDB 扩展
 
 [Cargo.lock](../Cargo.lock) 锁定 `duckdb 1.10506.1`，对应 DuckDB 1.5.6。Parquet 随 DuckDB 编译。几何源需要匹配版本和平台的签名 Spatial 扩展。直接查询不可变 HTTP 或 S3 对象时还需要 HTTPFS。

@@ -6,15 +6,17 @@
 
 ## 组件职责
 
-| 组件 | 职责 |
+| 维护任务 | 源码入口 |
 | --- | --- |
-| `TileDriver` / `TileSource` | 自定义源接口及现有数据源接口，提供描述符、瓦片和关闭操作 |
-| `SourceCatalog` / `CatalogSnapshot` | 发布源和组合声明，固定一次请求使用的目录代次 |
-| `CatalogService` | 执行已发布的源或组合，并缓存完整规范瓦片 |
-| `TileStack` / `TileLayer` | 验证请求并按顺序执行调用方定义的层 |
-| `TileCache` | 按字节计权存储瓦片，管理 TTL 和 TTI |
-| `discovery` / `watch` | 扫描文件并通知变更，应用将发现结果映射为目录更新 |
-| `filter`、`styles`、`raster`、`render` | 提供过滤、样式、栅格处理与可选渲染能力 |
+| 实现驱动、声明查询能力或维护已有 `TileSource` | [TileDriver 与描述符](../src/control/driver.rs)、[TileSource](../src/sources/driver.rs)、[请求与批量校验](../src/sources/request.rs) |
+| 发布目录快照、固定组合成员、排空旧源 | [目录发布](../src/control/catalog.rs)、[组合编译与读取](../src/control/composition/mod.rs)、[生命周期](../src/control/lifecycle.rs) |
+| 追踪一次瓦片读取、应用层或跨页导出 | [TileStack 入口](../src/service/mod.rs)、[CatalogService 读引擎](../src/service/engine.rs)、[导出会话](../src/service/export.rs) |
+| 调整缓存或调查同一瓦片的并发读取 | [TileCache](../src/cache/tile_cache.rs)、[按目录代次合并在途读取](../src/cache/flights.rs) |
+| 修改共用的坐标、瓦片结果或底层 I/O 检查 | [核心类型与坐标换算](../src/core/mod.rs)、[文件身份与 HTTP Range](../src/io/mod.rs)、[传输编解码](../src/transport.rs) |
+| 修改具体后端 | [DuckDB 几何源](../src/sources/duckdb/mod.rs)、[栅格数据源](../src/sources/raster/mod.rs)、[Postgres](../src/sources/postgres/mod.rs)、[其他归档源](../src/sources/mod.rs) |
+| 维护 `SourceManager` 与兼容组合源 | [兼容读取入口](../src/sources/legacy/mod.rs)，公开导入路径仍为 `sources::manager`、`sources::composite` 和 `sources::lazy_composite` |
+| 扫描文件、通知变更，将发现结果映射为目录更新 | [discovery](../src/discovery.rs)、[watch](../src/watch.rs) |
+| 调整过滤、样式、影像处理、地图渲染或 WMTS 描述 | [filter](../src/filter.rs)、[styles](../src/styles/mod.rs)、[raster](../src/raster/mod.rs)、[render](../src/render/mod.rs)、[WMTS XML](../src/protocol/wmts.rs) |
 
 应用负责鉴权、可见范围、配置、HTTP 路由、表示协商及对外地址。TileJSON 描述符只包含源元数据；应用必须补充绝对瓦片地址。
 
@@ -28,7 +30,7 @@
 
 `read_batch` 保留输入顺序和空位，`BatchPage.consumed` 表示已处理的坐标数。调用方从该位置继续。`begin_export` 固定跨页的目录条目；仅声明支持一致导出的源可使用。`read_export_page` 的游标检查源修订和请求身份，调用方必须保留稳定的坐标序列、相同的层配置，并对每次请求重新鉴权。临时组合从去掉每个成员首尾空白后的 ID 按输入顺序生成身份。例如 `a,b` 和 ` a, b ` 共用描述符 ID、缓存、在途读取和游标。
 
-[`SourceManager`](../src/sources/manager.rs) 和其 `get_tile_with_etag` 仍为兼容接口；新接入应使用 `TileStack`，由 HTTP 适配器针对最终表示生成验证标识。两个接口的缓存和生命周期各自独立。
+[`SourceManager`](../src/sources/legacy/manager.rs) 和其 `get_tile_with_etag` 仍为兼容接口；新接入应使用 `TileStack`，由 HTTP 适配器针对最终表示生成验证标识。两个接口的缓存和生命周期各自独立。
 
 ## 缓存身份与预算
 

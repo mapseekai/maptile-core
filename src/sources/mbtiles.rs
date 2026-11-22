@@ -39,10 +39,10 @@ pub mod tools {
     };
 }
 
-use super::file_stamp::FileStamp;
 use crate::cache::ContentVersion;
 use crate::control::{CatalogBuildLease, SourceReadLease};
 use crate::error::{MaptileError, MaptileResult};
+use crate::io::file_stamp::FileStamp;
 use crate::sources::archive_inspection::{
     ArchiveSourceType, inspect_archive, set_raster_tile_size,
 };

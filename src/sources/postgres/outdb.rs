@@ -186,7 +186,7 @@ impl PostgresOutDbRasterSource {
         query_params: Option<serde_json::Value>,
         style: &EffectiveStyle,
     ) -> MaptileResult<Option<TileResponse>> {
-        crate::sources::tile_math::validate_tile_request(&[TileCoord { z, x, y }], None)?;
+        crate::sources::validate_tile_request(&[TileCoord { z, x, y }], None)?;
         crate::raster::agtiff_style::to_tile_style(style)?;
 
         if z < self.minzoom || z > self.maxzoom {
@@ -484,7 +484,7 @@ impl TileSource for PostgresOutDbRasterSource {
         query: Option<&TileQuery<'_>>,
     ) -> MaptileResult<Vec<TileResponse>> {
         validate_source_request(self, coords, query)?;
-        crate::sources::read_tile_batch_sequential(self, coords, query).await
+        crate::sources::request::read_tile_batch_sequential(self, coords, query).await
     }
 }
 

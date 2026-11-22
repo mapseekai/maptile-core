@@ -6,8 +6,8 @@
 
 use crate::cache::ContentVersion;
 use crate::error::{MaptileError, MaptileResult};
+use crate::io::file_stamp::FileStamp;
 use crate::sources::archive_inspection::ArchiveSourceType;
-use crate::sources::file_stamp::FileStamp;
 use crate::sources::pmtiles::{
     PmtilesConfig, archive_content_version, archive_tile_etag, pmt_compression_to_encoding,
     pmt_tile_type_to_format, reader::Reader,

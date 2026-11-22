@@ -16,13 +16,16 @@
 
 pub mod cache;
 pub mod control;
+mod core;
 pub mod discovery;
 pub mod error;
 pub mod filter;
 pub mod headers;
+mod io;
 #[cfg(feature = "metrics")]
 pub mod metrics;
 pub mod prelude;
+mod protocol;
 pub mod raster;
 pub mod render;
 pub mod service;

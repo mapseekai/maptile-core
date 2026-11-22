@@ -30,7 +30,7 @@ cargo doc --locked --no-deps --open
 
 [架构与生命周期](architecture.md)说明应用如何组合数据源、缓存和样式，以及内容版本、缓存键、文件变更和关闭操作之间的关系。
 
-公共接口的实现入口包括 [`TileStack`](../src/service.rs)、[`CatalogService`](../src/control.rs)、[`TileDriver`](../src/control.rs)、[`TileCache`](../src/cache/tile_cache.rs) 和 [`render`](../src/render/mod.rs)。每篇专题文档链接到其对应的实现，便于核对配置与行为。
+公共接口的实现入口包括 [`TileStack`](../src/service/mod.rs)、[`CatalogService`](../src/service/engine.rs)、[`TileDriver`](../src/control/driver.rs)、[`TileCache`](../src/cache/tile_cache.rs) 和 [`render`](../src/render/mod.rs)。每篇专题文档链接到其对应的实现，便于核对配置与行为。
 
 ## 项目记录
 

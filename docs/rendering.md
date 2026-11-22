@@ -159,7 +159,7 @@ bash scripts/ci/maptile-render-cargo.sh run --locked --features render --example
 
 每次切片请求通过 `TileQuery.style` 提供 `EffectiveStyle`。应用先用 `RasterStyle::from_json` 或 `from_value` 解析 Raster Style 文档，再通过 `EffectiveStyle::from_raster_style` 取得可用于查询和缓存的样式。选择波段、渲染器、拉伸、色带、重采样和输出参数时，以所用数据和样式声明为准。
 
-`EffectiveStyle` 保存样式文档、瓦片尺寸、输出格式和样式散列；COG 适配器将其传给 async-geotiff，并在 `TileResponse.info` 中记录实际 PNG、WebP 或 JPEG 格式。实现见 [`style/resolve.rs`](../src/raster/style/resolve.rs)、[`agtiff_style.rs`](../src/raster/agtiff_style.rs) 与 [`agtiff_cog.rs`](../src/sources/agtiff_cog.rs)。
+`EffectiveStyle` 保存样式文档、瓦片尺寸、输出格式和样式散列；COG 适配器将其传给 async-geotiff，并在 `TileResponse.info` 中记录实际 PNG、WebP 或 JPEG 格式。实现见 [`style/resolve.rs`](../src/raster/style/resolve.rs)、[`agtiff_style.rs`](../src/raster/agtiff_style.rs) 与 [`cog.rs`](../src/sources/raster/cog.rs)。
 
 配置 COG 时，同时准备以下资源：
 
@@ -186,13 +186,13 @@ OutDB 每次请求都会查询当前资产，因此始终绕过瓦片结果缓�
 
 固定镶嵌先按成员 WGS84 范围筛选每瓦片候选，但全局统计仍使用全部成员，并继续受上游默认 64 个资产的统计发现限制。跨日期线、未知范围和缓存版本规则见[成员范围说明](sources.md#固定栅格镶嵌与成员范围)。
 
-各入口的配置与处理流程见 [`stac.rs`](../src/sources/stac.rs)、[`mosaic_source.rs`](../src/sources/mosaic_source.rs)、[`outdb.rs`](../src/sources/postgres/outdb.rs)。数据库连接复用方式见[数据源与查询](sources.md)。
+各入口的配置与处理流程见 [`stac.rs`](../src/sources/raster/stac.rs)、[`mosaic.rs`](../src/sources/raster/mosaic.rs)、[`outdb.rs`](../src/sources/postgres/outdb.rs)。数据库连接复用方式见[数据源与查询](sources.md)。
 
 ## 生成 WMTS 元数据
 
 `build_capabilities(&service, &layers)` 生成 WMTS 1.0.0 GetCapabilities XML。`WmtsService` 描述服务标题、摘要和访问地址；每个 `WmtsLayer` 提供图层标识、瓦片 URL 模板、图片 MIME 类型、缩放范围和可选 WGS84 边界。应用将生成的 XML 与对应瓦片入口一起提供给客户端。
 
-生成的矩阵集名为 `GoogleMapsCompatible`，使用 EPSG:3857、512 像素瓦片及 0 到 22 级矩阵。图层的 `min_zoom`、`max_zoom` 用于写出矩阵范围；配置时保持元数据与实际瓦片输出一致。实现及 XML 回归样例见 [`wmts.rs`](../src/render/wmts.rs) 和 [WMTS 测试](../tests/render/wmts.rs)。
+生成的矩阵集名为 `GoogleMapsCompatible`，使用 EPSG:3857、512 像素瓦片及 0 到 22 级矩阵。图层的 `min_zoom`、`max_zoom` 用于写出矩阵范围；配置时保持元数据与实际瓦片输出一致。实现及 XML 回归样例见 [`wmts.rs`](../src/protocol/wmts.rs) 和 [WMTS 测试](../tests/protocol/wmts.rs)。
 
 ## 验证与后续接入
 

@@ -12,7 +12,8 @@
 //! [`crate::render::RenderRequest`] (or returns the bbox for an external
 //! auto-fit pass that consumes overlays).
 
-use crate::render::types::{RenderCamera, RenderFormat, RenderRequest, TILE_SIZE, mercator_y};
+use crate::core::RENDER_TILE_SIZE;
+use crate::render::types::{RenderCamera, RenderFormat, RenderRequest, mercator_y};
 use std::f64::consts::TAU;
 use std::str::FromStr;
 
@@ -214,7 +215,7 @@ fn bbox_to_zoom(
     width: u32,
     height: u32,
 ) -> f64 {
-    let world = f64::from(TILE_SIZE);
+    let world = f64::from(RENDER_TILE_SIZE);
     let lon_span = (max_lon - min_lon).abs().max(1e-9);
     let zoom_lon = (f64::from(width) * 360.0 / (world * lon_span)).log2();
     let lat_span = (mercator_y(max_lat) - mercator_y(min_lat)).abs().max(1e-9);
@@ -307,7 +308,7 @@ mod tests {
         );
         assert!(z.abs() < 1e-9);
         let z = bbox_to_zoom(-10.0, 10.0, 10.0, 60.0, 800, 300);
-        let world = f64::from(TILE_SIZE) * z.exp2();
+        let world = f64::from(RENDER_TILE_SIZE) * z.exp2();
         assert!(world * 20.0 / 360.0 <= 800.0 + 1e-9);
         assert!(world * (mercator_y(60.0) - mercator_y(10.0)) / TAU <= 300.0 + 1e-9);
     }

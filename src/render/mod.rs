@@ -20,7 +20,7 @@ compile_error!("the render-opengl feature is supported only on Linux");
 
 pub mod static_map;
 pub mod types;
-pub mod wmts;
+pub use crate::protocol::wmts;
 
 pub use static_map::{StaticTarget, StaticTargetError};
 pub use types::{

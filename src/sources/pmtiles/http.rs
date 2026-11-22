@@ -7,11 +7,11 @@ use super::{
 };
 use crate::cache::ContentVersion;
 use crate::error::{MaptileError, MaptileResult};
-use crate::sources::archive_inspection::ArchiveSourceType;
-use crate::sources::{
-    SourceKind, TileCoord, TileInfo, TileQuery, TileResponse, TileSource,
+use crate::io::http_range::{
     has_identity_content_encoding, range_http_client_builder, strong_http_etag as strong_etag,
 };
+use crate::sources::archive_inspection::ArchiveSourceType;
+use crate::sources::{SourceKind, TileCoord, TileInfo, TileQuery, TileResponse, TileSource};
 use async_trait::async_trait;
 use bytes::BytesMut;
 use pmtiles::reqwest::{self, StatusCode, header};

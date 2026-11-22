@@ -170,7 +170,7 @@ required-features = ["postgres"]
 
 [[test]]
 name = "wmts_golden"
-path = "tests/render/wmts.rs"
+path = "tests/protocol/wmts.rs"
 
 [[test]]
 name = "pmtiles_local"
@@ -189,7 +189,7 @@ required-features = ["mbtiles", "pmtiles"]
 
 [[test]]
 name = "composite"
-path = "tests/sources/composite.rs"
+path = "tests/sources/legacy/composite.rs"
 
 [[test]]
 name = "catalog_snapshot"
@@ -197,7 +197,7 @@ path = "tests/styles/catalog.rs"
 
 [[test]]
 name = "mosaic_source_smoke"
-path = "tests/sources/mosaic_source.rs"
+path = "tests/sources/raster/mosaic.rs"
 required-features = ["agtiff"]
 
 [[test]]
@@ -207,7 +207,7 @@ required-features = ["pmtiles", "cloud"]
 
 [[test]]
 name = "manager"
-path = "tests/sources/manager.rs"
+path = "tests/sources/legacy/manager.rs"
 
 [[test]]
 name = "pmtiles_http"
@@ -230,7 +230,7 @@ required-features = ["postgres"]
 
 [[test]]
 name = "agtiff_cog"
-path = "tests/sources/agtiff_cog.rs"
+path = "tests/sources/raster/cog.rs"
 required-features = ["agtiff"]
 
 [[test]]

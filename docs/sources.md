@@ -1,6 +1,6 @@
 # 数据源与查询
 
-`maptile-core` 通过 [`TileStack`](../src/service.rs) 读取已发布目录中的数据源。应用打开具体源，发布到 [`CatalogService`](../src/control.rs)，再按源 ID 和 XYZ 坐标请求瓦片。已有 `TileSource` 实现可直接加入目录；应用也可实现 `TileDriver`。
+`maptile-core` 通过 [`TileStack`](../src/service/mod.rs) 读取已发布目录中的数据源。应用打开具体源，发布到 [`CatalogService`](../src/service/engine.rs)，再按源 ID 和 XYZ 坐标请求瓦片。已有 `TileSource` 实现可直接加入目录；应用也可实现 `TileDriver`。
 
 ## 按数据形态选择入口
 
@@ -186,7 +186,7 @@ let settings = PoolSettings {
 
 全局统计仍使用完整、有序的成员集，不能用单瓦片候选替代。锁定的 async-geotiff 0.13.0 在统计发现阶段也应用默认 64 个资产的限制，超过 64 个成员的全局统计拉伸仍不受支持；需要统计的样式还会读取远处成员，远处坏文件可能使统计失败。普通固定样式下，65 个成员中只有 1 个相交的场景已由真实投影 TIFF 回归覆盖。
 
-需要跨页一致导出时，通过 `MosaicSource::open_immutable` 打开，调用方须保证每个成员都是不可变版本，且重叠成员次序固定。普通 `open` 提供按请求的瓦片读取。内容版本包含成员身份和归一化范围，修改范围后重新打开并注册会分开瓦片缓存。成员内容本身变化时，应用仍需更新其 `source_id`/内容身份。配置与真实样式示例见[栅格渲染](rendering.md#stac固定镶嵌与-outdb)及 [`mosaic_source.rs`](../src/sources/mosaic_source.rs)。
+需要跨页一致导出时，通过 `MosaicSource::open_immutable` 打开，调用方须保证每个成员都是不可变版本，且重叠成员次序固定。普通 `open` 提供按请求的瓦片读取。内容版本包含成员身份和归一化范围，修改范围后重新打开并注册会分开瓦片缓存。成员内容本身变化时，应用仍需更新其 `source_id`/内容身份。配置与真实样式示例见[栅格渲染](rendering.md#stac固定镶嵌与-outdb)及 [`mosaic.rs`](../src/sources/raster/mosaic.rs)。
 
 ## FlatGeobuf 文件版本
 

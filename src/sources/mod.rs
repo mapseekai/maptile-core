@@ -1,89 +1,70 @@
-//! Tile source abstractions and registry.
+//! Tile source contracts, archive and database drivers, and compatibility entry points.
 
 pub mod archive_inspection;
-pub mod composite;
-#[cfg(any(
-    feature = "mbtiles",
-    feature = "pmtiles",
-    feature = "duckdb",
-    feature = "agtiff",
-    feature = "parquet-archive"
-))]
-mod file_stamp;
-pub mod lazy_composite;
-pub mod manager;
+mod driver;
+#[cfg(feature = "duckdb")]
+mod duckdb;
+mod legacy;
 #[cfg(feature = "mbtiles")]
 pub mod mbtiles;
 pub mod mvt;
+#[cfg(feature = "parquet-archive")]
+pub mod parquet_archive;
 #[cfg(feature = "pmtiles")]
 pub mod pmtiles;
 #[cfg(feature = "postgres")]
 pub mod postgres;
-pub mod raster_coverage;
-pub mod tile_math;
-mod tile_types;
+mod raster;
+mod request;
 
+pub use crate::core::{
+    response::{TileEtagResponse, TileResponse},
+    tile_math,
+    tile_types::{Encoding as TileEncoding, Format as TileFormat, TileCoord, TileInfo},
+};
 pub use composite::{CompositeChild, CompositeSource};
+pub use driver::{SourceKind, TileSource};
 pub use lazy_composite::LazyCompositeSource;
+pub use legacy::{composite, lazy_composite, manager};
+pub use request::{
+    MAX_TILE_BATCH_BYTES, MAX_TILE_BATCH_COORDS, MosaicPixelSelection, RasterPointQuery,
+    RasterPointResponse, TileQuery, effective_pixel_selection, parse_composite_id_list,
+};
+pub(crate) use request::{read_tile_batch_with, validate_source_request, validate_tile_request};
 
-#[cfg(feature = "raster")]
-pub mod dataset_cache;
-
-#[cfg(feature = "agtiff")]
-mod agtiff_cog;
-#[cfg(feature = "agtiff")]
-mod agtiff_request;
-#[cfg(feature = "agtiff")]
-mod agtiff_snapshot;
-#[cfg(feature = "agtiff")]
-pub use agtiff_cog::{AsyncCogSource, AsyncCogSourceConfig, CogObjectSource};
-
-#[cfg(any(feature = "pmtiles", feature = "agtiff"))]
-fn strong_http_etag(headers: &reqwest::header::HeaderMap) -> Option<&str> {
-    use reqwest::header::ETAG;
-    let mut values = headers.get_all(ETAG).iter();
-    let etag = values.next()?.to_str().ok()?;
-    (values.next().is_none()
-        && etag.len() >= 2
-        && etag.starts_with('"')
-        && etag.ends_with('"')
-        && etag[1..etag.len() - 1]
-            .bytes()
-            .all(|byte| byte >= 0x21 && byte != b'"' && byte != 0x7f))
-    .then_some(etag)
-}
-
-#[cfg(any(feature = "pmtiles", feature = "agtiff", feature = "duckdb"))]
-fn has_identity_content_encoding(headers: &reqwest::header::HeaderMap) -> bool {
-    headers
-        .get_all(reqwest::header::CONTENT_ENCODING)
-        .iter()
-        .all(|value| {
-            value
-                .as_bytes()
-                .split(|&byte| byte == b',')
-                .all(|coding| coding.trim_ascii().eq_ignore_ascii_case(b"identity"))
-        })
-}
-
-#[cfg(any(feature = "pmtiles", feature = "agtiff", feature = "duckdb"))]
-fn range_http_client_builder() -> reqwest::ClientBuilder {
-    use reqwest::header::{ACCEPT_ENCODING, HeaderMap, HeaderValue};
-    let mut headers = HeaderMap::new();
-    headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
-    // Keep Content-Encoding visible when downstream crates enable reqwest's codecs.
-    reqwest::Client::builder()
-        .default_headers(headers)
-        .no_gzip()
-        .no_brotli()
-        .no_zstd()
-        .no_deflate()
-}
-
-#[cfg(feature = "agtiff")]
-pub mod mosaic_source;
 #[cfg(feature = "agtiff")]
 pub use mosaic_source::{MosaicMember, MosaicSource, MosaicSourceConfig, pixel_selection_from_str};
+#[cfg(feature = "agtiff")]
+pub use raster::cog::{AsyncCogSource, AsyncCogSourceConfig, CogObjectSource};
+pub use raster::coverage as raster_coverage;
+#[cfg(feature = "raster")]
+pub use raster::dataset_cache;
+#[cfg(feature = "agtiff")]
+pub use raster::mosaic as mosaic_source;
+#[cfg(feature = "stac")]
+pub use raster::stac;
+#[cfg(feature = "stac")]
+pub use stac::{
+    StacAsset, StacSource, StacSourceConfig, build_search_url, extract_assets_from_item_collection,
+    is_cog_mime_type, tile_to_wgs84_bbox,
+};
+
+#[cfg(feature = "duckdb")]
+pub use duckdb::{geoparquet, local_vector};
+#[cfg(feature = "duckdb")]
+pub use geoparquet::{
+    BoundsMode, DuckDbPoolStatus, GeoParquetCredentialProvider, GeoParquetQueryOptions,
+    GeoParquetS3Credentials, GeoParquetS3Options, GeoParquetSource, GeoParquetSourceConfig,
+};
+#[cfg(feature = "duckdb")]
+pub use local_vector::{
+    FlatGeobufSource, FlatGeobufSourceConfig, ImportedGeoParquet, VectorImportOptions,
+    import_to_geoparquet,
+};
+#[cfg(feature = "parquet-archive")]
+pub use parquet_archive::{
+    ParquetArchiveColumns, ParquetArchiveSource, ParquetArchiveSourceConfig,
+};
 
 /// Decoded-block cache shared by COG readers.
 /// Applications can inject one cache into COG and mosaic configurations to
@@ -98,590 +79,4 @@ pub use async_geotiff::io::BlockCache;
 #[must_use]
 pub fn new_shared_block_cache() -> std::sync::Arc<BlockCache> {
     std::sync::Arc::new(BlockCache::new(async_geotiff::io::CacheConfig::default()))
-}
-
-#[cfg(feature = "duckdb")]
-mod duckdb_pool;
-#[cfg(feature = "duckdb")]
-mod duckdb_query;
-#[cfg(feature = "duckdb")]
-mod duckdb_sql;
-#[cfg(feature = "duckdb")]
-pub mod geoparquet;
-#[cfg(feature = "duckdb")]
-mod geoparquet_geometry;
-#[cfg(feature = "duckdb")]
-mod geoparquet_remote;
-#[cfg(feature = "duckdb")]
-pub use geoparquet::{
-    BoundsMode, DuckDbPoolStatus, GeoParquetCredentialProvider, GeoParquetQueryOptions,
-    GeoParquetS3Credentials, GeoParquetS3Options, GeoParquetSource, GeoParquetSourceConfig,
-};
-
-#[cfg(feature = "duckdb")]
-pub mod local_vector;
-#[cfg(feature = "duckdb")]
-pub use local_vector::{
-    FlatGeobufSource, FlatGeobufSourceConfig, ImportedGeoParquet, VectorImportOptions,
-    import_to_geoparquet,
-};
-
-#[cfg(feature = "parquet-archive")]
-pub mod parquet_archive;
-#[cfg(feature = "parquet-archive")]
-pub use parquet_archive::{
-    ParquetArchiveColumns, ParquetArchiveSource, ParquetArchiveSourceConfig,
-};
-
-#[cfg(feature = "stac")]
-pub mod stac;
-#[cfg(feature = "stac")]
-pub use stac::{
-    StacAsset, StacSource, StacSourceConfig, build_search_url, extract_assets_from_item_collection,
-    is_cog_mime_type, tile_to_wgs84_bbox,
-};
-
-use crate::cache::CacheZoomRange;
-use crate::error::MaptileResult;
-use crate::filter::{Cql2Expr, UrlQuery};
-
-pub use tile_types::{Encoding as TileEncoding, Format as TileFormat, TileCoord, TileInfo};
-
-pub const MAX_TILE_BATCH_COORDS: usize = 128;
-pub const MAX_TILE_BATCH_BYTES: usize = 8 * 1024 * 1024;
-
-/// Closed source capability used by application routing.
-///
-/// Sources are fail-closed by default. Only archive implementations that
-/// explicitly identify themselves as MBTiles or PMTiles may serve stored
-/// native tile bytes through the native-archive request path.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SourceKind {
-    NativeArchive(archive_inspection::ArchiveSourceType),
-    PostgresTable,
-    PostgresFunction,
-    GeoParquet,
-    FlatGeobuf,
-    ParquetArchive,
-    Cog,
-    Mosaic,
-    Stac,
-    Composite,
-    Other,
-}
-
-/// Parse a comma-separated source id list (Martin-style composite URL
-/// syntax: `/foo,bar,baz/{z}/{x}/{y}.pbf`). Returns the component ids
-/// when at least one comma is present, or `None` for a single id (so
-/// callers can fast-path the non-composite case).
-///
-/// Empty components and surrounding whitespace are stripped; if the
-/// result has fewer than 2 components, `None` is returned. Pair with
-/// [`crate::sources::manager::SourceManager::register_composite_from_ids`]
-/// to build the composite on demand.
-#[must_use]
-pub fn parse_composite_id_list(s: &str) -> Option<Vec<&str>> {
-    if !s.contains(',') {
-        return None;
-    }
-    let parts: Vec<&str> = s
-        .split(',')
-        .map(str::trim)
-        .filter(|p| !p.is_empty())
-        .collect();
-    if parts.len() < 2 { None } else { Some(parts) }
-}
-
-#[async_trait::async_trait]
-pub trait TileSource: std::any::Any + Send + Sync {
-    fn id(&self) -> &str;
-
-    fn source_kind(&self) -> SourceKind {
-        SourceKind::Other
-    }
-
-    /// Fingerprint used to partition cached tiles by source content.
-    ///
-    /// Cache keys include this version so a new content identity selects a new
-    /// set of entries. The default derives the fingerprint from [`Self::id`].
-    /// Sources that reuse an ID across content changes must override this method
-    /// with a content fingerprint, file generation, or durable edit revision.
-    fn content_version(&self) -> crate::cache::ContentVersion {
-        crate::cache::ContentVersion::from_input(self.id().as_bytes())
-    }
-
-    fn tilejson(&self) -> &tilejson::TileJSON;
-    fn tile_info(&self) -> TileInfo;
-    fn clone_source(&self) -> Box<dyn TileSource>;
-
-    /// Stop accepting new work and begin releasing source-owned resources.
-    /// Implementations without a persistent session need no special handling.
-    fn start_close(&self) {}
-
-    /// Wait until source-owned operations and connections have been released.
-    async fn close(&self) -> MaptileResult<()> {
-        self.start_close();
-        Ok(())
-    }
-
-    async fn get_tile(
-        &self,
-        xyz: TileCoord,
-        query: Option<&TileQuery<'_>>,
-    ) -> MaptileResult<TileResponse>;
-
-    /// Read an ordered prefix of decoded tiles without the manager's online cache.
-    ///
-    /// Empty tiles retain their position. A nonempty request returns at least
-    /// one tile; resume at the returned length when the byte budget truncates it.
-    /// Memory is bounded by the batch budget plus one decoded tile.
-    async fn read_tile_batch(
-        &self,
-        coords: &[TileCoord],
-        query: Option<&TileQuery<'_>>,
-    ) -> MaptileResult<Vec<TileResponse>> {
-        read_tile_batch_sequential(self, coords, query).await
-    }
-
-    /// Accelerated drivers with missing rows preserve them as empty slots.
-    async fn read_tile_batch_slots(
-        &self,
-        coords: &[TileCoord],
-        query: Option<&TileQuery<'_>>,
-    ) -> MaptileResult<Vec<Option<TileResponse>>> {
-        Ok(self
-            .read_tile_batch(coords, query)
-            .await?
-            .into_iter()
-            .map(Some)
-            .collect())
-    }
-
-    fn supports_raster_coverage(&self) -> bool {
-        false
-    }
-
-    /// Export native raster coverage, or return `InvalidRequest` if unsupported.
-    async fn raster_coverage(
-        &self,
-        _query: Option<&raster_coverage::CoverageQuery>,
-    ) -> MaptileResult<raster_coverage::CoverageResponse> {
-        Err(crate::error::MaptileError::InvalidRequest(
-            "source does not support native coverage export".into(),
-        ))
-    }
-
-    fn supports_raster_point(&self) -> bool {
-        false
-    }
-
-    /// Query a raw raster pixel value at a coordinate. Vector and non-raster
-    /// sources return `InvalidRequest` from the default unsupported implementation.
-    async fn query_raster_point(
-        &self,
-        _query: &RasterPointQuery,
-    ) -> MaptileResult<RasterPointResponse> {
-        Err(crate::error::MaptileError::InvalidRequest(format!(
-            "source '{}' does not support raster point queries",
-            self.id()
-        )))
-    }
-
-    /// Validator for a fetched or cached tile. Archives can use their content identity.
-    fn tile_etag(&self, response: &TileResponse) -> String {
-        compute_default_etag(&response.data)
-    }
-
-    /// Fetch a tile and compare its [`Self::tile_etag`] with `if_none_match`.
-    /// A match returns [`TileEtagResponse::NotModified`]; otherwise the response
-    /// includes the tile and its ETag. The default validator derives from the
-    /// payload, and a source can override it with an authoritative content ID.
-    async fn get_tile_with_etag(
-        &self,
-        xyz: TileCoord,
-        query: Option<&TileQuery<'_>>,
-        if_none_match: Option<&str>,
-    ) -> MaptileResult<TileEtagResponse> {
-        validate_source_request(self, &[xyz], query)?;
-        let resp = self.get_tile(xyz, query).await?;
-        let etag = self.tile_etag(&resp);
-        if Some(etag.as_str()) == if_none_match {
-            return Ok(TileEtagResponse::NotModified);
-        }
-        Ok(TileEtagResponse::Fresh { resp, etag })
-    }
-
-    /// Whether the source consumes `TileQuery.url_query`.
-    fn supports_url_query(&self) -> bool {
-        false
-    }
-
-    /// Whether the source consumes `TileQuery.filter` (CQL2).
-    fn supports_filter(&self) -> bool {
-        false
-    }
-
-    /// Whether the source applies a per-request [`TileQuery::style`].
-    fn supports_raster_style(&self) -> bool {
-        false
-    }
-
-    /// Whether the opened capability remains valid for every catalog read.
-    #[doc(hidden)]
-    fn supports_catalog_raster_style(&self) -> bool {
-        self.supports_raster_style()
-    }
-
-    fn supports_bbox(&self) -> bool {
-        false
-    }
-
-    /// The source declares every MVT layer name. Composition checks each actual tile.
-    fn strict_mvt(&self) -> bool {
-        false
-    }
-
-    /// All reads use the opened revision or report a version change.
-    fn consistent_export(&self) -> bool {
-        matches!(self.source_kind(), SourceKind::NativeArchive(_))
-    }
-
-    fn native_batch(&self) -> bool {
-        false
-    }
-
-    /// Persisted mosaic pixel-selection fallback. Non-mosaic sources return
-    /// `None`, which also marks request-level mosaic selection unsupported.
-    fn mosaic_pixel_selection(&self) -> Option<MosaicPixelSelection> {
-        None
-    }
-
-    /// Zoom-level bounds for tile caching. Returned by every source
-    /// to tell [`crate::sources::manager::SourceManager`] which zoom
-    /// levels are worth caching for this source. The default returns
-    /// [`CacheZoomRange::default()`] (cache every zoom).
-    ///
-    /// Override when a source has a structural reason to skip some
-    /// zooms — e.g. dynamic SQL sources where deep zooms are too
-    /// expensive to cache, or sources that already have an external
-    /// CDN in front of them.
-    fn cache_zoom(&self) -> CacheZoomRange {
-        CacheZoomRange::default()
-    }
-}
-
-/// Pixel-composition algorithms accepted by mosaic tile requests.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum MosaicPixelSelection {
-    First,
-    Highest,
-    Lowest,
-    Mean,
-    Median,
-}
-
-impl MosaicPixelSelection {
-    pub(crate) fn from_name(name: &str) -> Option<Self> {
-        Some(match name {
-            "first" => Self::First,
-            "highest" => Self::Highest,
-            "lowest" => Self::Lowest,
-            "mean" => Self::Mean,
-            "median" => Self::Median,
-            _ => return None,
-        })
-    }
-
-    #[cfg(feature = "agtiff")]
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::First => "first",
-            Self::Highest => "highest",
-            Self::Lowest => "lowest",
-            Self::Mean => "mean",
-            Self::Median => "median",
-        }
-    }
-
-    #[must_use]
-    pub(crate) const fn cache_tag(self) -> u8 {
-        match self {
-            Self::First => 1,
-            Self::Highest => 2,
-            Self::Lowest => 3,
-            Self::Mean => 4,
-            Self::Median => 5,
-        }
-    }
-}
-
-/// Resolve the query override, the Raster Style reducer, then the source fallback.
-#[must_use]
-pub fn effective_pixel_selection(
-    query: Option<&TileQuery<'_>>,
-    fallback: MosaicPixelSelection,
-) -> MosaicPixelSelection {
-    query
-        .and_then(|q| {
-            q.pixel_selection.or_else(|| {
-                let name = q
-                    .style?
-                    .raster_style()
-                    .as_value()
-                    .pointer("/raster:mosaic/pixel_selection")?
-                    .as_str()?;
-                MosaicPixelSelection::from_name(name)
-            })
-        })
-        .unwrap_or(fallback)
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct RasterPointQuery {
-    pub x: f64,
-    pub y: f64,
-    pub coord_crs: String,
-    /// 1-based band indices. Empty means all bands.
-    pub bidx: Vec<u32>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct RasterPointResponse {
-    pub x: f64,
-    pub y: f64,
-    pub coord_crs: String,
-    pub bidx: Vec<u32>,
-    pub values: Vec<f64>,
-    pub valid: bool,
-    pub outside: bool,
-}
-
-#[derive(Debug, Default)]
-pub struct TileQuery<'a> {
-    pub url_query: Option<&'a UrlQuery>,
-    pub filter: Option<&'a Cql2Expr>,
-    /// Spatial bbox passed via URL `?bbox=w,s,e,n`. Routed outside CQL2
-    /// (see spec D6) and ANDed into source SQL as
-    /// `geom && ST_MakeEnvelope(w,s,e,n,4326)`.
-    pub bbox: Option<[f64; 4]>,
-    /// Per-request raster styling. Participates in the cache identity.
-    /// Dynamic raster renderers require this value.
-    pub style: Option<&'a crate::raster::style::EffectiveStyle>,
-    /// Dataset-authoritative hash for a complete typed raster request.
-    /// Only sources that support per-request raster styling accept it.
-    pub style_hash: Option<crate::cache::StyleHash>,
-    /// Per-request mosaic composition. Borrowed query state carries this
-    /// `Copy` value without cloning; the manager rejects it for non-mosaic sources
-    /// in both ordinary and ETag reads. Direct source callers must check capabilities.
-    pub pixel_selection: Option<MosaicPixelSelection>,
-}
-
-impl<'a> TileQuery<'a> {
-    pub(crate) fn has_raster_style(&self) -> bool {
-        self.style.is_some() || self.style_hash.is_some()
-    }
-
-    /// True when the request carries inputs that make the response
-    /// non-cacheable as a whole — currently `url_query`, `filter`, and
-    /// `bbox` (these alter the data, not just the rendering). `style` is
-    /// excluded: it joins the cache key instead.
-    #[must_use]
-    pub fn bypasses_cache(&self) -> bool {
-        self.url_query.is_some() || self.filter.is_some() || self.bbox.is_some()
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct TileResponse {
-    pub data: bytes::Bytes,
-    pub info: TileInfo,
-    pub last_modified: Option<std::time::SystemTime>,
-}
-
-#[derive(Debug)]
-pub enum TileEtagResponse {
-    Fresh { resp: TileResponse, etag: String },
-    NotModified,
-}
-
-pub(crate) fn validate_source_request<S: TileSource + ?Sized>(
-    source: &S,
-    coords: &[TileCoord],
-    query: Option<&TileQuery<'_>>,
-) -> MaptileResult<()> {
-    tile_math::validate_tile_request(coords, query)?;
-    if query.is_some() {
-        crate::control::SourceCapabilities::from_source(source)
-            .validate_query(source.id(), query)?;
-    }
-    Ok(())
-}
-
-pub(crate) fn validate_tile_batch(coords: &[TileCoord]) -> MaptileResult<()> {
-    if coords.len() > MAX_TILE_BATCH_COORDS {
-        return Err(crate::error::MaptileError::InvalidRequest(format!(
-            "tile batch exceeds {MAX_TILE_BATCH_COORDS} coordinates"
-        )));
-    }
-    Ok(())
-}
-
-pub(crate) async fn read_tile_batch_sequential<S: TileSource + ?Sized>(
-    source: &S,
-    coords: &[TileCoord],
-    query: Option<&TileQuery<'_>>,
-) -> MaptileResult<Vec<TileResponse>> {
-    validate_source_request(source, coords, query)?;
-    read_tile_batch_with(coords, source.tile_info(), |coord| {
-        source.get_tile(coord, query)
-    })
-    .await
-}
-
-pub(crate) async fn read_tile_batch_with<F, Fut>(
-    coords: &[TileCoord],
-    info: TileInfo,
-    mut fetch: F,
-) -> MaptileResult<Vec<TileResponse>>
-where
-    F: FnMut(TileCoord) -> Fut + Send,
-    Fut: std::future::Future<Output = MaptileResult<TileResponse>> + Send,
-{
-    validate_tile_batch(coords)?;
-    let mut tiles = Vec::with_capacity(coords.len());
-    let mut bytes = 0;
-    for &coord in coords {
-        let mut tile = match fetch(coord).await {
-            Ok(tile) => tile,
-            Err(crate::error::MaptileError::TileNotFound(..)) => TileResponse {
-                data: bytes::Bytes::new(),
-                info,
-                last_modified: None,
-            },
-            Err(error) => return Err(error),
-        };
-        if !tile.data.is_empty() {
-            tile.data = crate::transport::decode_async(tile.data, tile.info.encoding).await?;
-        }
-        tile.info.encoding = TileEncoding::Uncompressed;
-        bytes += tile.data.len();
-        tiles.push(tile);
-        if bytes >= MAX_TILE_BATCH_BYTES {
-            break;
-        }
-    }
-    Ok(tiles)
-}
-
-fn compute_default_etag(data: &bytes::Bytes) -> String {
-    use base64::Engine as _;
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    let hash: u128 = if data.is_empty() {
-        0
-    } else {
-        xxhash_rust::xxh3::xxh3_128(data)
-    };
-    let mut s = String::with_capacity(24);
-    s.push('"');
-    s.push_str(&URL_SAFE_NO_PAD.encode(hash.to_ne_bytes()));
-    s.push('"');
-    s
-}
-
-#[cfg(test)]
-mod composite_url_tests {
-    use super::{
-        MosaicPixelSelection, TileQuery, effective_pixel_selection, parse_composite_id_list,
-    };
-
-    #[test]
-    fn request_selection_overrides_source_fallback() {
-        let query = TileQuery {
-            pixel_selection: Some(MosaicPixelSelection::Median),
-            ..TileQuery::default()
-        };
-        assert_eq!(
-            effective_pixel_selection(Some(&query), MosaicPixelSelection::First),
-            MosaicPixelSelection::Median
-        );
-        assert_eq!(
-            effective_pixel_selection(None, MosaicPixelSelection::First),
-            MosaicPixelSelection::First
-        );
-    }
-
-    #[test]
-    fn single_id_returns_none() {
-        assert_eq!(parse_composite_id_list("foo"), None);
-    }
-
-    #[test]
-    fn comma_separated_returns_components() {
-        assert_eq!(
-            parse_composite_id_list("foo,bar,baz"),
-            Some(vec!["foo", "bar", "baz"])
-        );
-    }
-
-    #[test]
-    fn whitespace_around_components_is_stripped() {
-        assert_eq!(
-            parse_composite_id_list("foo , bar , baz "),
-            Some(vec!["foo", "bar", "baz"])
-        );
-    }
-
-    #[test]
-    fn trailing_comma_with_one_id_returns_none() {
-        // Only one non-empty component → caller treats as plain id.
-        assert_eq!(parse_composite_id_list("foo,"), None);
-        assert_eq!(parse_composite_id_list(",foo"), None);
-        assert_eq!(parse_composite_id_list(",,"), None);
-    }
-
-    #[test]
-    fn two_ids() {
-        assert_eq!(parse_composite_id_list("a,b"), Some(vec!["a", "b"]));
-    }
-}
-
-#[cfg(test)]
-mod etag_tests {
-    use super::compute_default_etag;
-    use bytes::Bytes;
-
-    #[test]
-    fn etag_format_is_base64_url_safe_with_quotes() {
-        let etag = compute_default_etag(&Bytes::from_static(b"hello"));
-        assert_eq!(etag.len(), 24, "expected 22 base64 chars + 2 quotes");
-        assert!(etag.starts_with('"') && etag.ends_with('"'));
-        let body = &etag[1..etag.len() - 1];
-        assert!(
-            body.bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
-            "body must be base64 URL-safe (no = padding): {body}"
-        );
-    }
-
-    #[test]
-    fn etag_empty_input_is_zero_hash_base64() {
-        // xxh3_128(empty) is implementation-defined but we hash 0u128 instead.
-        // Result: base64(URL_SAFE_NO_PAD) of [0; 16] = "AAAAAAAAAAAAAAAAAAAAAA".
-        let etag = compute_default_etag(&Bytes::new());
-        assert_eq!(etag, "\"AAAAAAAAAAAAAAAAAAAAAA\"");
-    }
-
-    #[test]
-    fn etag_changes_with_data() {
-        let a = compute_default_etag(&Bytes::from_static(b"alpha"));
-        let b = compute_default_etag(&Bytes::from_static(b"beta"));
-        assert_ne!(a, b);
-    }
-
-    #[test]
-    fn etag_stable_for_same_data() {
-        let a = compute_default_etag(&Bytes::from_static(b"stable"));
-        let b = compute_default_etag(&Bytes::from_static(b"stable"));
-        assert_eq!(a, b);
-    }
 }

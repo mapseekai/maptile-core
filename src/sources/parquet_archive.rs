@@ -1,9 +1,9 @@
 //! Local Arrow/Parquet archives with a bounded index of pre-encoded tiles.
 
-use super::file_stamp::FileStamp;
 use super::{
     SourceKind, TileCoord, TileEncoding, TileFormat, TileInfo, TileQuery, TileResponse, TileSource,
 };
+use crate::io::file_stamp::FileStamp;
 use crate::{
     cache::{CacheZoomRange, ContentVersion},
     error::{MaptileError, MaptileResult},

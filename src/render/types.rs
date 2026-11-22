@@ -6,7 +6,7 @@
 
 use std::str::FromStr;
 
-pub(crate) const TILE_SIZE: u32 = 512;
+use crate::core::RENDER_TILE_SIZE;
 
 pub(crate) fn mercator_y(lat: f64) -> f64 {
     lat.clamp(-85.051_128_779_806_6, 85.051_128_779_806_6)
@@ -145,8 +145,8 @@ impl RenderRequest {
             style_json: style_json.into(),
             isolate_native_state: false,
             camera: RenderCamera::new(lon, lat, z as f64),
-            width: TILE_SIZE,
-            height: TILE_SIZE,
+            width: RENDER_TILE_SIZE,
+            height: RENDER_TILE_SIZE,
             scale,
             format,
             #[cfg(feature = "render")]
