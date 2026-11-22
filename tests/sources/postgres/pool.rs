@@ -656,9 +656,13 @@ async fn batch_admission_waits_for_twelve_second_backend_cleanup() {
         CREATE FUNCTION "{s}".slow_cleanup(z integer,x integer,y integer) RETURNS bytea LANGUAGE plpgsql AS $$
         BEGIN
           IF x=0 THEN
-            PERFORM nextval('{s}.started');
-            BEGIN PERFORM pg_sleep(30);
-            EXCEPTION WHEN query_canceled THEN PERFORM pg_sleep(12); END;
+            BEGIN
+              -- The test can cancel either backend as soon as both signals are visible.
+              PERFORM nextval('{s}.started');
+              PERFORM pg_sleep(30);
+            EXCEPTION WHEN query_canceled THEN
+              PERFORM pg_sleep(12);
+            END;
           ELSIF x=1 THEN
             PERFORM nextval('{s}.replacement_started'); PERFORM pg_sleep(1);
           ELSIF x=3 THEN
