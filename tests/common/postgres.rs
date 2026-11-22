@@ -6,8 +6,14 @@
 // Shared helpers; some items may be unused until specific tests pull them in.
 #![allow(dead_code)]
 
+use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::{JoinHandle, JoinSet};
+use tokio_postgres::{Client, Config, Transaction, config::Host};
 
 /// Returns the DSN if `DATABASE_URL` is set; otherwise prints a skip notice
 /// and returns `None`. Callers should `let dsn = match pg_dsn() { Some(d) => d, None => return };`.
@@ -101,6 +107,171 @@ impl Drop for SchemaGuard {
             });
         });
     }
+}
+
+pub const CANCELLATION_WATCHDOG: Duration = Duration::from_secs(5);
+
+pub struct CancellationGate<'a> {
+    monitor: &'a Client,
+    pub lock_key: i32,
+    pub dsn: String,
+    proxy: JoinHandle<()>,
+    pending: mpsc::Receiver<(i32, oneshot::Sender<()>)>,
+}
+
+impl<'a> CancellationGate<'a> {
+    pub async fn start(monitor: &'a Client, dsn: &str) -> Self {
+        let session = monitor
+            .query_one(
+                "SELECT pg_backend_pid(), session_user::text, current_database()",
+                &[],
+            )
+            .await
+            .unwrap();
+        let upstream: Config = dsn.parse().unwrap();
+        let host = match upstream.get_hostaddrs().first() {
+            Some(ip) => Host::Tcp(ip.to_string()),
+            None => upstream.get_hosts().first().unwrap().clone(),
+        };
+        let port = upstream.get_ports().first().copied().unwrap_or(5432);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_port = listener.local_addr().unwrap().port();
+        let quote = |value: &str| format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"));
+        let password = std::str::from_utf8(upstream.get_password().unwrap_or_default()).unwrap();
+        let dsn = format!(
+            "host=127.0.0.1 port={proxy_port} sslmode=disable user={} password={} dbname={} options={}",
+            quote(session.get(1)),
+            quote(password),
+            quote(session.get(2)),
+            quote(upstream.get_options().unwrap_or_default()),
+        );
+        let (requests, pending) = mpsc::channel(4);
+        let proxy = tokio::spawn(async move {
+            let mut peers = JoinSet::new();
+            loop {
+                tokio::select! {
+                    accepted = listener.accept() => {
+                        let (client, _) = accepted.unwrap();
+                        peers.spawn(relay_postgres(client, host.clone(), port, requests.clone()));
+                    }
+                    Some(_) = peers.join_next() => {}
+                }
+            }
+        });
+        Self {
+            monitor,
+            lock_key: session.get(0),
+            dsn,
+            proxy,
+            pending,
+        }
+    }
+
+    pub async fn hold<'connection>(
+        &self,
+        holder: &'connection mut Client,
+    ) -> Transaction<'connection> {
+        let locks = holder.transaction().await.unwrap();
+        locks
+            .query_one("SELECT pg_advisory_xact_lock($1, 1)", &[&self.lock_key])
+            .await
+            .unwrap();
+        locks
+    }
+
+    pub async fn wait_for_query(&self) -> i32 {
+        tokio::time::timeout(CANCELLATION_WATCHDOG, async {
+            loop {
+                let waiter = self.monitor.query_opt(
+                    "SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND classid = $1::int::oid
+                     AND objid = 1 AND objsubid = 2 AND NOT granted",
+                    &[&self.lock_key],
+                ).await.unwrap();
+                if let Some(row) = waiter {
+                    return row.get(0);
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("backend never waited on the advisory lock")
+    }
+
+    pub async fn pause_cancellation(&mut self, pid: i32) -> oneshot::Sender<()> {
+        let (cancelled_pid, release) =
+            tokio::time::timeout(CANCELLATION_WATCHDOG, self.pending.recv())
+                .await
+                .expect("no cancellation request arrived")
+                .unwrap();
+        assert_eq!(cancelled_pid, pid);
+        assert_eq!(self.wait_for_query().await, pid);
+        release
+    }
+
+    pub async fn assert_inactive(&self, pid: i32) {
+        let active: bool = self
+            .monitor
+            .query_one(
+                "SELECT EXISTS (SELECT FROM pg_stat_activity WHERE pid = $1 AND state = 'active')",
+                &[&pid],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert!(
+            !active,
+            "PostgreSQL backend {pid} was still active after drain"
+        );
+    }
+}
+
+impl Drop for CancellationGate<'_> {
+    fn drop(&mut self) {
+        self.proxy.abort();
+    }
+}
+
+async fn relay_postgres(
+    mut client: TcpStream,
+    host: Host,
+    port: u16,
+    requests: mpsc::Sender<(i32, oneshot::Sender<()>)>,
+) -> io::Result<()> {
+    const CANCEL_REQUEST: [u8; 8] = [0, 0, 0, 16, 4, 210, 22, 46];
+    let mut startup = [0; 16];
+    client.read_exact(&mut startup[..8]).await?;
+    let startup = if startup[..8] == CANCEL_REQUEST {
+        client.read_exact(&mut startup[8..]).await?;
+        let pid = i32::from_be_bytes(startup[8..12].try_into().unwrap());
+        let (release, allowed) = oneshot::channel();
+        if requests.send((pid, release)).await.is_err() || allowed.await.is_err() {
+            return Ok(());
+        }
+        &startup[..]
+    } else {
+        &startup[..8]
+    };
+    match host {
+        Host::Tcp(host) => {
+            relay_stream(client, TcpStream::connect((host, port)).await?, startup).await
+        }
+        #[cfg(unix)]
+        Host::Unix(dir) => {
+            let server =
+                tokio::net::UnixStream::connect(dir.join(format!(".s.PGSQL.{port}"))).await?;
+            relay_stream(client, server, startup).await
+        }
+    }
+}
+
+async fn relay_stream(
+    mut client: TcpStream,
+    mut server: impl AsyncRead + AsyncWrite + Unpin,
+    startup: &[u8],
+) -> io::Result<()> {
+    server.write_all(startup).await?;
+    tokio::io::copy_bidirectional(&mut client, &mut server).await?;
+    Ok(())
 }
 
 pub async fn assert_invalid_tile_requests(

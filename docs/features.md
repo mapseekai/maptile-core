@@ -13,7 +13,7 @@
 | `parquet-archive` | 读取预编码瓦片的 Parquet 归档 | 使用 Arrow 和 Parquet，归档瓦片列块使用未压缩编码 |
 | `agtiff` | COG 切片、像元点查和多景镶嵌 | 使用 async-geotiff 与 PROJ |
 | `stac` | STAC 搜索和 Raster Style 镶嵌 | 启用 `agtiff` |
-| `raster` | 通过 GDAL 导出原生 GeoTIFF 覆盖 | 启用 `agtiff`。PostGIS Out-DB 同时启用 `postgres` |
+| `raster` | 通过 GDAL 导出原生 GeoTIFF 覆盖 | 启用 `agtiff`。PostGIS Out-DB 同时启用 `postgres`。GDAL 版本见[构建环境](development.md) |
 | `zstd` | Zstandard 瓦片传输编解码 | 启用原生 zstd |
 | `mlt` | MVT 与 MLT 有界转换 | 拒绝无法保留的内容，如未知 MLT 帧和混合属性类型的 MVT 字段 |
 | `metrics` | Prometheus 缓存请求计数器 | 应用抓取默认 registry |

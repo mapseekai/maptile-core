@@ -665,35 +665,38 @@ async fn invalid_requests_are_rejected_before_function_sql() {
 
 #[tokio::test]
 async fn catalog_revocation_waits_for_cancelled_postgres_statements() {
+    use common::postgres::{CANCELLATION_WATCHDOG, CancellationGate};
     use maptile_core::{
         cache::TileCache,
         control::CatalogService,
         error::MaptileError,
         service::{ReadTarget, TileStack},
     };
-    use std::time::Duration;
     use tokio::time::{Instant, timeout};
 
     let Some(dsn) = common::postgres::pg_dsn() else {
         return;
     };
     let guard = common::postgres::SchemaGuard::create(&dsn).await;
-    let pool = make_pool(&dsn).await;
-    let monitor = pool.get().await.unwrap();
+    let monitor_pool = make_pool(&dsn).await;
+    let monitor = monitor_pool.get().await.unwrap();
+    let mut gate_owner = monitor_pool.get().await.unwrap();
+    let mut gate = CancellationGate::start(&monitor, &dsn).await;
+    let pool = make_pool(&gate.dsn).await;
     monitor
         .batch_execute(&format!(
             r#"
-        CREATE FUNCTION "{}".hold_for_revocation(z integer, x integer, y integer)
+        CREATE FUNCTION "{schema}".hold_for_revocation(z integer, x integer, y integer)
         RETURNS bytea LANGUAGE plpgsql AS $$
         BEGIN
             IF x = 0 THEN
-                BEGIN PERFORM pg_sleep(30);
-                EXCEPTION WHEN query_canceled THEN PERFORM pg_sleep(1); END;
+                PERFORM pg_advisory_xact_lock({lock_key}, 1);
             END IF;
             RETURN ''::bytea;
         END $$;
     "#,
-            guard.name
+            schema = guard.name,
+            lock_key = gate.lock_key,
         ))
         .await
         .unwrap();
@@ -727,6 +730,7 @@ async fn catalog_revocation_waits_for_cancelled_postgres_statements() {
         update.put(Arc::new(live)).unwrap();
         catalog.catalog().publish(update).unwrap();
         let observed = catalog.catalog().snapshot();
+        let locks = gate.hold(&mut gate_owner).await;
 
         let job = tokio::spawn({
             let stack = stack.clone();
@@ -740,53 +744,38 @@ async fn catalog_revocation_waits_for_cancelled_postgres_statements() {
                 }
             }
         });
-        let pid: i32 = timeout(Duration::from_secs(3), async {
-            loop {
-                let active = monitor
-                    .query_opt(
-                        "SELECT pid FROM pg_stat_activity
-                     WHERE wait_event = 'PgSleep' AND position($1 in query) > 0",
-                        &[&guard.name],
-                    )
-                    .await
-                    .unwrap();
-                if let Some(row) = active {
-                    break row.get(0);
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-
-        let short = catalog
-            .catalog()
-            .revoke(&observed, id, Instant::now() + Duration::from_millis(100))
-            .await;
-        assert!(matches!(short, Err(MaptileError::Deadline)));
-        assert!(matches!(job.await.unwrap(), Err(MaptileError::Cancelled)));
+        let pid = gate.wait_for_query().await;
+        let mut drain = Box::pin(catalog.catalog().revoke(
+            &observed,
+            id,
+            Instant::now() + CANCELLATION_WATCHDOG,
+        ));
+        assert!(futures_util::poll!(drain.as_mut()).is_pending());
+        let release = gate.pause_cancellation(pid).await;
+        assert!(matches!(
+            timeout(CANCELLATION_WATCHDOG, job).await.unwrap().unwrap(),
+            Err(MaptileError::Cancelled)
+        ));
+        assert!(futures_util::poll!(drain.as_mut()).is_pending());
+        assert!(matches!(
+            catalog
+                .catalog()
+                .revoke(&observed, id, Instant::now())
+                .await,
+            Err(MaptileError::Deadline)
+        ));
         let unrelated = ReadTarget::new("unrelated", "public").at(TileCoord { z: 1, x: 1, y: 0 });
         assert!(
-            timeout(Duration::from_secs(1), stack.read(unrelated))
+            timeout(CANCELLATION_WATCHDOG, stack.read(unrelated))
                 .await
                 .unwrap()
                 .is_ok()
         );
 
-        catalog
-            .catalog()
-            .revoke(&observed, id, Instant::now() + Duration::from_secs(3))
-            .await
-            .unwrap();
-        let remains_active: bool = monitor
-            .query_one(
-                "SELECT EXISTS (SELECT FROM pg_stat_activity WHERE pid = $1 AND state = 'active')",
-                &[&pid],
-            )
-            .await
-            .unwrap()
-            .get(0);
-        assert!(!remains_active);
+        release.send(()).unwrap();
+        drain.await.unwrap();
+        gate.assert_inactive(pid).await;
+        locks.commit().await.unwrap();
     }
 }
 

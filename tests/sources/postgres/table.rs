@@ -706,27 +706,30 @@ async fn point_table_keeps_its_exact_degenerate_extent() {
 
 #[tokio::test]
 async fn shutdown_waits_for_cancelled_table_discovery_sql() {
+    use common::postgres::{CANCELLATION_WATCHDOG, CancellationGate};
     use maptile_core::{
         cache::{ContentVersion, TileCache},
         control::{CatalogService, DiscoveredDataset, Inventory, TileDriver},
         error::MaptileError,
     };
-    use tokio::time::{Duration, Instant, timeout};
+    use tokio::time::{Instant, timeout};
 
     let Some(dsn) = common::postgres::pg_dsn() else {
         return;
     };
     let schema = common::postgres::SchemaGuard::create(&dsn).await;
     create_simple_table(&dsn, &schema.name, "input").await;
-    let pool = make_pool(&dsn).await;
-    let monitor = pool.get().await.unwrap();
+    let monitor_pool = make_pool(&dsn).await;
+    let monitor = monitor_pool.get().await.unwrap();
+    let mut gate_owner = monitor_pool.get().await.unwrap();
+    let mut gate = CancellationGate::start(&monitor, &dsn).await;
+    let pool = make_pool(&gate.dsn).await;
     monitor
         .batch_execute(&format!(
             r#"
             CREATE FUNCTION "{s}".hold_bounds(value geometry) RETURNS geometry LANGUAGE plpgsql AS $$
             BEGIN
-                BEGIN PERFORM pg_sleep(30);
-                EXCEPTION WHEN query_canceled THEN PERFORM pg_sleep(1); END;
+                PERFORM pg_advisory_xact_lock({lock_key}, 1);
                 RETURN value;
             END $$;
             CREATE VIEW "{s}".discovery AS
@@ -734,11 +737,13 @@ async fn shutdown_waits_for_cancelled_table_discovery_sql() {
                 FROM "{s}".input LIMIT 1;
             "#,
             s = schema.name,
+            lock_key = gate.lock_key,
         ))
         .await
         .unwrap();
     let config = cfg_for(&schema.name, "discovery");
     let service = Arc::new(CatalogService::new(TileCache::new(4, None, None).unwrap()));
+    let locks = gate.hold(&mut gate_owner).await;
     let reconcile = tokio::spawn({
         let service = service.clone();
         async move {
@@ -759,47 +764,30 @@ async fn shutdown_waits_for_cancelled_table_discovery_sql() {
                 .await
         }
     });
-    let pid: i32 = timeout(Duration::from_secs(3), async {
-        loop {
-            if let Some(row) = monitor
-                .query_opt(
-                    "SELECT pid FROM pg_stat_activity
-                     WHERE wait_event = 'PgSleep' AND position($1 in query) > 0",
-                    &[&schema.name],
-                )
-                .await
-                .unwrap()
-            {
-                break row.get(0);
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("PostGIS bounds discovery SQL must reach the fixture");
+    let pid = gate.wait_for_query().await;
     reconcile.abort();
-    assert!(reconcile.await.unwrap_err().is_cancelled());
-    assert!(matches!(
+    assert!(
+        timeout(CANCELLATION_WATCHDOG, reconcile)
+            .await
+            .unwrap()
+            .unwrap_err()
+            .is_cancelled()
+    );
+    let release = gate.pause_cancellation(pid).await;
+    let mut drain = Box::pin(
         service
             .catalog()
-            .shutdown(Instant::now() + Duration::from_millis(100))
-            .await,
+            .shutdown(Instant::now() + CANCELLATION_WATCHDOG),
+    );
+    assert!(futures_util::poll!(drain.as_mut()).is_pending());
+    assert!(matches!(
+        service.catalog().shutdown(Instant::now()).await,
         Err(MaptileError::Deadline),
     ));
-    service
-        .catalog()
-        .shutdown(Instant::now() + Duration::from_secs(3))
-        .await
-        .unwrap();
-    let active: bool = monitor
-        .query_one(
-            "SELECT EXISTS (SELECT FROM pg_stat_activity WHERE pid = $1 AND state = 'active')",
-            &[&pid],
-        )
-        .await
-        .unwrap()
-        .get(0);
-    assert!(!active);
+    release.send(()).unwrap();
+    drain.await.unwrap();
+    gate.assert_inactive(pid).await;
+    locks.commit().await.unwrap();
 }
 
 #[tokio::test]

@@ -20,12 +20,14 @@ cargo --version
 | `geoparquet` / `duckdb` | C/C++ 工具链 | 编译 bundled DuckDB；几何查询准备相应扩展 |
 | `local-vector` | `geoparquet` 的环境与 Spatial 扩展 | 使用扩展自带的矢量驱动 |
 | `agtiff` / `stac` | PROJ 及匹配的运行时坐标数据 | 当前 `proj-sys` 构建要求系统 PROJ ≥9.6.2，或由 CMake 构建随包源码 |
-| `raster` | GDAL、对应开发库及 PROJ | 提供 GDAL 相关栅格路径 |
+| `raster` | GDAL 3.4 至 3.12、配套头文件及 PROJ | macOS CI 使用 GDAL 3.12，Ubuntu 24.04 使用发行版的 GDAL |
 | `render`，macOS | C/C++、CMake、Ninja、Xcode Command Line Tools | 使用 Metal 后端 |
 | `render`，Linux | C/C++、CMake、Ninja及 Vulkan 构建和运行环境 | 使用默认 Vulkan 后端 |
 | `render-opengl` | Linux 的 C/C++、CMake、Ninja及 OpenGL 构建和运行环境 | 使用 OpenGL 变体 |
 
 依赖解析版本记录在 [Cargo.lock](../Cargo.lock)。PROJ 的版本探测和源码回退逻辑由锁定版本的 `proj-sys` 构建脚本执行；运行时同时提供匹配的 PROJ 数据目录。
+
+使用 macOS 上的 GDAL 3.12 时，请让 `GDAL_HOME` 和 `PKG_CONFIG_PATH` 指向同一安装。运行 `pkg-config --modversion gdal` 确认版本。GDAL 3.13 更改了字节类型名及栅格 I/O 参数结构，当前正式版 Rust `gdal 0.19` 无法用其头文件编译。升级 Rust 绑定前，`raster` 请使用上表的原生版本。
 
 ## 常规检查
 

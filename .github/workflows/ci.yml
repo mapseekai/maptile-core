@@ -169,14 +169,33 @@ jobs:
         with:
           toolchain: "1.98.1"
           components: clippy
-      - name: Install PROJ or GDAL
-        if: contains(matrix.features, 'agtiff') || contains(matrix.features, 'stac') || contains(matrix.features, 'raster')
+      - name: Install PROJ
+        if: matrix.name == 'agtiff' || matrix.name == 'stac'
+        run: brew install proj
+      - name: Install GDAL supported by the Rust bindings
+        if: matrix.name == 'raster'
+        uses: mamba-org/setup-micromamba@add3a49764cedee8ee24e82dfde87f5bc2914462 # v2
+        with:
+          environment-name: raster
+          create-args: -c conda-forge libgdal-core-devel=3.12.*
+          init-shell: none
+      - name: Select the native raster environment
+        if: matrix.name == 'raster'
+        shell: micromamba-shell {0}
         run: |
-          if [[ "$FEATURES" == *raster* ]]; then
-            brew install gdal
-          else
-            brew install proj
-          fi
+          set -euo pipefail
+          export PKG_CONFIG_PATH="$CONDA_PREFIX/lib/pkgconfig"
+          [[ "$(pkg-config --modversion gdal)" == 3.12.* ]]
+          [[ "$(pkg-config --variable=prefix gdal)" == "$CONDA_PREFIX" ]]
+          test -r "$(pkg-config --variable=includedir gdal)/gdal.h"
+          test -r "$(pkg-config --variable=libdir gdal)/libgdal.dylib"
+          {
+            echo "GDAL_HOME=$CONDA_PREFIX"
+            echo "GDAL_DATA=$CONDA_PREFIX/share/gdal"
+            echo "PROJ_DATA=$CONDA_PREFIX/share/proj"
+            echo "PKG_CONFIG_PATH=$PKG_CONFIG_PATH"
+            echo "RUSTFLAGS=-C link-arg=-Wl,-rpath,$CONDA_PREFIX/lib"
+          } >> "$GITHUB_ENV"
       - name: Assert feature boundaries
         run: bash scripts/ci/check-feature-dependencies.sh "$FEATURES"
       - name: Test
