@@ -189,12 +189,14 @@ jobs:
           [[ "$(pkg-config --variable=prefix gdal)" == "$CONDA_PREFIX" ]]
           test -r "$(pkg-config --variable=includedir gdal)/gdal.h"
           test -r "$(pkg-config --variable=libdir gdal)/libgdal.dylib"
+          rpath="-C link-arg=-Wl,-rpath,$CONDA_PREFIX/lib"
           {
             echo "GDAL_HOME=$CONDA_PREFIX"
             echo "GDAL_DATA=$CONDA_PREFIX/share/gdal"
             echo "PROJ_DATA=$CONDA_PREFIX/share/proj"
             echo "PKG_CONFIG_PATH=$PKG_CONFIG_PATH"
-            echo "RUSTFLAGS=-C link-arg=-Wl,-rpath,$CONDA_PREFIX/lib"
+            echo "RUSTFLAGS=$rpath"
+            echo "RUSTDOCFLAGS=$rpath"
           } >> "$GITHUB_ENV"
       - name: Assert feature boundaries
         run: bash scripts/ci/check-feature-dependencies.sh "$FEATURES"
