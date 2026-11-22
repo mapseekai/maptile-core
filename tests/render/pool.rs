@@ -439,7 +439,7 @@ async fn timed_submission_returns_overload_when_queue_remains_full() {
         .unwrap();
 
     let (third_tx, _third_rx) = tokio::sync::oneshot::channel();
-    let error = submit_for_test_with_timeout(
+    let error = submit_with_timeout(
         group.sender(),
         RenderJob {
             request: request(),
@@ -461,7 +461,7 @@ async fn timed_submission_to_closed_queue_is_render_error() {
     let (sender, receiver) = flume::bounded::<WorkerMessage<()>>(1);
     drop(receiver);
     let (response, _) = tokio::sync::oneshot::channel();
-    let error = submit_for_test_with_timeout(
+    let error = submit_with_timeout(
         &sender,
         RenderJob {
             request: request(),
@@ -505,7 +505,7 @@ async fn dropped_response_after_admission_skips_before_worker_pickup() {
     control.wait_entered();
 
     let (second_tx, second_rx) = tokio::sync::oneshot::channel();
-    submit_for_test_with_timeout(
+    submit_with_timeout(
         group.sender(),
         RenderJob {
             request: request(),

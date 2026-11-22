@@ -1,6 +1,7 @@
 mod compile;
 mod read;
 #[cfg(test)]
+#[path = "../../../tests/control/composition.rs"]
 mod tests;
 
 use std::sync::Arc;

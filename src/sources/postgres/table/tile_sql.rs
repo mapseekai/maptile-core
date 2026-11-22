@@ -156,4 +156,5 @@ fn build_bbox_search(info: &TableInfo, supports_tile_margin: bool, [z, x, y]: [&
 }
 
 #[cfg(test)]
+#[path = "../../../../tests/sources/postgres/table/tile_sql.rs"]
 mod tests;

@@ -240,5 +240,5 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libegl1-mesa-dev libgles2-mesa-dev libglfw3-dev libuv1-dev libicu-dev libpng-dev libjpeg-dev libwebp-dev libcurl4-openssl-dev
-      - name: Build pinned native source and render fixture images
-        run: bash scripts/ci/maptile-render-cargo.sh test --locked --features render-opengl --test render_native -- --test-threads=1
+      - name: Run library tests and render native fixture images
+        run: bash scripts/ci/maptile-render-cargo.sh test --locked --features render-opengl --lib --test render_native -- --test-threads=1

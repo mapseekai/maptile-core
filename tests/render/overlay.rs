@@ -4,6 +4,30 @@
 use super::*;
 use image::RgbaImage;
 
+fn encode_polyline(points: &[GeoPoint]) -> String {
+    let mut encoded = String::new();
+    let mut prev_lat = 0i64;
+    let mut prev_lng = 0i64;
+    for point in points {
+        let lat = (point.lat * 1e5).round() as i64;
+        let lng = (point.lon * 1e5).round() as i64;
+        encode_value(lat - prev_lat, &mut encoded);
+        encode_value(lng - prev_lng, &mut encoded);
+        prev_lat = lat;
+        prev_lng = lng;
+    }
+    encoded
+}
+
+fn encode_value(mut value: i64, output: &mut String) {
+    value = if value < 0 { !(value << 1) } else { value << 1 };
+    while value >= 0x20 {
+        output.push(((value & 0x1f) as u8 + 63 + 0x20) as char);
+        value >>= 5;
+    }
+    output.push((value as u8 + 63) as char);
+}
+
 #[test]
 fn malformed_overlay_strings_do_not_panic() {
     for path in ["path-red(", "path-(é", "path-", "path-3(0,0|1,1"] {

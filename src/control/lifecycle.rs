@@ -7,8 +7,6 @@ use std::{
 use tokio::{sync::RwLock, time::Instant};
 use tokio_util::sync::CancellationToken;
 
-#[cfg(test)]
-use super::catalog::validate_id;
 use super::{DiscoveredDataset, SourceDescriptor, TileDriver};
 use crate::{
     cache::ContentVersion,
@@ -91,14 +89,6 @@ impl Drop for Recovery<'_> {
 }
 
 impl SourceSlot {
-    #[cfg(test)]
-    pub(super) fn new(driver: Arc<dyn TileDriver>) -> MaptileResult<Self> {
-        let descriptor = driver.descriptor();
-        validate_id(&descriptor.id)?;
-        let instance = Arc::new(DriverInstance::new(driver, descriptor));
-        Self::registration(instance, false, None)
-    }
-
     pub(super) fn registration(
         instance: Arc<DriverInstance>,
         trusted_mvt: bool,

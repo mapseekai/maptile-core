@@ -477,13 +477,5 @@ async fn submit_with_timeout<O: Send + 'static>(
 }
 
 #[cfg(test)]
-async fn submit_for_test_with_timeout<O: Send + 'static>(
-    sender: &flume::Sender<WorkerMessage<O>>,
-    job: RenderJob<O>,
-    admission_timeout: std::time::Duration,
-) -> MaptileResult<()> {
-    submit_with_timeout(sender, job, admission_timeout).await
-}
-
-#[cfg(test)]
+#[path = "../../tests/render/pool.rs"]
 mod tests;

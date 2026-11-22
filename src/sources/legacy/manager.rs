@@ -629,6 +629,3 @@ pub struct Catalog {
     pub sources: Vec<CatalogSource>,
     pub styles: Vec<crate::styles::StyleInfo>,
 }
-
-#[cfg(test)]
-mod tests;

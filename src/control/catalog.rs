@@ -1,5 +1,6 @@
 mod inventory;
 #[cfg(test)]
+#[path = "../../tests/control/catalog.rs"]
 mod tests;
 
 pub(crate) use inventory::CatalogBuildLease;

@@ -286,4 +286,5 @@ async fn estimate_bounds(
 }
 
 #[cfg(test)]
+#[path = "../../../../tests/sources/postgres/table/metadata.rs"]
 mod tests;

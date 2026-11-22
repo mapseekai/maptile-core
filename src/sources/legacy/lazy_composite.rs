@@ -342,6 +342,3 @@ impl TileSource for LazyCompositeSource {
         .await
     }
 }
-
-#[cfg(test)]
-mod tests;

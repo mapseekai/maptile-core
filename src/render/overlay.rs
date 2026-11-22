@@ -114,32 +114,6 @@ fn decode_polyline_value(bytes: &mut impl Iterator<Item = u8>) -> Option<i64> {
     None
 }
 
-#[cfg(test)]
-fn encode_polyline(points: &[GeoPoint]) -> String {
-    let mut encoded = String::new();
-    let mut prev_lat = 0i64;
-    let mut prev_lng = 0i64;
-    for point in points {
-        let lat = (point.lat * 1e5).round() as i64;
-        let lng = (point.lon * 1e5).round() as i64;
-        encode_value(lat - prev_lat, &mut encoded);
-        encode_value(lng - prev_lng, &mut encoded);
-        prev_lat = lat;
-        prev_lng = lng;
-    }
-    encoded
-}
-
-#[cfg(test)]
-fn encode_value(mut value: i64, output: &mut String) {
-    value = if value < 0 { !(value << 1) } else { value << 1 };
-    while value >= 0x20 {
-        output.push(((value & 0x1f) as u8 + 63 + 0x20) as char);
-        value >>= 5;
-    }
-    output.push((value as u8 + 63) as char);
-}
-
 fn is_encoded_polyline(s: &str) -> bool {
     if s.is_empty() {
         return false;
@@ -389,4 +363,5 @@ pub fn calculate_bounds(
 }
 
 #[cfg(test)]
+#[path = "../../tests/render/overlay.rs"]
 mod tests;

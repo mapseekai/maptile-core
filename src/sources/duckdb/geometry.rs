@@ -3,6 +3,7 @@
 mod bounds;
 mod resolver;
 #[cfg(test)]
+#[path = "../../../tests/sources/duckdb/geometry.rs"]
 mod tests;
 mod tile_sql;
 
@@ -216,15 +217,6 @@ impl GeometrySource {
                 .ok()
                 .flatten();
         }
-    }
-
-    #[cfg(test)]
-    async fn tile(
-        &self,
-        xyz: TileCoord,
-        lease: Option<Arc<dyn Send + Sync>>,
-    ) -> MaptileResult<bytes::Bytes> {
-        self.read_tile(xyz, lease, None).await
     }
 
     pub async fn read_tile(

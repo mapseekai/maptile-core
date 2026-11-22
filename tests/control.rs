@@ -1,10 +1,13 @@
 use bytes::Bytes;
-use geozero::mvt::{Message, Tile, tile::Layer};
+use geozero::mvt::{
+    Message, Tile,
+    tile::{Feature, GeomType, Layer, Value},
+};
 use maptile_core::{
     cache::{ContentVersion, StyleHash, TileCache},
     control::{
-        CatalogService, CompositeDeclaration, DiscoveredDataset, DuplicateLayer, Inventory,
-        MemberFailurePolicy, SourceDescriptor, TileDriver,
+        CatalogService, CompositeDeclaration, CompositeLimits, DiscoveredDataset, DuplicateLayer,
+        Inventory, MemberFailurePolicy, SourceCatalog, SourceDescriptor, TileDriver, open_blocking,
     },
     error::{MaptileError, MaptileResult},
     service::{ReadTarget, TileLayer, TileOutcome, TileService, TileStack, ValidatedTileRequest},
@@ -12,17 +15,38 @@ use maptile_core::{
         MAX_TILE_BATCH_COORDS, TileCoord, TileEncoding, TileFormat, TileInfo, TileQuery,
         TileResponse,
     },
+    transport,
 };
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    },
+    time::Duration,
+};
+use tokio::{
+    sync::{Barrier, Notify},
+    time::Instant,
 };
 
 struct TestDriver {
     descriptor: SourceDescriptor,
-    tiles: [Option<Bytes>; 2],
+    tiles: Vec<Option<Bytes>>,
     error: Option<MaptileError>,
     reads: Arc<AtomicUsize>,
+    read_barrier: Option<Arc<Barrier>>,
+}
+impl TestDriver {
+    fn new(descriptor: SourceDescriptor, tiles: impl Into<Vec<Option<Bytes>>>) -> Self {
+        Self {
+            descriptor,
+            tiles: tiles.into(),
+            error: None,
+            reads: Arc::default(),
+            read_barrier: None,
+        }
+    }
 }
 #[async_trait::async_trait]
 impl TileDriver for TestDriver {
@@ -34,6 +58,9 @@ impl TileDriver for TestDriver {
         coord: TileCoord,
         _: Option<&TileQuery<'_>>,
     ) -> MaptileResult<Option<TileResponse>> {
+        if let Some(barrier) = &self.read_barrier {
+            barrier.wait().await;
+        }
         self.reads.fetch_add(1, Ordering::SeqCst);
         if let Some(error) = &self.error {
             return Err(error.clone());
@@ -48,15 +75,21 @@ impl TileDriver for TestDriver {
     }
 }
 fn tile(name: &str, extent: u32) -> Bytes {
+    tile_layers(&[(name, extent)])
+}
+fn tile_layers(layers: &[(&str, u32)]) -> Bytes {
     let tile = Tile {
-        layers: vec![Layer {
-            version: 2,
-            name: name.into(),
-            features: vec![],
-            keys: vec![],
-            values: vec![],
-            extent: Some(extent),
-        }],
+        layers: layers
+            .iter()
+            .map(|&(name, extent)| Layer {
+                version: 2,
+                name: name.into(),
+                features: vec![],
+                keys: vec![],
+                values: vec![],
+                extent: Some(extent),
+            })
+            .collect(),
     };
     Bytes::from(tile.encode_to_vec())
 }
@@ -68,10 +101,9 @@ fn driver(
     reads: Arc<AtomicUsize>,
 ) -> Arc<dyn TileDriver> {
     Arc::new(TestDriver {
-        descriptor: strict_descriptor(id, names),
-        tiles,
         error,
         reads,
+        ..TestDriver::new(strict_descriptor(id, names), tiles)
     })
 }
 fn strict_descriptor(id: &str, names: &[&str]) -> SourceDescriptor {
@@ -108,6 +140,49 @@ async fn stack_read(stack: &TileStack, id: &str, x: u32) -> MaptileResult<TileOu
     stack
         .read(ReadTarget::new(id, "scope").at(TileCoord { z: 1, x, y: 0 }))
         .await
+}
+
+fn composition_source(
+    id: &str,
+    declared: &[&str],
+    result: MaptileResult<Option<Bytes>>,
+) -> Arc<dyn TileDriver> {
+    let mut descriptor = strict_descriptor(id, declared);
+    descriptor.capabilities.consistent_export = false;
+    let (data, error) = match result {
+        Ok(data) => (data, None),
+        Err(error) => (None, Some(error)),
+    };
+    Arc::new(TestDriver {
+        error,
+        ..TestDriver::new(descriptor, [data])
+    })
+}
+
+fn composition_stack(
+    sources: &[Arc<dyn TileDriver>],
+    declarations: &[CompositeDeclaration],
+    limits: CompositeLimits,
+) -> MaptileResult<TileStack> {
+    let service = Arc::new(
+        CatalogService::with_limits(TileCache::new(1, None, None).unwrap(), limits).unwrap(),
+    );
+    let mut update = service.catalog().update();
+    for source in sources {
+        update.put(source.clone()).unwrap();
+    }
+    for declaration in declarations {
+        update.composite(declaration.clone()).unwrap();
+    }
+    service.catalog().publish(update)?;
+    Ok(TileStack::builder(service).build())
+}
+
+fn present_data(outcome: TileOutcome) -> Bytes {
+    match outcome {
+        TileOutcome::Present(tile) => tile.data,
+        _ => panic!("expected present tile, got {outcome:?}"),
+    }
 }
 
 #[tokio::test]
@@ -221,6 +296,461 @@ async fn public_stack_composite_uses_actual_layers_and_keeps_partial_out_of_cach
     );
     assert!(service.catalog().snapshot().describe("a,c").is_none());
     assert_eq!(service.catalog().snapshot().generation(), generation + 1);
+}
+
+#[tokio::test]
+async fn rejects_cycle_missing_regular_duplicate_leaf_and_unknown_layers() {
+    let limits = CompositeLimits::default();
+    let lazy = |id, members: &[&str]| CompositeDeclaration {
+        lazy: true,
+        ..decl(
+            id,
+            members,
+            DuplicateLayer::Error,
+            MemberFailurePolicy::FailFast,
+        )
+    };
+    assert!(matches!(
+        composition_stack(&[], &[lazy("x", &["y"]), lazy("y", &["x"])], limits),
+        Err(MaptileError::Config(message)) if message.starts_with("composite cycle at ")
+    ));
+    assert!(matches!(
+        composition_stack(
+            &[],
+            &[decl(
+                "x",
+                &["missing"],
+                DuplicateLayer::Error,
+                MemberFailurePolicy::FailFast,
+            )],
+            limits,
+        ),
+        Err(MaptileError::Config(message)) if message == "missing composite member missing in x"
+    ));
+    let a = composition_source("a", &["roads"], Ok(Some(tile("roads", 1))));
+    assert!(matches!(
+        composition_stack(
+            &[a],
+            &[decl(
+                "x",
+                &["a", "a"],
+                DuplicateLayer::KeepFirst,
+                MemberFailurePolicy::FailFast,
+            )],
+            limits,
+        ),
+        Err(MaptileError::Config(message)) if message == "duplicate leaf a in x"
+    ));
+    let unknown = composition_source("unknown", &[], Ok(Some(Bytes::new())));
+    assert!(matches!(
+        composition_stack(
+            &[unknown],
+            &[decl(
+                "x",
+                &["unknown"],
+                DuplicateLayer::Error,
+                MemberFailurePolicy::FailFast,
+            )],
+            limits,
+        ),
+        Err(MaptileError::Config(message)) if message == "member unknown lacks strict MVT declarations"
+    ));
+    let stack = composition_stack(&[], &[lazy("x", &["missing"])], limits).unwrap();
+    assert!(matches!(
+        stack_read(&stack, "x", 0).await,
+        Err(MaptileError::SourceUnavailable(id)) if id == "x"
+    ));
+}
+
+#[test]
+fn depth_limit_counts_declarations_and_rejects_deep_graph_before_building() {
+    let declarations: Vec<_> = (0..65)
+        .map(|n| CompositeDeclaration {
+            id: format!("node{n}").into(),
+            members: vec![if n == 64 {
+                "leaf".into()
+            } else {
+                format!("node{}", n + 1).into()
+            }],
+            lazy: true,
+            duplicate_layer: DuplicateLayer::Error,
+            failure_policy: MemberFailurePolicy::FailFast,
+        })
+        .collect();
+    let limits = CompositeLimits::default();
+    assert!(matches!(
+        composition_stack(&[], &declarations, limits),
+        Err(MaptileError::Config(message)) if message == "composite graph too deep"
+    ));
+    assert!(composition_stack(&[], &declarations[1..], limits).is_ok());
+}
+
+#[tokio::test]
+async fn conflicts_are_selected_from_actual_per_tile_layers() {
+    let sources = [
+        composition_source("a", &["roads", "water"], Ok(Some(tile("roads", 11)))),
+        composition_source(
+            "b",
+            &["roads", "water"],
+            Ok(Some(tile_layers(&[("roads", 22), ("water", 33)]))),
+        ),
+    ];
+    for (policy, extent) in [
+        (DuplicateLayer::KeepFirst, 11),
+        (DuplicateLayer::KeepLast, 22),
+    ] {
+        let stack = composition_stack(
+            &sources,
+            &[decl(
+                "x",
+                &["a", "b"],
+                policy,
+                MemberFailurePolicy::FailFast,
+            )],
+            CompositeLimits::default(),
+        )
+        .unwrap();
+        let result = Tile::decode(present_data(stack_read(&stack, "x", 0).await.unwrap())).unwrap();
+        assert_eq!(result.layers.len(), 2);
+        assert_eq!(
+            result
+                .layers
+                .iter()
+                .find(|layer| layer.name == "roads")
+                .unwrap()
+                .extent,
+            Some(extent)
+        );
+        assert!(result.layers.iter().any(|layer| layer.name == "water"));
+    }
+}
+
+#[tokio::test]
+async fn rejects_undeclared_actual_layer_even_when_error_policy_declares_no_conflict() {
+    let a = composition_source("a", &["roads"], Ok(Some(tile("roads", 1))));
+    for encoding in [TileEncoding::Uncompressed, TileEncoding::Gzip] {
+        let mut descriptor = strict_descriptor("b", &["water"]);
+        descriptor.info.encoding = encoding;
+        let bytes = transport::encode_as(&tile("roads", 2), encoding).unwrap();
+        let b = Arc::new(TestDriver::new(descriptor, [Some(bytes)]));
+        let stack = composition_stack(
+            &[a.clone(), b],
+            &[decl(
+                "x",
+                &["a", "b"],
+                DuplicateLayer::Error,
+                MemberFailurePolicy::FailFast,
+            )],
+            CompositeLimits::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            stack_read(&stack, "x", 0).await,
+            Err(MaptileError::InvalidMetadata(_))
+        ));
+    }
+    let duplicate = composition_source(
+        "duplicate",
+        &["roads"],
+        Ok(Some(tile_layers(&[("roads", 1), ("roads", 2)]))),
+    );
+    let stack = composition_stack(
+        &[duplicate],
+        &[decl(
+            "x",
+            &["duplicate"],
+            DuplicateLayer::KeepFirst,
+            MemberFailurePolicy::FailFast,
+        )],
+        CompositeLimits::default(),
+    )
+    .unwrap();
+    assert!(matches!(
+        stack_read(&stack, "x", 0).await,
+        Err(MaptileError::InvalidMetadata(_))
+    ));
+}
+
+#[tokio::test]
+async fn empty_is_present_no_tile_is_absent_and_transient_skip_is_partial() {
+    let sources = [
+        composition_source("empty", &["roads"], Ok(Some(Bytes::new()))),
+        composition_source("absent", &["water"], Ok(None)),
+        composition_source(
+            "fail",
+            &["rivers"],
+            Err(MaptileError::SourceUnavailable("fail".into())),
+        ),
+    ];
+    let stack = composition_stack(
+        &sources,
+        &[
+            decl(
+                "zero",
+                &["empty", "absent"],
+                DuplicateLayer::Error,
+                MemberFailurePolicy::FailFast,
+            ),
+            decl(
+                "partial",
+                &["zero", "fail"],
+                DuplicateLayer::Error,
+                MemberFailurePolicy::SkipTransient,
+            ),
+        ],
+        CompositeLimits::default(),
+    )
+    .unwrap();
+    assert!(matches!(
+        stack_read(&stack, "absent", 0).await.unwrap(),
+        TileOutcome::NoTile
+    ));
+    assert!(present_data(stack_read(&stack, "zero", 0).await.unwrap()).is_empty());
+    let TileOutcome::Partial {
+        tile: Some(tile),
+        failures,
+    } = stack_read(&stack, "partial", 0).await.unwrap()
+    else {
+        panic!("expected partial tile")
+    };
+    assert!(tile.data.is_empty());
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].source.as_ref(), "fail");
+}
+
+#[tokio::test]
+async fn nested_policy_and_total_limit_are_preserved() {
+    let sources = [
+        composition_source(
+            "fail",
+            &["failed"],
+            Err(MaptileError::SourceUnavailable("fail".into())),
+        ),
+        composition_source("ok", &["ok"], Ok(Some(tile("ok", 1)))),
+    ];
+    let declarations = [
+        decl(
+            "inner",
+            &["fail"],
+            DuplicateLayer::Error,
+            MemberFailurePolicy::FailFast,
+        ),
+        decl(
+            "outer",
+            &["inner", "ok"],
+            DuplicateLayer::Error,
+            MemberFailurePolicy::SkipTransient,
+        ),
+    ];
+    let stack = composition_stack(&sources, &declarations, CompositeLimits::default()).unwrap();
+    assert!(matches!(
+        stack_read(&stack, "outer", 0).await.unwrap(),
+        TileOutcome::Partial { tile: Some(_), .. }
+    ));
+    let limits = CompositeLimits {
+        max_decoded_bytes: 1,
+        ..CompositeLimits::default()
+    };
+    let stack = composition_stack(&sources, &declarations, limits).unwrap();
+    assert!(matches!(
+        stack_read(&stack, "outer", 0).await,
+        Err(MaptileError::PayloadTooLarge { limit: 1 })
+    ));
+}
+
+#[tokio::test]
+async fn all_skipped_is_an_error_and_invalid_input_is_never_skipped() {
+    let sources = [
+        composition_source(
+            "a",
+            &["a"],
+            Err(MaptileError::SourceUnavailable("a".into())),
+        ),
+        composition_source(
+            "b",
+            &["b"],
+            Err(MaptileError::SourceUnavailable("b".into())),
+        ),
+        composition_source(
+            "invalid",
+            &["invalid"],
+            Err(MaptileError::InvalidRequest("invalid".into())),
+        ),
+    ];
+    let stack = composition_stack(
+        &sources,
+        &[
+            decl(
+                "x",
+                &["a", "b"],
+                DuplicateLayer::Error,
+                MemberFailurePolicy::SkipTransient,
+            ),
+            decl(
+                "bad",
+                &["invalid"],
+                DuplicateLayer::Error,
+                MemberFailurePolicy::SkipTransient,
+            ),
+        ],
+        CompositeLimits::default(),
+    )
+    .unwrap();
+    assert!(matches!(
+        stack_read(&stack, "x", 0).await,
+        Err(MaptileError::SourceUnavailable(_))
+    ));
+    assert!(matches!(
+        stack_read(&stack, "bad", 0).await,
+        Err(MaptileError::InvalidRequest(_))
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compressed_members_respect_work_and_decoded_limits() {
+    use std::io::Write;
+
+    fn roads(name: &str, offset: u32) -> Bytes {
+        let features = (0..3000)
+            .map(|index| {
+                let x = (131 * index + offset) % 3500;
+                let y = (253 * index + offset) % 3500;
+                Feature {
+                    id: Some(u64::from(index) + 1),
+                    tags: vec![0, index % 2],
+                    r#type: Some(GeomType::Linestring as i32),
+                    geometry: vec![9, 2 * x, 2 * y, 26, 6, 8, 14, 10, 4, 6],
+                }
+            })
+            .collect();
+        let tile = Tile {
+            layers: vec![Layer {
+                version: 2,
+                name: name.into(),
+                features,
+                keys: vec!["class".into()],
+                values: ["primary", "local"]
+                    .map(|class| Value {
+                        string_value: Some(class.into()),
+                        ..Default::default()
+                    })
+                    .into(),
+                extent: Some(4096),
+            }],
+        };
+        Bytes::from(tile.encode_to_vec())
+    }
+
+    let raw = [roads("streets", 0), roads("paths", 721)];
+    let compressed = raw.each_ref().map(|raw| {
+        let mut encoder = flate2::GzBuilder::new()
+            .extra(vec![0; 65_000])
+            .write(Vec::new(), flate2::Compression::default());
+        encoder.write_all(raw).unwrap();
+        Bytes::from(encoder.finish().unwrap())
+    });
+    let decoded_bytes = raw[0].len() + raw[1].len();
+    let encoded_bytes = compressed[0].len() + compressed[1].len();
+    let work_bytes = 2 * decoded_bytes;
+    assert!(encoded_bytes > decoded_bytes);
+    assert!(encoded_bytes + raw[0].len().max(raw[1].len()) < work_bytes);
+
+    const REQUESTS: u32 = 32;
+    let barrier = Arc::new(Barrier::new(2));
+    let [streets, paths] = compressed;
+    let sources: [Arc<dyn TileDriver>; 2] =
+        [("a", "streets", streets), ("b", "paths", paths)].map(|(id, layer, bytes)| {
+            let mut descriptor = strict_descriptor(id, &[layer]);
+            descriptor.info.encoding = TileEncoding::Gzip;
+            Arc::new(TestDriver {
+                read_barrier: Some(barrier.clone()),
+                ..TestDriver::new(descriptor, vec![Some(bytes); REQUESTS as usize])
+            }) as Arc<dyn TileDriver>
+        });
+    let declarations = [decl(
+        "x",
+        &["a", "b"],
+        DuplicateLayer::Error,
+        MemberFailurePolicy::FailFast,
+    )];
+    let limits = CompositeLimits {
+        max_work_bytes: work_bytes,
+        max_decoded_bytes: decoded_bytes,
+        ..CompositeLimits::default()
+    };
+    let stack = composition_stack(&sources, &declarations, limits).unwrap();
+    let expected = [raw[0].as_ref(), raw[1].as_ref()].concat();
+    let mut rejected = 0;
+    for x in 0..REQUESTS {
+        let coord = TileCoord { z: 6, x, y: 0 };
+        let target = ReadTarget::new("x", "scope").at(coord);
+        let outcome = tokio::time::timeout(Duration::from_secs(5), stack.read(target))
+            .await
+            .expect("concurrent member read timed out");
+        match outcome {
+            Ok(outcome) => assert_eq!(present_data(outcome), expected),
+            Err(MaptileError::PayloadTooLarge { .. }) => rejected += 1,
+            Err(error) => panic!("unexpected error for {coord:?}: {error}"),
+        }
+    }
+    assert_eq!(rejected, 0, "valid tiles rejected at the exact work limit");
+
+    for limits in [
+        CompositeLimits {
+            max_work_bytes: work_bytes - 1,
+            ..limits
+        },
+        CompositeLimits {
+            max_decoded_bytes: decoded_bytes - 1,
+            ..limits
+        },
+    ] {
+        let stack = composition_stack(&sources, &declarations, limits).unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), stack_read(&stack, "x", 0))
+            .await
+            .expect("concurrent member read timed out");
+        assert!(matches!(outcome, Err(MaptileError::PayloadTooLarge { .. })));
+    }
+}
+
+#[tokio::test]
+async fn cumulative_decoded_budget_rejects_two_large_valid_members() {
+    fn large(name: &str) -> Bytes {
+        let tile = Tile {
+            layers: vec![Layer {
+                version: 2,
+                name: name.into(),
+                features: vec![],
+                keys: vec!["a".repeat(9 * 1024 * 1024)],
+                values: vec![],
+                extent: Some(4096),
+            }],
+        };
+        Bytes::from(tile.encode_to_vec())
+    }
+    let sources = [
+        composition_source("a", &["a"], Ok(Some(large("a")))),
+        composition_source("b", &["b"], Ok(Some(large("b")))),
+    ];
+    let limits = CompositeLimits {
+        max_compressed_bytes: 32 * 1024 * 1024,
+        ..CompositeLimits::default()
+    };
+    let stack = composition_stack(
+        &sources,
+        &[decl(
+            "x",
+            &["a", "b"],
+            DuplicateLayer::Error,
+            MemberFailurePolicy::FailFast,
+        )],
+        limits,
+    )
+    .unwrap();
+    assert!(matches!(
+        stack_read(&stack, "x", 0).await,
+        Err(MaptileError::PayloadTooLarge { .. })
+    ));
 }
 
 #[tokio::test]
@@ -700,32 +1230,29 @@ async fn stale_failure_cannot_admit_a_second_probe() {
     assert!(probe.await.is_ok());
 }
 
+struct HeldGzip {
+    data: Bytes,
+    entered: Arc<Notify>,
+    release: mpsc::Receiver<()>,
+}
+impl AsRef<[u8]> for HeldGzip {
+    fn as_ref(&self) -> &[u8] {
+        &self.data
+    }
+}
+impl Drop for HeldGzip {
+    fn drop(&mut self) {
+        self.entered.notify_one();
+        let _ = self.release.recv_timeout(Duration::from_secs(10));
+    }
+}
+
 #[tokio::test]
 async fn nested_fail_fast_holds_leaf_capacity_until_abandoned_blocking_work_finishes() {
-    use maptile_core::{control::CompositeLimits, transport};
     use std::{
-        sync::{Mutex, atomic::AtomicBool, mpsc},
+        sync::{Mutex, atomic::AtomicBool},
         task::{Context, Wake, Waker},
-        time::Duration,
     };
-    use tokio::sync::Notify;
-
-    struct HeldGzip {
-        data: Bytes,
-        entered: Arc<Notify>,
-        release: mpsc::Receiver<()>,
-    }
-    impl AsRef<[u8]> for HeldGzip {
-        fn as_ref(&self) -> &[u8] {
-            &self.data
-        }
-    }
-    impl Drop for HeldGzip {
-        fn drop(&mut self) {
-            self.entered.notify_one();
-            let _ = self.release.recv_timeout(Duration::from_secs(10));
-        }
-    }
 
     enum LeafRead {
         Gzip(Mutex<Option<Bytes>>),
@@ -1006,6 +1533,98 @@ async fn shutdown_cannot_finish_while_factory_is_opening() {
         !finished_while_active,
         "shutdown completed while factory still active"
     );
+}
+
+#[tokio::test]
+async fn shutdown_waits_for_cancelled_factory_file_work() {
+    let catalog = SourceCatalog::default();
+    let items = [discovered("local")];
+    let (started, ready) = tokio::sync::oneshot::channel();
+    let (release, wait) = mpsc::channel();
+    let mut signals = Some((started, wait));
+    let mut build = Box::pin(
+        catalog.reconcile(0, "files", Inventory::Complete(&items), |_| {
+            let (started, wait) = signals.take().unwrap();
+            open_blocking(move || {
+                started.send(()).unwrap();
+                wait.recv_timeout(Duration::from_secs(5)).unwrap();
+                Err(MaptileError::Cancelled)
+            })
+        }),
+    );
+    tokio::select! {
+        result = build.as_mut() => panic!("factory finished early: {result:?}"),
+        ready = ready => ready.unwrap(),
+    }
+    drop(build);
+    let mut shutdown = Box::pin(catalog.shutdown(Instant::now() + Duration::from_secs(5)));
+    let first = futures::poll!(shutdown.as_mut());
+    release.send(()).unwrap();
+    assert!(
+        first.is_pending(),
+        "shutdown completed during file work: {first:?}"
+    );
+    shutdown.await.unwrap();
+}
+
+#[tokio::test]
+async fn shutdown_waits_for_cancelled_job_on_retired_source() {
+    use std::sync::Mutex;
+
+    struct BlockedRead(Mutex<Option<Bytes>>);
+    #[async_trait::async_trait]
+    impl TileDriver for BlockedRead {
+        fn descriptor(&self) -> SourceDescriptor {
+            strict_descriptor("retired", &["roads"])
+        }
+
+        async fn read(
+            &self,
+            _: TileCoord,
+            _: Option<&TileQuery<'_>>,
+        ) -> MaptileResult<Option<TileResponse>> {
+            let bytes = self.0.lock().unwrap().take().unwrap();
+            transport::decode_async(bytes, TileEncoding::Gzip).await?;
+            Ok(None)
+        }
+    }
+
+    let entered = Arc::new(Notify::new());
+    let (release, wait) = mpsc::channel();
+    let bytes = Bytes::from_owner(HeldGzip {
+        data: transport::encode_as(&tile("roads", 4096), TileEncoding::Gzip).unwrap(),
+        entered: entered.clone(),
+        release: wait,
+    });
+    let engine = Arc::new(CatalogService::new(TileCache::new(1, None, None).unwrap()));
+    let mut update = engine.catalog().update();
+    update
+        .put(Arc::new(BlockedRead(Mutex::new(Some(bytes)))))
+        .unwrap();
+    engine.catalog().publish(update).unwrap();
+    let stack = TileStack::builder(engine.clone()).build();
+    let mut read = Box::pin(stack_read(&stack, "retired", 0));
+    tokio::select! {
+        result = read.as_mut() => panic!("driver returned early: {result:?}"),
+        () = entered.notified() => {},
+        () = tokio::time::sleep(Duration::from_secs(5)) => panic!("decoder did not start"),
+    }
+    let mut remove = engine.catalog().update();
+    remove.remove("retired");
+    engine.catalog().publish(remove).unwrap();
+    drop(read);
+    let mut drain = Box::pin(
+        engine
+            .catalog()
+            .shutdown(Instant::now() + Duration::from_secs(5)),
+    );
+    let first = futures::poll!(drain.as_mut());
+    release.send(()).unwrap();
+    assert!(
+        first.is_pending(),
+        "shutdown reported {first:?} while the decoder was still disposing of its input"
+    );
+    drain.await.unwrap();
 }
 
 #[tokio::test]

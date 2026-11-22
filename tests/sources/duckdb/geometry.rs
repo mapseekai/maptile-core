@@ -47,14 +47,14 @@ async fn flatgeobuf_scan_keeps_a_projected_chord_and_empty_tiles() {
         "{plan}"
     );
     let tile = source
-        .tile(TileCoord { z: 4, x: 9, y: 6 }, None)
+        .read_tile(TileCoord { z: 4, x: 9, y: 6 }, None, None)
         .await
         .unwrap();
     let tile = mvt::decode(&tile).unwrap();
     assert_eq!(tile.layers[0].features.len(), 1);
     assert_eq!(tile.layers[0].features[0].id, Some(6));
     let empty = source
-        .tile(TileCoord { z: 4, x: 0, y: 0 }, None)
+        .read_tile(TileCoord { z: 4, x: 0, y: 0 }, None, None)
         .await
         .unwrap();
     assert!(
@@ -277,8 +277,8 @@ async fn pruning_reaches_parquet_statistics_and_does_not_change_tiles() {
     let with = GeometrySource::open(&f.config()).unwrap();
     let without_fixture = fixture_points(&[(10.0, 60.0), (20.0, 60.0)], false);
     let without = GeometrySource::open(&without_fixture.config()).unwrap();
-    let tile = with.tile(TILE, None).await.unwrap();
-    assert_eq!(tile, without.tile(TILE, None).await.unwrap());
+    let tile = with.read_tile(TILE, None, None).await.unwrap();
+    assert_eq!(tile, without.read_tile(TILE, None, None).await.unwrap());
     let conn = spatial_connection(&f.config().query_options).unwrap();
     let explain = |source: &GeometrySource| {
         conn.prepare(&format!("EXPLAIN {}", source.query.sql))
@@ -407,12 +407,12 @@ async fn timeouts_and_cancellation_keep_pool_bounded_and_reusable() {
     let mut cfg = f.config();
     cfg.query_options.pool_size = 1;
     let mut source = GeometrySource::open(&cfg).unwrap();
-    assert!(!source.tile(TILE, None).await.unwrap().is_empty());
+    assert!(!source.read_tile(TILE, None, None).await.unwrap().is_empty());
     source.options.timeout_ms = 50;
     let normal = source.query.sql.clone();
     source.query.sql="SELECT NULL::BLOB, sum(i)::BIGINT FROM range(1000000000) t(i) WHERE i % ($z::INTEGER + 2) = $x::INTEGER AND i > $y::INTEGER".into();
     let source = Arc::new(source);
-    assert!(source.tile(TILE, None).await.is_err());
+    assert!(source.read_tile(TILE, None, None).await.is_err());
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             if source.pool.slots.available_permits() == 1 {
@@ -424,7 +424,7 @@ async fn timeouts_and_cancellation_keep_pool_bounded_and_reusable() {
     .await
     .unwrap();
     let cloned = source.clone();
-    let task = tokio::spawn(async move { cloned.tile(TILE, None).await });
+    let task = tokio::spawn(async move { cloned.read_tile(TILE, None, None).await });
     tokio::time::sleep(Duration::from_millis(10)).await;
     task.abort();
     let _ = task.await;
@@ -442,11 +442,11 @@ async fn timeouts_and_cancellation_keep_pool_bounded_and_reusable() {
     source.query.sql = normal;
     source.options.timeout_ms = 10_000;
     for _ in 0..5 {
-        assert!(!source.tile(TILE, None).await.unwrap().is_empty());
+        assert!(!source.read_tile(TILE, None, None).await.unwrap().is_empty());
     }
     let permit = source.pool.slots.clone().acquire_owned().await.unwrap();
     source.options.timeout_ms = 20;
-    assert!(source.tile(TILE, None).await.is_err());
+    assert!(source.read_tile(TILE, None, None).await.is_err());
     assert_eq!(source.pool.slots.available_permits(), 0);
     drop(permit);
     assert_eq!(source.pool.slots.available_permits(), 1);
@@ -518,7 +518,7 @@ async fn cancelled_query_retains_then_releases_its_file_lease() {
     let pool = source.pool.clone();
     let dropped = Arc::new(AtomicUsize::new(0));
     let lease = Arc::new(Lease(dropped.clone()));
-    let task = tokio::spawn(async move { source.tile(TILE, Some(lease)).await });
+    let task = tokio::spawn(async move { source.read_tile(TILE, Some(lease), None).await });
     tokio::time::timeout(Duration::from_secs(1), async {
         while pool.slots.available_permits() == 2 {
             tokio::task::yield_now().await;
@@ -633,7 +633,7 @@ async fn http_range_open_tile_and_close_do_not_materialize_the_object() {
         "opening transferred {opening} of {} bytes",
         http.stats.bytes.len()
     );
-    let data = source.tile(TILE, None).await.unwrap();
+    let data = source.read_tile(TILE, None, None).await.unwrap();
     let tile = mvt::decode(&data).unwrap();
     assert_eq!(tile.layers[0].features.len(), 1);
     assert_eq!(tile.layers[0].features[0].id, Some(1));
@@ -661,7 +661,7 @@ async fn http_range_open_tile_and_close_do_not_materialize_the_object() {
     source.close().await.unwrap();
     source.close().await.unwrap();
     assert!(source.pool_status().connections == 0);
-    assert!(source.tile(TILE, None).await.is_err());
+    assert!(source.read_tile(TILE, None, None).await.is_err());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -898,7 +898,7 @@ async fn close_interrupts_active_queries_and_rejects_waiters() {
     source.query.sql = "SELECT NULL::BLOB, sum(i)::BIGINT FROM range(1000000000) t(i) WHERE i % ($z::INTEGER + 2) = $x::INTEGER AND i > $y::INTEGER".into();
     let source = Arc::new(source);
     let query_source = source.clone();
-    let query = tokio::spawn(async move { query_source.tile(TILE, None).await });
+    let query = tokio::spawn(async move { query_source.read_tile(TILE, None, None).await });
     tokio::time::timeout(Duration::from_secs(2), async {
         while source.pool_status().active_requests == 0 {
             tokio::task::yield_now().await;
@@ -913,7 +913,7 @@ async fn close_interrupts_active_queries_and_rejects_waiters() {
     assert!(query.await.unwrap().is_err());
     assert!(source.pool_status().connections == 0);
     assert_eq!(source.pool_status().active_requests, 0);
-    assert!(source.tile(TILE, None).await.is_err());
+    assert!(source.read_tile(TILE, None, None).await.is_err());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

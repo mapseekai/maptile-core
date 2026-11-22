@@ -42,6 +42,8 @@ bash scripts/ci/maptile-render-cargo_test.sh
 git diff --check
 ```
 
+公开 API 的测试归入 `tests/` 下已有的集成测试文件。需要访问模块私有实现的成组用例也放在 `tests/` 下，按源码目录和模块名命名，由对应模块在 `#[cfg(test)]` 下引入。运行这类用例时选择 `--lib` 和相应的 feature，例如 `cargo test --locked --features postgres --lib sources::postgres::table`。
+
 新增的入门示例可独立运行：
 
 ```sh
@@ -60,7 +62,7 @@ cargo run --locked --features pmtiles --example read_pmtiles
 | GDAL 与 STAC 编译 | `cargo check --locked --all-targets --features raster,stac` | GDAL、PROJ 与开发库 |
 | 渲染脚本行为 | `bash scripts/ci/maptile-render-cargo_test.sh` | Bash 与 Git |
 
-GeoParquet 扩展的安装、校验和运行示例见[GeoParquet 与本地矢量](geoparquet.md)。CI 的 `geoparquet` 检查组启用 `local-vector`，覆盖 GeoParquet 与本地矢量路径。
+GeoParquet 扩展的安装、校验和运行示例见[GeoParquet 与本地矢量](geoparquet.md)。CI 的 `duckdb` 检查组启用同名 feature，覆盖 GeoParquet 与本地矢量路径。
 
 记录验证结果时，同时记录实际 feature 组合和外部环境。编译检查、单元测试、数据库集成与原生图形运行分别验证不同层面的行为。
 
@@ -93,7 +95,7 @@ cargo test --locked --features postgres --test postgres_table \
 
 ```sh
 CARGO_BUILD_JOBS=2 cargo test --locked --features render \
-  --test render_native -- --test-threads=1
+  --lib --test render_native -- --test-threads=1
 ```
 
 独立应用可直接引用完整仓库检出：
