@@ -18,16 +18,14 @@ use crate::cache::ContentVersion;
 use crate::error::{MaptileError, MaptileResult};
 use crate::raster::style::EffectiveStyle;
 use crate::raster::style::pipeline;
+use crate::sources::dataset_cache::{self, CachedDataset, DatasetCache};
 use crate::sources::{
     TileCoord, TileEncoding, TileFormat, TileInfo, TileQuery, TileResponse, TileSource,
+    validate_source_request,
 };
 
-#[derive(Debug, Clone)]
-struct RasterPathResult {
-    filepath: String,
-}
-
-type DatasetEntry = crate::sources::dataset_cache::CachedDataset;
+const MAX_OUTDB_ASSETS: usize = 64;
+const MAX_OUTDB_PATH_BYTES: usize = 16 * 1024;
 
 const WEB_MERCATOR_EXTENT: f64 = 20_037_508.342_789_244;
 
@@ -45,8 +43,8 @@ pub struct PostgresOutDbRasterSource {
     schema: String,
     function: String,
     sql_query: String,
-    cache_zoom: crate::cache::CacheZoomRange,
     content_version: ContentVersion,
+    dataset_cache: DatasetCache,
 }
 
 impl std::fmt::Debug for PostgresOutDbRasterSource {
@@ -64,16 +62,23 @@ impl PostgresOutDbRasterSource {
         pool: Arc<PostgresPool>,
         config: &PostgresOutDbRasterConfig,
     ) -> MaptileResult<Self> {
-        let conn = pool.get().await?;
-
+        super::pool::validate_source_window(
+            Some(config.minzoom),
+            Some(config.maxzoom),
+            config.bounds,
+        )?;
         let function_name = config.function.as_ref().unwrap_or(&config.id);
-
-        Self::verify_function(&conn, &config.schema, function_name).await?;
+        let pending = pool.get_query().await?;
+        Self::verify_function(pending.connection(), &config.schema, function_name).await?;
+        pending.finish().await?;
 
         let sql_query = format!(
-            "SELECT * FROM {}.{}($1::integer, $2::integer, $3::integer, $4::geometry, $5::jsonb)",
+            "SELECT octet_length(filepath::text) AS size,
+                    CASE WHEN octet_length(filepath::text) <= {MAX_OUTDB_PATH_BYTES} THEN filepath::text END
+             FROM {}.{}($1::integer, $2::integer, $3::integer, $4::geometry, $5::jsonb) LIMIT {}",
             pg_escape::quote_identifier(&config.schema),
-            pg_escape::quote_identifier(function_name)
+            pg_escape::quote_identifier(function_name),
+            MAX_OUTDB_ASSETS + 1,
         );
 
         let mut tj: TileJSON = tilejson! { tiles: vec![] };
@@ -104,9 +109,15 @@ impl PostgresOutDbRasterSource {
             schema: config.schema.clone(),
             function: function_name.clone(),
             sql_query,
-            cache_zoom: config.cache_zoom.unwrap_or_default(),
             content_version: ContentVersion::new_generation(),
+            dataset_cache: dataset_cache::global().clone(),
         })
+    }
+
+    #[must_use]
+    pub fn with_dataset_cache(mut self, cache: DatasetCache) -> Self {
+        self.dataset_cache = cache;
+        self
     }
 
     #[must_use]
@@ -180,7 +191,8 @@ impl PostgresOutDbRasterSource {
         let bbox_wkt = Self::bbox_to_wkt(min_x, min_y, max_x, max_y);
         let params = query_params.unwrap_or(serde_json::json!({}));
 
-        let conn = self.pool.get().await?;
+        let pending = self.pool.get_query().await?;
+        let conn = pending.connection();
 
         let param_types: &[Type] = &[Type::INT4, Type::INT4, Type::INT4, Type::TEXT, Type::JSONB];
 
@@ -207,22 +219,15 @@ impl PostgresOutDbRasterSource {
                 ))
             })?;
 
-        drop(conn);
+        pending.finish().await?;
 
         if rows.is_empty() {
             return Ok(None);
         }
-
-        let results: Vec<RasterPathResult> = rows
-            .iter()
-            .filter_map(|row| {
-                let filepath = row.try_get::<_, String>("filepath").ok()?;
-                Some(RasterPathResult { filepath })
-            })
-            .collect();
-
-        if results.is_empty() {
-            return Ok(None);
+        if rows.len() > MAX_OUTDB_ASSETS {
+            return Err(MaptileError::Resource(
+                "Out-DB tile exceeds the candidate dataset limit".into(),
+            ));
         }
 
         let base_style = style.clone();
@@ -230,10 +235,25 @@ impl PostgresOutDbRasterSource {
         // Resolve all datasets up front (async, may open OFF-lock via
         // spawn_blocking). The blocking renderer below only takes the
         // already-resolved Arcs and locks them with `blocking_lock`.
-        let mut entries: Vec<DatasetEntry> = Vec::with_capacity(results.len());
-        for result in &results {
-            let ds = crate::sources::dataset_cache::global()
-                .get_or_open(&result.filepath)
+        let mut paths = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let size: Option<i32> = row.try_get(0).map_err(MaptileError::backend)?;
+            let Some(size) = size else { continue };
+            if size as usize > MAX_OUTDB_PATH_BYTES {
+                return Err(MaptileError::Resource(
+                    "Out-DB dataset path exceeds the byte limit".into(),
+                ));
+            }
+            paths.push(row.try_get::<_, String>(1).map_err(MaptileError::backend)?);
+        }
+        if paths.is_empty() {
+            return Ok(None);
+        }
+        let mut entries: Vec<CachedDataset> = Vec::with_capacity(paths.len());
+        for path in paths {
+            let ds = self
+                .dataset_cache
+                .get_or_open_scoped(&path, self.content_version)
                 .await?;
             entries.push(ds);
         }
@@ -245,7 +265,7 @@ impl PostgresOutDbRasterSource {
     /// composite the resulting images in query order.
     #[allow(clippy::too_many_arguments)]
     async fn render_tile_blocking(
-        entries: Vec<DatasetEntry>,
+        entries: Vec<CachedDataset>,
         min_x: f64,
         min_y: f64,
         max_x: f64,
@@ -423,7 +443,7 @@ impl TileSource for PostgresOutDbRasterSource {
     }
 
     fn cache_zoom(&self) -> crate::cache::CacheZoomRange {
-        self.cache_zoom
+        crate::cache::CacheZoomRange::disabled()
     }
 
     fn clone_source(&self) -> Box<dyn TileSource> {
@@ -435,7 +455,7 @@ impl TileSource for PostgresOutDbRasterSource {
         xyz: TileCoord,
         query: Option<&TileQuery<'_>>,
     ) -> MaptileResult<TileResponse> {
-        crate::sources::tile_math::validate_tile_request(std::slice::from_ref(&xyz), query)?;
+        validate_source_request(self, &[xyz], query)?;
         let style = query.and_then(|q| q.style).ok_or_else(|| {
             MaptileError::InvalidRequest("canonical raster style is required".into())
         })?;
@@ -453,7 +473,7 @@ impl TileSource for PostgresOutDbRasterSource {
         coords: &[TileCoord],
         query: Option<&TileQuery<'_>>,
     ) -> MaptileResult<Vec<TileResponse>> {
-        crate::sources::tile_math::validate_tile_request(coords, query)?;
+        validate_source_request(self, coords, query)?;
         crate::sources::read_tile_batch_sequential(self, coords, query).await
     }
 }

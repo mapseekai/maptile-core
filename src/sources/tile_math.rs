@@ -2,6 +2,11 @@
 
 use crate::error::MaptileError;
 
+pub use super::tile_types::{
+    bbox_to_xyz, get_zoom_precision, tile_index, webmercator_to_wgs84, wgs84_to_webmercator,
+    xyz_to_bbox,
+};
+
 /// Maximum web-mercator zoom level we support before tile counts no
 /// longer fit in `u32`. (`2^30` ≈ 1 billion tiles per axis.)
 pub const MAX_ZOOM: u8 = 30;
@@ -18,7 +23,7 @@ pub fn tiles_per_axis(z: u8) -> Result<u32, MaptileError> {
     }
 }
 
-/// Validate database request inputs before SQL, integer casts, or zoom shortcuts.
+/// Validate XYZ and spatial input before routing or any backend read.
 pub(crate) fn validate_tile_request(
     coords: &[super::TileCoord],
     query: Option<&super::TileQuery<'_>>,
@@ -42,7 +47,7 @@ pub(crate) fn validate_tile_request(
 }
 
 /// `(west, south, east, north)` WGS84 bbox of a slippy tile.
-#[cfg(any(test, feature = "duckdb", feature = "geoparquet"))]
+#[cfg(test)]
 pub(super) fn tile_envelope_4326(z: u8, x: u32, y: u32) -> (f64, f64, f64, f64) {
     let n = 2_f64.powi(z as i32);
     let west = (x as f64) / n * 360.0 - 180.0;

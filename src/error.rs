@@ -9,6 +9,22 @@
 
 use std::sync::Arc;
 
+/// Protocol-independent classification for retry, admission and adapter decisions.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ErrorKind {
+    NotFound,
+    InvalidInput,
+    Unsupported,
+    VersionChanged,
+    ResourceLimit,
+    Saturated,
+    Deadline,
+    Cancelled,
+    Unavailable,
+    Backend,
+}
+
 #[derive(thiserror::Error, Debug, Clone)]
 #[non_exhaustive]
 pub enum MaptileError {
@@ -32,6 +48,18 @@ pub enum MaptileError {
 
     #[error("invalid request: {0}")]
     InvalidRequest(String),
+
+    #[error("unsupported operation: {0}")]
+    Unsupported(String),
+
+    #[error("source version changed: {0}")]
+    VersionChanged(String),
+
+    #[error("tile read deadline elapsed")]
+    Deadline,
+
+    #[error("tile read cancelled")]
+    Cancelled,
 
     #[error("tile payload exceeds {limit} bytes")]
     PayloadTooLarge { limit: usize },
@@ -90,6 +118,52 @@ pub enum MaptileError {
 }
 
 impl MaptileError {
+    #[must_use]
+    pub fn kind(&self) -> ErrorKind {
+        match self {
+            Self::SourceNotFound(_) | Self::StyleNotFound(_) | Self::TileNotFound(..) => {
+                ErrorKind::NotFound
+            }
+            Self::StyleFile { source, .. } => source.kind(),
+            Self::SourceUnavailable(_) => ErrorKind::Unavailable,
+            Self::Unsupported(_) => ErrorKind::Unsupported,
+            Self::VersionChanged(_) => ErrorKind::VersionChanged,
+            Self::Deadline => ErrorKind::Deadline,
+            Self::Cancelled => ErrorKind::Cancelled,
+            Self::CapacityExhausted => ErrorKind::Saturated,
+            Self::PayloadTooLarge { .. } | Self::Resource(_) => ErrorKind::ResourceLimit,
+            Self::Config(_) | Self::InvalidRequest(_) | Self::Filter(_) | Self::InvalidStyle(_) => {
+                ErrorKind::InvalidInput
+            }
+            Self::Io(error) => match error.kind() {
+                std::io::ErrorKind::TimedOut => ErrorKind::Deadline,
+                std::io::ErrorKind::ConnectionRefused
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::NotConnected
+                | std::io::ErrorKind::HostUnreachable
+                | std::io::ErrorKind::NetworkUnreachable => ErrorKind::Unavailable,
+                _ => ErrorKind::Backend,
+            },
+            Self::Backend(_)
+            | Self::BackendMsg(_)
+            | Self::InvalidMetadata(_)
+            | Self::Json(_)
+            | Self::Render(_)
+            | Self::Style(_)
+            | Self::Mosaic(_)
+            | Self::Transcode(_) => ErrorKind::Backend,
+        }
+    }
+
+    #[must_use]
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self.kind(),
+            ErrorKind::Unavailable | ErrorKind::Saturated | ErrorKind::Deadline
+        )
+    }
+
     /// Wrap a backend error (postgres, pmtiles, GDAL, duckdb, …)
     /// preserving it as the structured `source` of [`MaptileError::Backend`].
     pub fn backend(e: impl std::error::Error + Send + Sync + 'static) -> Self {

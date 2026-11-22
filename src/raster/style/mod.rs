@@ -1,6 +1,6 @@
 //! Raster Style 3.0 documents, shared by all raster sources.
 
-#[cfg(feature = "raster")]
+#[cfg(all(feature = "raster", any(feature = "postgres", test)))]
 pub(crate) mod pipeline;
 pub mod resolve;
 

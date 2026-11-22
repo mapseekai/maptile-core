@@ -10,16 +10,18 @@
 //! sources (and individual COG sources) share the same decoded-block pool,
 //! matching the behaviour of `AsyncCogSource`.
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use async_geotiff::bounds::Bbox;
+use async_geotiff::error::{AgError, AgResult};
 use async_geotiff::io::BlockCache;
-use async_geotiff::mosaic::{AssetRef, Backend, MosaicSource as AgMosaicSource, MosaicTiler};
+use async_geotiff::mosaic::{
+    AssetRef, Backend, DiscoveredAssets, DiscoveryOptions, MosaicSource as AgMosaicSource,
+    MosaicTiler,
+};
 use async_geotiff::tms::{TileCoord as AgTileCoord, TileMatrixSet};
 use async_trait::async_trait;
 use bytes::Bytes;
-#[cfg(feature = "raster")]
-use gdal::spatial_ref::{AxisMappingStrategy, CoordTransform, SpatialRef};
 use object_store::ObjectStore;
 use tilejson::{TileJSON, tilejson};
 
@@ -78,31 +80,18 @@ fn bounds_for_tilejson(bounds: [f64; 4], srid: Option<i32>) -> MaptileResult<[f6
     Ok(bounds)
 }
 
-#[cfg(feature = "raster")]
 fn project_bounds_to_wgs84(bounds: [f64; 4], srid: i32) -> MaptileResult<[f64; 4]> {
     let [xmin, ymin, xmax, ymax] = bounds;
-    if !bounds.iter().all(|v| v.is_finite()) || xmin > xmax || ymin > ymax {
+    if xmin > xmax {
         return Err(MaptileError::Config(format!(
             "invalid mosaic bounds {bounds:?}"
         )));
     }
-    let mut src_srs = SpatialRef::from_epsg(srid as u32)
-        .map_err(|e| backend_err(format!("Failed to create EPSG:{srid}: {e}")))?;
-    src_srs.set_axis_mapping_strategy(AxisMappingStrategy::TraditionalGisOrder);
-    let mut dst_srs = SpatialRef::from_epsg(4326)
-        .map_err(|e| backend_err(format!("Failed to create EPSG:4326: {e}")))?;
-    dst_srs.set_axis_mapping_strategy(AxisMappingStrategy::TraditionalGisOrder);
-    let coord_transform = CoordTransform::new(&src_srs, &dst_srs)
+    let transform = proj::Proj::new_known_crs(&format!("EPSG:{srid}"), "EPSG:4326", None)
         .map_err(|e| backend_err(format!("Failed to create coordinate transform: {e}")))?;
-
-    coord_transform
-        .transform_bounds(&bounds, 21)
+    transform
+        .transform_bounds(xmin, ymin, xmax, ymax, 21)
         .map_err(|e| backend_err(format!("Failed to transform mosaic bounds: {e}")))
-}
-
-#[cfg(not(feature = "raster"))]
-fn project_bounds_to_wgs84(bounds: [f64; 4], _srid: i32) -> MaptileResult<[f64; 4]> {
-    Ok(bounds)
 }
 
 const WORLD_BBOX: Bbox = Bbox {
@@ -201,12 +190,11 @@ pub fn pixel_selection_from_str(s: &str) -> MaptileResult<MosaicPixelSelection> 
 
 /// One member COG inside the mosaic.
 pub struct MosaicMember {
-    /// HTTP(S) URL or object_store-resolvable URL that async-geotiff
+    /// HTTP(S) URL or object key that async-geotiff
     /// `CogReader` can open (e.g. `https://minio.example.com/bucket/file.tif`).
     pub url: String,
-    /// Stable cache identity (e.g. `"cog.<cuid>"`).  Decoded blocks keyed
-    /// by this value are shared with the member's standalone `AsyncCogSource`
-    /// when both use the same `BlockCache` instance.
+    /// Version identity of the object at `url`. Use a new identity for
+    /// replacement bytes.
     pub source_id: String,
     /// WGS84 bounding box `[west, south, east, north]`, independent of `srid`.
     /// West > east denotes a date-line crossing; unwrapped longitudes are normalized.
@@ -232,6 +220,7 @@ pub struct MosaicSourceConfig {
     /// server, single bucket — async-geotiff `Backend::Store`). `None` ⇒ each
     /// member's `url` is a full HTTP(S) URL read over the unauthenticated HTTP
     /// backend (`Backend::Http`).
+    /// A supplied store owns cancellation and cleanup of work it detaches from the read future.
     pub store: Option<Arc<dyn ObjectStore>>,
 }
 
@@ -242,20 +231,13 @@ pub struct MosaicSourceConfig {
 /// Static member collection: filters candidates to members whose WGS84 bbox
 /// intersects the requested tile, while retaining the full member list for
 /// global `statistics_assets`.
+#[derive(Clone)]
 struct FixedMosaicSource {
-    assets: Vec<AssetRef>,
+    assets: Arc<[AssetRef]>,
 }
 
-#[async_trait]
-impl AgMosaicSource for FixedMosaicSource {
-    async fn statistics_assets(&self) -> async_geotiff::error::AgResult<Vec<AssetRef>> {
-        Ok(self.assets.clone())
-    }
-
-    async fn assets_for_tile(
-        &self,
-        coord: AgTileCoord,
-    ) -> async_geotiff::error::AgResult<Vec<AssetRef>> {
+impl FixedMosaicSource {
+    fn candidates(&self, coord: AgTileCoord) -> AgResult<impl Iterator<Item = &AssetRef>> {
         let tms = async_geotiff::tms::Tms::cached(coord.tms)?;
         let tile = tms.tile_bbox(coord.z, coord.x, coord.y)?;
         let mut corners = [(tile.xmin, tile.ymin), (tile.xmax, tile.ymax)];
@@ -280,10 +262,68 @@ impl AgMosaicSource for FixedMosaicSource {
         Ok(self
             .assets
             .iter()
-            .filter(|asset| bbox_intersects_tile(asset.bbox, tile_bbox))
-            .cloned()
-            .collect())
+            .filter(move |asset| bbox_intersects_tile(asset.bbox, tile_bbox)))
     }
+}
+
+#[async_trait]
+impl AgMosaicSource for FixedMosaicSource {
+    async fn statistics_assets(&self) -> AgResult<Vec<AssetRef>> {
+        Ok(self.assets.to_vec())
+    }
+
+    async fn statistics_assets_with_options(
+        &self,
+        options: &DiscoveryOptions,
+    ) -> AgResult<DiscoveredAssets> {
+        discover(self.assets.iter(), options)
+    }
+
+    async fn assets_for_tile(&self, coord: AgTileCoord) -> AgResult<Vec<AssetRef>> {
+        Ok(self.candidates(coord)?.cloned().collect())
+    }
+
+    async fn assets_for_tile_with_options(
+        &self,
+        coord: AgTileCoord,
+        options: &DiscoveryOptions,
+    ) -> AgResult<DiscoveredAssets> {
+        discover(self.candidates(coord)?, options)
+    }
+}
+
+fn discover<'a>(
+    assets: impl Iterator<Item = &'a AssetRef>,
+    options: &DiscoveryOptions,
+) -> AgResult<DiscoveredAssets> {
+    let mut seen = HashSet::new();
+    let mut selected = Vec::new();
+    let mut bytes = 0usize;
+    for asset in assets {
+        if seen.contains(asset.url.as_str()) {
+            continue;
+        }
+        if options.max_assets > 0 && selected.len() == options.max_assets {
+            return Err(AgError::Mosaic(format!(
+                "tile matches at least {} assets, exceeding limit {}",
+                selected.len() + 1,
+                options.max_assets,
+            )));
+        }
+        bytes = bytes
+            .saturating_add(size_of::<AssetRef>())
+            .saturating_add(asset.url.len())
+            .saturating_add(asset.source_id.len());
+        if bytes > options.max_asset_bytes {
+            return Err(AgError::ResourceLimit(
+                "discovered asset metadata exceeds byte limit".into(),
+            ));
+        }
+        seen.insert(asset.url.as_str());
+        selected.push(asset);
+    }
+    let _transient = options.work_budget.try_reserve(bytes as u64)?;
+    DiscoveredAssets::from_assets(selected.into_iter().cloned().collect(), options)
 }
 
 // ---------------------------------------------------------------------------
@@ -299,16 +339,36 @@ pub struct MosaicSource {
     tiler: Arc<MosaicTiler<FixedMosaicSource>>,
     pixel_selection: MosaicPixelSelection,
     cache_zoom: crate::cache::CacheZoomRange,
-    /// Member identities and extents both affect the tile candidates.
-    content_id: String,
+    content_version: crate::cache::ContentVersion,
+    immutable: bool,
 }
 
 impl MosaicSource {
-    /// Build a `MosaicSource` from config, sharing the given `BlockCache` with
-    /// all other sources in the process.
+    /// Open a fixed member list for tile reads using the given block cache.
     pub async fn open(
         cfg: MosaicSourceConfig,
         block_cache: Arc<BlockCache>,
+    ) -> MaptileResult<Self> {
+        Self::open_members(cfg, block_cache, false).await
+    }
+
+    /// Open a fixed member list that supports consistent exports.
+    ///
+    /// Every asset address must keep serving its declared version for the
+    /// lifetime of the source and all its export sessions. Use version-qualified
+    /// URLs or immutable object keys. Readers open lazily and can reopen evicted
+    /// assets. Each open requires a validator from the backend.
+    pub async fn open_immutable(
+        cfg: MosaicSourceConfig,
+        block_cache: Arc<BlockCache>,
+    ) -> MaptileResult<Self> {
+        Self::open_members(cfg, block_cache, true).await
+    }
+
+    async fn open_members(
+        cfg: MosaicSourceConfig,
+        block_cache: Arc<BlockCache>,
+        immutable: bool,
     ) -> MaptileResult<Self> {
         if cfg.members.is_empty() {
             return Err(MaptileError::Config(
@@ -316,17 +376,30 @@ impl MosaicSource {
             ));
         }
 
-        let assets: Vec<AssetRef> = cfg
+        if cfg
             .members
             .iter()
+            .any(|member| member.url.is_empty() || member.source_id.is_empty())
+        {
+            return Err(MaptileError::Config(
+                "mosaic members require an address and version identity".into(),
+            ));
+        }
+
+        let assets: Vec<AssetRef> = cfg
+            .members
+            .into_iter()
             .map(|m| AssetRef {
-                url: m.url.clone(),
-                source_id: m.source_id.clone(),
+                url: m.url,
+                source_id: m.source_id,
                 bbox: normalize_member_bbox(m.bbox_wgs84),
             })
             .collect();
         let tilejson_bounds = match cfg.bounds {
-            Some(bounds) => bounds_for_tilejson(bounds, cfg.srid)?,
+            Some(bounds) => {
+                crate::transport::run_blocking(move || bounds_for_tilejson(bounds, cfg.srid))
+                    .await?
+            }
             None => assets.iter().fold(
                 [
                     f64::INFINITY,
@@ -351,13 +424,22 @@ impl MosaicSource {
             ),
         };
 
-        let content_id = format!(
-            "{:?}",
-            assets
-                .iter()
-                .map(|asset| (&asset.source_id, asset.bbox))
-                .collect::<Vec<_>>()
-        );
+        let content_version = if immutable && cfg.store.is_none() {
+            let manifest = format!(
+                "{:?}",
+                (
+                    cfg.pixel_selection,
+                    tilejson_bounds,
+                    assets
+                        .iter()
+                        .map(|asset| (&asset.url, &asset.source_id, asset.bbox))
+                        .collect::<Vec<_>>()
+                )
+            );
+            crate::cache::ContentVersion::from_input(manifest.as_bytes())
+        } else {
+            crate::cache::ContentVersion::new_generation()
+        };
 
         // Build TileJSON (mirrors AsyncCogSource).
         let mut tj: TileJSON = tilejson! { tiles: vec![] };
@@ -377,11 +459,12 @@ impl MosaicSource {
         tj.other
             .insert("format".into(), serde_json::Value::String("webp".into()));
 
-        let fixed = FixedMosaicSource { assets };
+        let fixed = FixedMosaicSource {
+            assets: assets.into(),
+        };
         // object_store mode (production: members are MinIO keys in one bucket,
         // `Backend::Store`) vs. HTTP mode (public COG URLs / tests, the default
-        // `Backend::Http`). Both share the injected `BlockCache` so a member
-        // served standalone reuses its decoded blocks.
+        // `Backend::Http`). Both use the injected decoded-block memory budget.
         let builder = MosaicTiler::builder(fixed).block_cache(block_cache);
         let tiler = match cfg.store {
             Some(store) => builder.backend(Backend::Store(store)).build(),
@@ -394,7 +477,8 @@ impl MosaicSource {
             tiler: Arc::new(tiler),
             pixel_selection: cfg.pixel_selection,
             cache_zoom: crate::cache::CacheZoomRange::default(),
-            content_id,
+            content_version,
+            immutable,
         })
     }
 }
@@ -407,6 +491,10 @@ impl MosaicSource {
 impl TileSource for MosaicSource {
     fn id(&self) -> &str {
         &self.id
+    }
+
+    fn source_kind(&self) -> super::SourceKind {
+        super::SourceKind::Mosaic
     }
 
     fn tilejson(&self) -> &TileJSON {
@@ -433,7 +521,11 @@ impl TileSource for MosaicSource {
     }
 
     fn content_version(&self) -> crate::cache::ContentVersion {
-        crate::cache::ContentVersion::from_input(self.content_id.as_bytes())
+        self.content_version
+    }
+
+    fn consistent_export(&self) -> bool {
+        self.immutable
     }
 
     #[tracing::instrument(name = "mosaic.get_tile", skip_all, fields(z = %xyz.z, x = %xyz.x, y = %xyz.y))]
@@ -442,6 +534,7 @@ impl TileSource for MosaicSource {
         xyz: TileCoord,
         query: Option<&TileQuery<'_>>,
     ) -> MaptileResult<TileResponse> {
+        super::validate_source_request(self, &[xyz], query)?;
         let style = query.and_then(|q| q.style).ok_or_else(|| {
             MaptileError::InvalidRequest("canonical raster style is required".into())
         })?;
@@ -452,20 +545,24 @@ impl TileSource for MosaicSource {
         )?;
         let out_format = out_tile_format(style.format);
 
-        let tile: Bytes = self
-            .tiler
-            .tile(
-                AgTileCoord {
-                    tms: TileMatrixSet::WebMercatorQuad,
-                    z: xyz.z,
-                    x: xyz.x,
-                    y: xyz.y,
-                },
-                &tile_style,
-            )
-            .await
-            .map_err(crate::raster::agtiff_style::render_error)?
-            .ok_or(MaptileError::TileNotFound(xyz.z, xyz.x, xyz.y))?;
+        let tile: Bytes = super::agtiff_request::render(|limiter| async {
+            self.tiler
+                .as_ref()
+                .clone()
+                .with_request_limiter(limiter)
+                .tile(
+                    AgTileCoord {
+                        tms: TileMatrixSet::WebMercatorQuad,
+                        z: xyz.z,
+                        x: xyz.x,
+                        y: xyz.y,
+                    },
+                    &tile_style,
+                )
+                .await
+        })
+        .await?
+        .ok_or(MaptileError::TileNotFound(xyz.z, xyz.x, xyz.y))?;
 
         Ok(TileResponse {
             data: tile,
@@ -510,7 +607,7 @@ mod pixel_selection_tests {
             // Missing/degenerate bbox [0, 0, 0, 0] -> conservatively retained for all tiles
             ("missing_bbox", [0.0, 0.0, 0.0, 0.0]),
         ];
-        let assets: Vec<AssetRef> = members
+        let assets = members
             .into_iter()
             .map(|(id, raw)| AssetRef {
                 url: format!("{id}.tif"),
@@ -930,21 +1027,19 @@ mod pixel_selection_tests {
         ] {
             for (x, bbox, far_bbox) in [(0, west, east), (columns - 1, east, west)] {
                 let coord = AgTileCoord { tms, z: 2, x, y: 1 };
-                let mut fixed = FixedMosaicSource {
-                    assets: vec![AssetRef {
-                        url: "0.tif".into(),
-                        source_id: "far".into(),
-                        bbox: far_bbox,
-                    }],
-                };
+                let mut assets = vec![AssetRef {
+                    url: "0.tif".into(),
+                    source_id: "far".into(),
+                    bbox: far_bbox,
+                }];
                 for i in 0..64 {
-                    fixed.assets.push(AssetRef {
+                    assets.push(AssetRef {
                         url: format!("{i}.tif"),
                         source_id: i.to_string(),
                         bbox,
                     });
                 }
-                fixed.assets.insert(
+                assets.insert(
                     2,
                     AssetRef {
                         url: "0.tif".into(),
@@ -952,6 +1047,9 @@ mod pixel_selection_tests {
                         bbox,
                     },
                 );
+                let fixed = FixedMosaicSource {
+                    assets: assets.into(),
+                };
                 let mut expected = (0..64).map(|i| i.to_string()).collect::<Vec<_>>();
                 expected.insert(1, "duplicate".into());
                 let raw = fixed.assets_for_tile(coord).await.unwrap();
@@ -977,11 +1075,25 @@ mod pixel_selection_tests {
                         .collect::<Vec<_>>(),
                     (0..64).map(|i| i.to_string()).collect::<Vec<_>>()
                 );
-                fixed.assets.push(AssetRef {
+                let small_budget = DiscoveryOptions {
+                    max_asset_bytes: 16,
+                    ..options.clone()
+                };
+                assert!(matches!(
+                    fixed
+                        .assets_for_tile_with_options(coord, &small_budget)
+                        .await,
+                    Err(AgError::ResourceLimit(_))
+                ));
+                let mut assets = fixed.assets.to_vec();
+                assets.push(AssetRef {
                     url: "64.tif".into(),
                     source_id: "64".into(),
                     bbox,
                 });
+                let fixed = FixedMosaicSource {
+                    assets: assets.into(),
+                };
                 let result = fixed.assets_for_tile_with_options(coord, &options).await;
                 assert!(
                     matches!(result, Err(async_geotiff::error::AgError::Mosaic(message)) if message.contains("65 assets, exceeding limit 64")),

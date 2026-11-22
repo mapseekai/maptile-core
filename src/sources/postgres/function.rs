@@ -15,11 +15,10 @@ use tilejson::{TileJSON, tilejson};
 use crate::cache::{CacheZoomRange, ContentVersion};
 use crate::error::{MaptileError, MaptileResult};
 use crate::sources::{
-    TileCoord, TileEncoding, TileFormat, TileInfo, TileQuery, TileResponse, TileSource,
-    read_tile_batch_with,
+    MAX_TILE_BATCH_BYTES, TileCoord, TileEncoding, TileFormat, TileInfo, TileQuery, TileResponse,
+    TileSource, validate_source_request,
 };
-
-use crate::sources::tile_math::validate_tile_request;
+use crate::transport::MAX_DECODED_TILE_BYTES;
 
 use super::PostgresPool;
 
@@ -32,7 +31,7 @@ pub struct PostgresFunctionConfig {
     pub minzoom: Option<u8>,
     pub maxzoom: Option<u8>,
     pub bounds: Option<[f64; 4]>,
-    /// Per-source cache zoom policy. `None` ≡ cache every zoom.
+    /// Legacy cache policy. This source reads mutable data and bypasses the tile cache.
     pub cache_zoom: Option<CacheZoomRange>,
 }
 
@@ -59,6 +58,7 @@ impl std::fmt::Debug for PostgresFunctionSource {
 
 impl PostgresFunctionSource {
     pub async fn open(pool: Arc<PostgresPool>, cfg: PostgresFunctionConfig) -> MaptileResult<Self> {
+        super::pool::validate_source_window(cfg.minzoom, cfg.maxzoom, cfg.bounds)?;
         let query_type = probe_signature(&pool, &cfg.schema, &cfg.function).await?;
         let supports_url_query = query_type.is_some();
         let sql = build_sql(&cfg.schema, &cfg.function, query_type);
@@ -92,53 +92,58 @@ impl PostgresFunctionSource {
             content_version: ContentVersion::new_generation(),
         })
     }
+
+    fn within_zoom_range(&self, zoom: u8) -> bool {
+        zoom >= self.cfg.minzoom.unwrap_or(0) && self.cfg.maxzoom.is_none_or(|max| zoom <= max)
+    }
 }
 
 async fn probe_signature(
-    pool: &PostgresPool,
+    pool: &Arc<PostgresPool>,
     schema: &str,
     function: &str,
 ) -> MaptileResult<Option<&'static str>> {
-    let conn = pool.get().await?;
-    let row = conn
+    let pending = pool.get_query().await?;
+    let row = pending
+        .connection()
         .query_opt(
             r#"
-            SELECT array_agg(format_type(t, NULL)::text)
-            FROM pg_proc p
-            JOIN pg_namespace n ON n.oid = p.pronamespace
-            CROSS JOIN LATERAL unnest(p.proargtypes) AS t
+            SELECT format_type(p.proargtypes[3], NULL)
+            FROM pg_catalog.pg_proc p
+            JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
             WHERE n.nspname = $1 AND p.proname = $2
-            GROUP BY p.oid
+              AND p.prokind = 'f' AND NOT p.proretset AND p.prorettype = 'bytea'::regtype
+              AND p.proargtypes[0] = 'integer'::regtype
+              AND p.proargtypes[1] = 'integer'::regtype
+              AND p.proargtypes[2] = 'integer'::regtype
+              AND (p.pronargs = 3 OR (p.pronargs = 4 AND
+                   p.proargtypes[3] IN ('json'::regtype, 'jsonb'::regtype)))
+            ORDER BY p.pronargs DESC, p.proargtypes[3] DESC NULLS LAST
             LIMIT 1
             "#,
             &[&schema, &function],
         )
         .await
         .map_err(MaptileError::backend)?;
+    pending.finish().await?;
 
-    let row =
-        row.ok_or_else(|| MaptileError::Config(format!("function {schema}.{function} not found")))?;
-    let args: Vec<String> = row.get(0);
-
-    let normalized: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    match normalized.as_slice() {
-        ["integer", "integer", "integer"] => Ok(None),
-        ["integer", "integer", "integer", "json"] => Ok(Some("json")),
-        ["integer", "integer", "integer", "jsonb"] => Ok(Some("jsonb")),
-        other => Err(MaptileError::Config(format!(
-            "function {schema}.{function} has unsupported signature: {other:?}"
-        ))),
-    }
+    let row = row.ok_or_else(|| MaptileError::Config(format!(
+        "no bytea function {schema}.{function} accepts (integer, integer, integer [, json/jsonb])"
+    )))?;
+    Ok(row
+        .get::<_, Option<&str>>(0)
+        .map(|arg| if arg == "jsonb" { "jsonb" } else { "json" }))
 }
 
 fn build_sql(schema: &str, function: &str, query_type: Option<&'static str>) -> String {
     let s = pg_escape::quote_identifier(schema);
     let f = pg_escape::quote_identifier(function);
-    if let Some(query_type) = query_type {
-        format!("SELECT {s}.{f}($1::int, $2::int, $3::int, $4::{query_type})")
-    } else {
-        format!("SELECT {s}.{f}($1::int, $2::int, $3::int)")
-    }
+    let arg = query_type.map_or(String::new(), |t| format!(", $4::{t}"));
+    // OFFSET 0 prevents inlining so a stable function is evaluated only once.
+    format!(
+        "SELECT octet_length(data), CASE WHEN octet_length(data) <= {MAX_DECODED_TILE_BYTES} THEN data END
+         FROM (SELECT {s}.{f}($1::int, $2::int, $3::int{arg}) AS data OFFSET 0) result"
+    )
 }
 
 fn url_query_to_json(q: &crate::filter::UrlQuery) -> Value {
@@ -183,6 +188,16 @@ fn build_query_payload(q: Option<&TileQuery<'_>>) -> Value {
 
 #[async_trait]
 impl TileSource for PostgresFunctionSource {
+    fn source_kind(&self) -> crate::sources::SourceKind {
+        crate::sources::SourceKind::PostgresFunction
+    }
+    fn supports_bbox(&self) -> bool {
+        self.supports_url_query
+    }
+    fn native_batch(&self) -> bool {
+        true
+    }
+
     fn id(&self) -> &str {
         &self.cfg.id
     }
@@ -210,11 +225,7 @@ impl TileSource for PostgresFunctionSource {
     }
 
     fn cache_zoom(&self) -> crate::cache::CacheZoomRange {
-        // Single source of truth: read from the stored config. Returning the
-        // resolved value (with `unwrap_or_default()`) avoids having both a
-        // raw `Option<CacheZoomRange>` on the config and a duplicate
-        // `CacheZoomRange` field on this struct.
-        self.cfg.cache_zoom.unwrap_or_default()
+        CacheZoomRange::disabled()
     }
 
     fn clone_source(&self) -> Box<dyn TileSource> {
@@ -234,8 +245,15 @@ impl TileSource for PostgresFunctionSource {
         xyz: TileCoord,
         query: Option<&TileQuery<'_>>,
     ) -> MaptileResult<TileResponse> {
-        validate_tile_request(std::slice::from_ref(&xyz), query)?;
-        self.fetch_tile(xyz, query).await
+        validate_source_request(self, &[xyz], query)?;
+        let missing = || MaptileError::TileNotFound(xyz.z, xyz.x, xyz.y);
+        if !self.within_zoom_range(xyz.z) {
+            return Err(missing());
+        }
+        let pending = self.pool.get_query().await?;
+        let row = self.fetch_tile_on(pending.connection(), xyz, query).await?;
+        pending.finish().await?;
+        self.tile_response(&row)?.ok_or_else(missing)
     }
 
     async fn read_tile_batch(
@@ -243,38 +261,58 @@ impl TileSource for PostgresFunctionSource {
         coords: &[TileCoord],
         query: Option<&TileQuery<'_>>,
     ) -> MaptileResult<Vec<TileResponse>> {
-        validate_tile_request(coords, query)?;
-        if coords.is_empty() {
-            return Ok(Vec::new());
+        let rows = self.read_tile_batch_slots(coords, query).await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                row.unwrap_or_else(|| TileResponse {
+                    data: Bytes::new(),
+                    info: self.info,
+                    last_modified: None,
+                })
+            })
+            .collect())
+    }
+
+    async fn read_tile_batch_slots(
+        &self,
+        coords: &[TileCoord],
+        query: Option<&TileQuery<'_>>,
+    ) -> MaptileResult<Vec<Option<TileResponse>>> {
+        validate_source_request(self, coords, query)?;
+        if coords.iter().all(|coord| !self.within_zoom_range(coord.z)) {
+            return Ok(vec![None; coords.len()]);
         }
         let pending = self.pool.get_batch().await?;
-        let conn = pending.connection();
-        let tiles = read_tile_batch_with(coords, self.info, |coord| {
-            self.fetch_tile_on(conn, coord, query)
-        })
-        .await?;
+        let mut tiles = Vec::with_capacity(coords.len());
+        let mut bytes = 0;
+        for &coord in coords {
+            let tile = if self.within_zoom_range(coord.z) {
+                let row = self
+                    .fetch_tile_on(pending.connection(), coord, query)
+                    .await?;
+                self.tile_response(&row)?
+            } else {
+                None
+            };
+            bytes += tile.as_ref().map_or(0, |tile| tile.data.len());
+            tiles.push(tile);
+            if bytes >= MAX_TILE_BATCH_BYTES {
+                break;
+            }
+        }
         pending.finish().await?;
         Ok(tiles)
     }
 }
 
 impl PostgresFunctionSource {
-    /// Invoke the SQL function for one tile.
-    async fn fetch_tile(
-        &self,
-        xyz: TileCoord,
-        query: Option<&TileQuery<'_>>,
-    ) -> MaptileResult<TileResponse> {
-        let conn = self.pool.get().await?;
-        self.fetch_tile_on(&conn, xyz, query).await
-    }
-
     async fn fetch_tile_on(
         &self,
         conn: &deadpool_postgres::Object,
         xyz: TileCoord,
         query: Option<&TileQuery<'_>>,
-    ) -> MaptileResult<TileResponse> {
+    ) -> MaptileResult<tokio_postgres::Row> {
         let z = i32::from(xyz.z);
         let x = xyz.x as i32;
         let y = xyz.y as i32;
@@ -283,35 +321,31 @@ impl PostgresFunctionSource {
             .await
             .map_err(MaptileError::backend)?;
 
-        let row_opt = if self.supports_url_query {
+        if self.supports_url_query {
             let json = build_query_payload(query);
-            conn.query_opt(&stmt, &[&z, &x, &y, &json])
-                .await
-                .map_err(MaptileError::backend)?
+            conn.query_one(&stmt, &[&z, &x, &y, &json]).await
         } else {
-            conn.query_opt(&stmt, &[&z, &x, &y])
-                .await
-                .map_err(MaptileError::backend)?
+            conn.query_one(&stmt, &[&z, &x, &y]).await
+        }
+        .map_err(MaptileError::backend)
+    }
+
+    fn tile_response(&self, row: &tokio_postgres::Row) -> MaptileResult<Option<TileResponse>> {
+        let size: Option<i32> = row.try_get(0).map_err(MaptileError::backend)?;
+        let Some(size) = size else {
+            return Ok(None);
         };
-
-        // NULL means no tile; a present but empty bytea remains a valid MVT.
-        let row = row_opt.ok_or(MaptileError::TileNotFound(xyz.z, xyz.x, xyz.y))?;
-        let bytes: Vec<u8> = row
-            .try_get::<_, Option<Vec<u8>>>(0)
-            .map_err(MaptileError::backend)?
-            .ok_or(MaptileError::TileNotFound(xyz.z, xyz.x, xyz.y))?;
-
-        if bytes.len() > crate::transport::MAX_DECODED_TILE_BYTES {
+        if size as usize > MAX_DECODED_TILE_BYTES {
             return Err(MaptileError::PayloadTooLarge {
-                limit: crate::transport::MAX_DECODED_TILE_BYTES,
+                limit: MAX_DECODED_TILE_BYTES,
             });
         }
-
-        Ok(TileResponse {
+        let bytes: Vec<u8> = row.try_get(1).map_err(MaptileError::backend)?;
+        Ok(Some(TileResponse {
             data: Bytes::from(bytes),
             info: self.info,
             last_modified: None,
-        })
+        }))
     }
 }
 

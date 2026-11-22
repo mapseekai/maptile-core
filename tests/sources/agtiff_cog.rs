@@ -1,5 +1,318 @@
+#[cfg(feature = "agtiff")]
+#[path = "../common/raster.rs"]
+mod raster_fixture;
+
+use maptile_core::sources::{AsyncCogSource, AsyncCogSourceConfig, CogObjectSource, TileSource};
+use std::sync::Arc;
+
+fn cog_config(source: CogObjectSource) -> AsyncCogSourceConfig {
+    AsyncCogSourceConfig {
+        id: "portable-cog".into(),
+        source,
+        name: None,
+        description: None,
+        attribution: None,
+        minzoom: None,
+        maxzoom: None,
+        bounds: None,
+        cache_zoom: None,
+        content_id: "point-generation".into(),
+        block_cache: None,
+    }
+}
+
+#[cfg(feature = "agtiff")]
+#[tokio::test]
+async fn opens_geotiff_and_queries_pixel_without_gdal() {
+    use maptile_core::sources::RasterPointQuery;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("point.tif");
+    raster_fixture::write_world_tiff(&path, |_| 73);
+    let source = AsyncCogSource::open(cog_config(CogObjectSource::Local(
+        path.to_str().unwrap().into(),
+    )))
+    .await
+    .unwrap();
+    let point = source
+        .query_raster_point(&RasterPointQuery {
+            x: 0.0,
+            y: 0.0,
+            coord_crs: "EPSG:4326".into(),
+            bidx: vec![1],
+        })
+        .await
+        .unwrap();
+    assert!(point.valid);
+    assert_eq!(point.values, vec![73.0]);
+}
+
+#[tokio::test]
+async fn drain_reports_unconfirmed_raw_decode_after_valid_point_admission() {
+    use maptile_core::{
+        cache::TileCache,
+        control::CatalogService,
+        error::ErrorKind,
+        service::{ReadTarget, TileStack},
+        sources::RasterPointQuery,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("raw.tif");
+    raster_fixture::write_world_tiff_with_compression_tag(&path, |_| 73, 8);
+    let config = cog_config(CogObjectSource::Local(path.to_str().unwrap().into()));
+    for (band, expected_error, expected_drain_error) in [
+        (2, ErrorKind::InvalidInput, None),
+        (1, ErrorKind::Backend, Some(ErrorKind::Unavailable)),
+    ] {
+        let source = AsyncCogSource::open(config.clone()).await.unwrap();
+        let engine = Arc::new(CatalogService::new(TileCache::new(1, None, None).unwrap()));
+        let mut update = engine.catalog().update();
+        update.put(Arc::new(source)).unwrap();
+        engine.catalog().publish(update).unwrap();
+        let stack = TileStack::builder(engine.clone()).build();
+        let error = stack
+            .raster_point(
+                ReadTarget::new("portable-cog", "public"),
+                &RasterPointQuery {
+                    x: 0.,
+                    y: 0.,
+                    coord_crs: "EPSG:4326".into(),
+                    bidx: vec![band],
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), expected_error);
+        let drain = engine
+            .catalog()
+            .shutdown(tokio::time::Instant::now() + std::time::Duration::from_secs(5))
+            .await;
+        assert_eq!(drain.err().map(|error| error.kind()), expected_drain_error);
+    }
+}
+
+#[tokio::test]
+async fn cog_export_rejects_equal_length_local_replacement() {
+    use maptile_core::{
+        cache::TileCache,
+        control::CatalogService,
+        error::MaptileError,
+        service::{ReadTarget, TileOutcome, TileStack},
+        sources::{TileCoord, TileQuery},
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("本地 terrain #1.tif");
+    raster_fixture::write_world_tiff(&path, |_| 73);
+    let config = cog_config(CogObjectSource::Local(path.to_str().unwrap().into()));
+    let engine = Arc::new(CatalogService::new(TileCache::new(1, None, None).unwrap()));
+    let publish = |source: AsyncCogSource| {
+        let mut update = engine.catalog().update();
+        update.put(Arc::new(source)).unwrap();
+        engine.catalog().publish(update).unwrap();
+    };
+    publish(AsyncCogSource::open(config.clone()).await.unwrap());
+    let stack = TileStack::builder(engine.clone()).build();
+    let style = raster_fixture::gray_png_style();
+    let query = TileQuery {
+        style: Some(&style),
+        ..Default::default()
+    };
+    let target = ReadTarget {
+        query: Some(&query),
+        ..ReadTarget::new("portable-cog", "public")
+    };
+    let west = TileCoord { z: 1, x: 0, y: 0 };
+    let east = TileCoord { x: 1, ..west };
+    let center_pixel = |outcome: &TileOutcome| {
+        image::load_from_memory(&outcome.tile().unwrap().data)
+            .unwrap()
+            .to_rgba8()
+            .get_pixel(128, 128)
+            .0
+    };
+    let old = stack.begin_export(target).unwrap();
+    assert_eq!(
+        center_pixel(&old.read_page(&[west]).await.unwrap().tiles[0]),
+        [73, 73, 73, 255]
+    );
+    let next = dir.path().join("next.tif");
+    raster_fixture::write_world_tiff(&next, |_| 91);
+    let next_file = std::fs::File::options().write(true).open(&next).unwrap();
+    next_file
+        .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(1))
+        .unwrap();
+    drop(next_file);
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().len(),
+        std::fs::metadata(&next).unwrap().len()
+    );
+    std::fs::rename(&next, &path).unwrap();
+    assert!(matches!(
+        old.read_page(&[east]).await,
+        Err(MaptileError::VersionChanged(_))
+    ));
+
+    publish(AsyncCogSource::open(config).await.unwrap());
+    let current = stack.begin_export(target).unwrap();
+    assert_ne!(old.revision(), current.revision());
+    assert_eq!(
+        center_pixel(&current.read_page(&[west]).await.unwrap().tiles[0]),
+        [91, 91, 91, 255]
+    );
+}
+
+#[tokio::test]
+async fn remote_cog_replacement_preserves_the_version_error() {
+    use maptile_core::{error::ErrorKind, sources::RasterPointQuery};
+    use object_store::{ObjectStoreExt, memory::InMemory, path::Path};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("point.tif");
+    let store = Arc::new(InMemory::new());
+    let key = Path::from("point.tif");
+    raster_fixture::write_world_tiff(&path, |_| 73);
+    store
+        .put(&key, std::fs::read(&path).unwrap().into())
+        .await
+        .unwrap();
+    let source = AsyncCogSource::open(cog_config(CogObjectSource::ObjectStore {
+        store: store.clone(),
+        key: key.to_string(),
+    }))
+    .await
+    .unwrap();
+    raster_fixture::write_world_tiff(&path, |_| 91);
+    store
+        .put(&key, std::fs::read(path).unwrap().into())
+        .await
+        .unwrap();
+    let error = source
+        .query_raster_point(&RasterPointQuery {
+            x: 0.0,
+            y: 0.0,
+            coord_crs: "EPSG:4326".into(),
+            bidx: vec![1],
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::VersionChanged);
+}
+
+#[tokio::test]
+async fn http_cog_rechecks_successful_ranges_when_server_ignores_if_match() {
+    use axum::{
+        Router,
+        http::{HeaderMap, StatusCode, header},
+        routing::get,
+    };
+    use maptile_core::{error::ErrorKind, sources::RasterPointQuery};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("point.tif");
+    raster_fixture::write_world_tiff(&path, |_| 73);
+    let data = bytes::Bytes::from(std::fs::read(path).unwrap());
+    let changed = Arc::new(AtomicBool::new(false));
+    let handler = {
+        let changed = changed.clone();
+        move |headers: HeaderMap| {
+            let (data, changed) = (data.clone(), changed.clone());
+            async move {
+                let (a, b) = headers[header::RANGE]
+                    .to_str()
+                    .unwrap()
+                    .strip_prefix("bytes=")
+                    .unwrap()
+                    .split_once('-')
+                    .unwrap();
+                let start: usize = a.parse().unwrap();
+                let end = b.parse::<usize>().unwrap().min(data.len() - 1);
+                let mut out = HeaderMap::new();
+                if changed.load(Ordering::Acquire) {
+                    assert_eq!(headers[header::IF_MATCH], "\"one\"");
+                    out.append(header::ETAG, "\"one\"".parse().unwrap());
+                    out.append(header::ETAG, "\"two\"".parse().unwrap());
+                } else {
+                    out.insert(header::ETAG, "\"one\"".parse().unwrap());
+                }
+                out.insert(
+                    header::CONTENT_RANGE,
+                    format!("bytes {start}-{end}/{}", data.len())
+                        .parse()
+                        .unwrap(),
+                );
+                (StatusCode::PARTIAL_CONTENT, out, data.slice(start..=end))
+            }
+        }
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = Router::new().route("/signed.tif", get(handler));
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let source = AsyncCogSource::open(cog_config(CogObjectSource::Http(format!(
+        "http://{addr}/signed.tif?version=one"
+    ))))
+    .await
+    .unwrap();
+    changed.store(true, Ordering::Release);
+    let error = source
+        .query_raster_point(&RasterPointQuery {
+            x: 0.0,
+            y: 0.0,
+            coord_crs: "EPSG:4326".into(),
+            bidx: vec![1],
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::VersionChanged);
+    server.abort();
+}
+
+#[tokio::test]
+async fn cog_rejects_an_http_object_without_a_strong_validator() {
+    use axum::{
+        Router,
+        extract::Path,
+        http::{HeaderMap, StatusCode, header},
+        routing::get,
+    };
+    use maptile_core::error::MaptileError;
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let probes = Arc::new(AtomicUsize::new(0));
+    let handler = {
+        let probes = probes.clone();
+        move |Path(mode): Path<String>, headers: HeaderMap| {
+            let probes = probes.clone();
+            async move {
+                assert_eq!(headers[header::RANGE], "bytes=0-0");
+                probes.fetch_add(1, Relaxed);
+                let mut out = HeaderMap::new();
+                out.insert(header::CONTENT_RANGE, "bytes 0-0/4".parse().unwrap());
+                if mode == "weak.tif" {
+                    out.insert(header::ETAG, "W/\"v1\"".parse().unwrap());
+                }
+                (StatusCode::PARTIAL_CONTENT, out, "I")
+            }
+        }
+    };
+    let app = Router::new().route("/{mode}", get(handler));
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    for mode in ["missing.tif", "weak.tif"] {
+        let result = AsyncCogSource::open(cog_config(CogObjectSource::Http(format!(
+            "http://{addr}/{mode}"
+        ))))
+        .await;
+        assert!(matches!(result, Err(MaptileError::Config(_))));
+    }
+    assert_eq!(probes.load(Relaxed), 2);
+    server.abort();
+}
+
 mod raster_uint16_e2e {
-    #![cfg(all(feature = "agtiff", feature = "raster"))]
+    #![cfg(feature = "raster")]
 
     use gdal::DriverManager;
     use gdal::raster::{Buffer, RasterCreationOptions};

@@ -20,13 +20,33 @@ jobs:
         include:
           - name: default
             features: ""
-          - name: cloud-metrics-mlt
-            features: cloud,metrics,mlt
-          - name: geoparquet
-            features: local-vector
+          - name: pmtiles
+            features: pmtiles
+          - name: pmtiles-cloud
+            features: pmtiles,cloud,zstd
+          - name: mbtiles
+            features: mbtiles
+          - name: archives
+            features: pmtiles,mbtiles
+          - name: postgres
+            features: postgres
+          - name: duckdb
+            features: duckdb
+          - name: parquet-archive
+            features: parquet-archive
+          - name: agtiff
+            features: agtiff
+          - name: stac
+            features: stac
+          - name: raster
+            features: raster
+          - name: postgres-outdb
+            features: postgres,raster
+          - name: metrics-mlt
+            features: metrics,mlt
     services:
       postgres:
-        image: postgis/postgis:17-3.5
+        image: ${{ startsWith(matrix.name, 'postgres') && 'postgis/postgis:17-3.5' || '' }}
         env:
           POSTGRES_HOST_AUTH_METHOD: trust
           POSTGRES_DB: maptile_core_test
@@ -41,7 +61,7 @@ jobs:
       CARGO_INCREMENTAL: "0"
       RUSTDOCFLAGS: "-D warnings"
       CARGO_BUILD_JOBS: "2"
-      DATABASE_URL: postgresql://postgres@127.0.0.1:5432/maptile_core_test
+      DATABASE_URL: ${{ startsWith(matrix.name, 'postgres') && 'postgresql://postgres@127.0.0.1:5432/maptile_core_test' || '' }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
@@ -75,6 +95,14 @@ jobs:
           )
           sudo apt-get "${apt_options[@]}" -o APT::Update::Error-Mode=any update
           sudo apt-get "${apt_options[@]}" install --yes --no-install-recommends build-essential cmake ninja-build pkg-config
+      - name: Install PROJ build requirements and GDAL when enabled
+        if: contains(matrix.features, 'agtiff') || contains(matrix.features, 'stac') || contains(matrix.features, 'raster')
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends sqlite3 libsqlite3-dev libproj-dev
+          if [[ "$FEATURES" == *raster* ]]; then
+            sudo apt-get install --yes --no-install-recommends libgdal-dev
+          fi
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
@@ -87,8 +115,10 @@ jobs:
           cargo fmt --all --check
           bash scripts/ci/maptile-render-cargo_test.sh
       - name: Prepare signed DuckDB extensions
-        if: matrix.name == 'geoparquet'
-        run: cargo run --locked --features geoparquet --example geoparquet_extensions -- --install
+        if: matrix.name == 'duckdb'
+        run: cargo run --locked --features duckdb --example geoparquet_extensions -- --install
+      - name: Assert feature boundaries
+        run: bash scripts/ci/check-feature-dependencies.sh "$FEATURES"
       - name: Test
         run: cargo test --locked --features "$FEATURES"
       - name: Clippy
@@ -98,3 +128,96 @@ jobs:
       - name: Verify source package
         if: matrix.name == 'default'
         run: cargo package --locked
+
+  macos:
+    name: macOS ${{ matrix.name }}
+    runs-on: macos-15
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: default
+            features: ""
+          - name: pmtiles
+            features: pmtiles,cloud,zstd
+          - name: mbtiles
+            features: mbtiles
+          - name: archives
+            features: pmtiles,mbtiles
+          - name: parquet-archive
+            features: parquet-archive
+          - name: agtiff
+            features: agtiff
+          - name: stac
+            features: stac
+          - name: raster
+            features: raster
+          - name: metrics-mlt
+            features: metrics,mlt
+    env:
+      FEATURES: ${{ matrix.features }}
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+      CARGO_BUILD_JOBS: "2"
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@0176485ebe2f605bde554dd99f804beeaf7db3e2
+        with:
+          toolchain: "1.98.1"
+          components: clippy
+      - name: Install PROJ or GDAL
+        if: contains(matrix.features, 'agtiff') || contains(matrix.features, 'stac') || contains(matrix.features, 'raster')
+        run: |
+          if [[ "$FEATURES" == *raster* ]]; then
+            brew install gdal
+          else
+            brew install proj
+          fi
+      - name: Assert feature boundaries
+        run: bash scripts/ci/check-feature-dependencies.sh "$FEATURES"
+      - name: Test
+        run: cargo test --locked --features "$FEATURES"
+      - name: Clippy
+        run: cargo clippy --locked --all-targets --features "$FEATURES" -- -D warnings
+
+  windows-archives:
+    name: Windows archive generations
+    runs-on: windows-2025
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@0176485ebe2f605bde554dd99f804beeaf7db3e2
+        with:
+          toolchain: "1.98.1"
+      - name: Exercise file identity, positional I/O and SQLite snapshots
+        run: cargo test --locked --features pmtiles,mbtiles --test pmtiles_local --test mbtiles --test control --test service
+
+  native-opengl:
+    name: Linux OpenGL renderer
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      EGL_PLATFORM: surfaceless
+      LIBGL_ALWAYS_SOFTWARE: "1"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@0176485ebe2f605bde554dd99f804beeaf7db3e2
+        with:
+          toolchain: "1.98.1"
+      - name: Install EGL and native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1-mesa-dev libgles2-mesa-dev libglfw3-dev libuv1-dev libicu-dev libpng-dev libjpeg-dev libwebp-dev libcurl4-openssl-dev
+      - name: Build pinned native source and render fixture images
+        run: bash scripts/ci/maptile-render-cargo.sh test --locked --features render-opengl --test render_native -- --test-threads=1

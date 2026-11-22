@@ -4,8 +4,8 @@ use crate::cache::ContentVersion;
 use crate::error::{MaptileError, MaptileResult};
 use crate::sources::archive_inspection::ArchiveSourceType;
 use crate::sources::pmtiles::{
-    PmtilesConfig, archive_content_version, archive_tile_etag, pmt_compression_to_encoding,
-    pmt_tile_type_to_format, reader::Reader,
+    PmtilesConfig, archive_tile_etag, pmt_compression_to_encoding, pmt_tile_type_to_format,
+    reader::Reader,
 };
 use crate::sources::{SourceKind, TileCoord, TileInfo, TileQuery, TileResponse, TileSource};
 use async_trait::async_trait;
@@ -13,52 +13,105 @@ use bytes::BytesMut;
 use futures_util::TryStreamExt;
 use object_store::{GetOptions, GetRange, ObjectStore, path::Path};
 use pmtiles::{AsyncBackend, BackendResponse, PmtError, PmtResult};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tilejson::TileJSON;
 
 struct CloudBackend {
     store: Arc<dyn ObjectStore>,
     path: Path,
+    identity: OnceLock<(ObjectIdentity, u64)>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ObjectIdentity {
+    Version(String),
+    Etag(String),
 }
 
 impl AsyncBackend for CloudBackend {
     async fn read(&self, offset: usize, length: usize) -> PmtResult<BackendResponse> {
         let start = offset as u64;
-        let end = (offset + length) as u64;
+        let end = offset.checked_add(length).ok_or_else(|| {
+            PmtError::Reading(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid PMTiles range",
+            ))
+        })? as u64;
+        if length == 0 {
+            return Err(PmtError::Reading(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "empty PMTiles range",
+            )));
+        }
+        let (version, if_match) = match self.identity.get().map(|(identity, _)| identity) {
+            Some(ObjectIdentity::Version(version)) => (Some(version.clone()), None),
+            Some(ObjectIdentity::Etag(etag)) => (None, Some(etag.clone())),
+            None => (None, None),
+        };
         let response = self
             .store
             .get_opts(
                 &self.path,
                 GetOptions {
                     range: Some(GetRange::Bounded(start..end)),
+                    version,
+                    if_match,
                     ..Default::default()
                 },
             )
-            .await?;
+            .await
+            .map_err(|error| match error {
+                object_store::Error::Precondition { .. } if self.identity.get().is_some() => {
+                    PmtError::SourceModified
+                }
+                object_store::Error::NotFound { .. } if self.identity.get().is_some() => {
+                    PmtError::SourceModified
+                }
+                other => PmtError::from(other),
+            })?;
         let size = response.meta.size;
-        if response.range != (start..end.min(size)) || start >= size {
-            return Err(PmtError::RangeRequestsUnsupported);
-        }
-        let version = response
+        let identity = response
             .meta
             .version
             .as_ref()
             .filter(|version| !version.is_empty() && version.as_str() != "null")
-            .map(|version| format!("version:{size}:{version}"))
+            .map(|version| ObjectIdentity::Version(version.clone()))
             .or_else(|| {
                 response
                     .meta
                     .e_tag
                     .as_ref()
-                    .filter(|etag| !etag.is_empty() && !etag.starts_with("W/"))
-                    .map(|etag| format!("etag:{size}:{etag}"))
+                    .filter(|etag| {
+                        !etag.is_empty() && etag.as_str() != "*" && !etag.starts_with("W/")
+                    })
+                    .map(|etag| ObjectIdentity::Etag(etag.clone()))
             })
-            .unwrap_or_else(|| {
-                format!(
-                    "modified:{size}:{}",
-                    response.meta.last_modified.to_rfc3339()
-                )
-            });
+            .ok_or_else(|| {
+                if self.identity.get().is_some() {
+                    return PmtError::SourceModified;
+                }
+                PmtError::Reading(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "PMTiles requires an object version or strong ETag",
+                ))
+            })?;
+        let identity = (identity, size);
+        if let Some(expected) = self.identity.get() {
+            if expected != &identity {
+                return Err(PmtError::SourceModified);
+            }
+        } else if self.identity.set(identity.clone()).is_err()
+            && self.identity.get() != Some(&identity)
+        {
+            return Err(PmtError::SourceModified);
+        }
+        if response.range != (start..end.min(size)) || start >= size {
+            return Err(PmtError::RangeRequestsUnsupported);
+        }
+        let version = match &identity.0 {
+            ObjectIdentity::Version(value) => format!("version:{size}:{value}"),
+            ObjectIdentity::Etag(value) => format!("etag:{size}:{value}"),
+        };
         let expected = (response.range.end - start) as usize;
         let mut body = response.into_stream();
         let mut bytes = BytesMut::new();
@@ -126,12 +179,11 @@ impl CloudPmtilesSource {
         let reader = Reader::open(CloudBackend {
             store,
             path: object_path,
+            identity: OnceLock::new(),
         })
         .await?;
-        let stable = reader
-            .version()
-            .filter(|version| !version.starts_with("modified:"));
-        let content_version = archive_content_version(&cfg.path, stable);
+        // An injected store can resolve the same URL and ETag in another account or endpoint.
+        let content_version = ContentVersion::new_generation();
 
         let header = &reader.header;
         let native_format = pmt_tile_type_to_format(header.tile_type)?;
@@ -190,10 +242,10 @@ impl TileSource for CloudPmtilesSource {
     async fn get_tile(
         &self,
         xyz: TileCoord,
-        _query: Option<&TileQuery<'_>>,
+        query: Option<&TileQuery<'_>>,
     ) -> MaptileResult<TileResponse> {
-        let coord = pmtiles::TileCoord::new(xyz.z, xyz.x, xyz.y)
-            .map_err(|_| MaptileError::TileNotFound(xyz.z, xyz.x, xyz.y))?;
+        crate::sources::validate_source_request(self, &[xyz], query)?;
+        let coord = super::checked_coord(xyz)?;
         let bytes = self
             .reader
             .get_tile(coord)
@@ -208,5 +260,34 @@ impl TileSource for CloudPmtilesSource {
 
     fn tile_etag(&self, response: &TileResponse) -> String {
         archive_tile_etag(self.content_version, response)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use object_store::ObjectStoreExt;
+    #[tokio::test]
+    async fn equal_length_replacement_fails_conditional_range() {
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let path = Path::from("archive.pmtiles");
+        store
+            .put(&path, bytes::Bytes::from_static(b"one!").into())
+            .await
+            .unwrap();
+        let backend = CloudBackend {
+            store: store.clone(),
+            path: path.clone(),
+            identity: OnceLock::new(),
+        };
+        assert_eq!(backend.read(0, 4).await.unwrap().bytes, "one!");
+        store
+            .put(&path, bytes::Bytes::from_static(b"two!").into())
+            .await
+            .unwrap();
+        assert!(matches!(
+            backend.read(0, 4).await,
+            Err(PmtError::SourceModified)
+        ));
     }
 }

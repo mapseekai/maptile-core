@@ -182,6 +182,7 @@ async fn concurrent_register_and_get_is_safe() {
     assert_eq!(m.list_ids().len(), 50);
 }
 
+#[cfg(all(feature = "mbtiles", feature = "pmtiles"))]
 mod manager_interop {
     use maptile_core::sources::manager::SourceManager;
     use maptile_core::sources::mbtiles::{MbtilesConfig, MbtilesSource};

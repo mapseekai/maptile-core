@@ -21,6 +21,63 @@ fn default_settings() -> PoolSettings {
 }
 
 #[tokio::test]
+async fn shutdown_waits_for_a_cancelled_factory_pool_connection() {
+    use maptile_core::{
+        cache::ContentVersion,
+        control::{DiscoveredDataset, Inventory, SourceCatalog},
+        error::MaptileError,
+    };
+    use std::{sync::Arc, time::Duration};
+    use tokio::{io::AsyncReadExt, net::TcpListener, time};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let dsn = format!("host=127.0.0.1 port={port} user=catalog dbname=catalog sslmode=disable");
+    let catalog = Arc::new(SourceCatalog::default());
+    let opening = tokio::spawn({
+        let catalog = catalog.clone();
+        async move {
+            let items = [DiscoveredDataset {
+                id: "roads".into(),
+                dataset: "roads".into(),
+                revision: ContentVersion::from_input(b"v1"),
+            }];
+            catalog
+                .reconcile(0, "postgres", Inventory::Complete(&items), |_| async {
+                    PostgresPool::connect(&dsn, default_settings()).await?;
+                    Err(MaptileError::Config(
+                        "fixture must stop during startup".into(),
+                    ))
+                })
+                .await
+        }
+    });
+
+    let deadline = time::Instant::now() + Duration::from_secs(5);
+    let (mut socket, _) = time::timeout_at(deadline, listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut startup = [0_u8; 8];
+    time::timeout_at(deadline, socket.read_exact(&mut startup))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&startup[4..], &196608_u32.to_be_bytes()); // PostgreSQL protocol 3.0
+    opening.abort();
+    assert!(opening.await.unwrap_err().is_cancelled());
+
+    let mut shutdown = Box::pin(catalog.shutdown(deadline));
+    let during_handshake = futures_util::poll!(shutdown.as_mut());
+    drop(socket);
+    assert!(
+        during_handshake.is_pending(),
+        "shutdown returned {during_handshake:?} during PostgreSQL startup"
+    );
+    shutdown.await.unwrap();
+}
+
+#[tokio::test]
 async fn pool_connects_and_reports_versions() {
     let dsn = match common::postgres::pg_dsn() {
         Some(d) => d,
@@ -69,9 +126,13 @@ async fn prewarmed_and_replacement_connections_keep_startup_settings() {
     let name = common::postgres::unique_schema();
     let dsn = if dsn.starts_with("postgres://") || dsn.starts_with("postgresql://") {
         let separator = if dsn.contains('?') { '&' } else { '?' };
-        format!("{dsn}{separator}options=-c%20application_name%3D{name}%20-c%20jit%3Don")
+        format!(
+            "{dsn}{separator}options=-c%20application_name%3D{name}%20-c%20jit%3Don%20-c%20work_mem%3D11MB%20-c%20statement_timeout%3D250ms"
+        )
     } else {
-        format!("{dsn} options='-c application_name={name} -c jit=on'")
+        format!(
+            "{dsn} options='-c application_name={name} -c jit=on -c work_mem=11MB -c statement_timeout=250ms'"
+        )
     };
     let pool = PostgresPool::connect(
         &dsn,
@@ -82,6 +143,11 @@ async fn prewarmed_and_replacement_connections_keep_startup_settings() {
     )
     .await
     .unwrap();
+    assert_eq!(pool.connection_status().size, 4);
+    assert_eq!(
+        pool.batch_slots_available(),
+        Some(default_settings().batch_concurrency)
+    );
     let first = pool.get().await.unwrap();
     let count: i64 = first
         .query_one(
@@ -115,23 +181,36 @@ async fn prewarmed_and_replacement_connections_keep_startup_settings() {
     for conn in &held {
         let row = conn
             .query_one(
-                "SELECT current_setting('jit'),current_setting('application_name')",
+                "SELECT current_setting('jit'), current_setting('application_name'),
+                        current_setting('work_mem'), current_setting('statement_timeout')",
                 &[],
             )
             .await
             .unwrap();
         assert_eq!(row.get::<_, String>(0), "off");
         assert_eq!(row.get::<_, String>(1), name);
+        assert_eq!(row.get::<_, String>(2), "11MB");
+        assert_eq!(row.get::<_, String>(3), "250ms");
     }
     drop(deadpool_postgres::Object::take(held.pop().unwrap()));
     let replacement = pool.get().await.unwrap();
+    let row = replacement
+        .query_one(
+            "SELECT current_setting('jit'), current_setting('work_mem'), current_setting('statement_timeout')",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, &str>(0), "off");
+    assert_eq!(row.get::<_, &str>(1), "11MB");
+    assert_eq!(row.get::<_, &str>(2), "250ms");
+    let error = replacement
+        .query_one("SELECT pg_sleep(1)", &[])
+        .await
+        .unwrap_err();
     assert_eq!(
-        replacement
-            .query_one("SHOW jit", &[])
-            .await
-            .unwrap()
-            .get::<_, String>(0),
-        "off"
+        error.code(),
+        Some(&tokio_postgres::error::SqlState::QUERY_CANCELED)
     );
 }
 

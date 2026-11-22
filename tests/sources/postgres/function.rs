@@ -168,7 +168,7 @@ async fn supports_url_query_reflects_signature() {
 }
 
 #[tokio::test]
-async fn same_id_replacement_caches_the_new_function_generation() {
+async fn function_edits_and_same_id_replacement_are_visible() {
     use maptile_core::{cache::TileCache, sources::manager::SourceManager};
 
     let Some(dsn) = common::postgres::pg_dsn() else {
@@ -207,6 +207,27 @@ async fn same_id_replacement_caches_the_new_function_generation() {
     let coord = TileCoord { z: 0, x: 0, y: 0 };
     manager.register(old.clone());
     let before = manager.get_tile("same", coord, None).await.unwrap().data;
+    pool.get()
+        .await
+        .unwrap()
+        .batch_execute(&format!(
+            r#"
+        CREATE OR REPLACE FUNCTION "{}".basic(z integer, x integer, y integer)
+        RETURNS bytea LANGUAGE sql AS $$ SELECT ''::bytea $$;
+    "#,
+            guard.name
+        ))
+        .await
+        .unwrap();
+    assert!(
+        manager
+            .get_tile("same", coord, None)
+            .await
+            .unwrap()
+            .data
+            .is_empty()
+    );
+
     cfg.function = "jsonb_tiles".into();
     let new = Arc::new(PostgresFunctionSource::open(pool, cfg).await.unwrap());
     assert_ne!(old.content_version(), new.content_version());
@@ -492,6 +513,14 @@ async fn tile_etag_round_trip() {
 
 #[tokio::test]
 async fn batch_keeps_null_empty_order_and_resumes_its_byte_prefix() {
+    use maptile_core::{
+        cache::TileCache,
+        control::CatalogService,
+        error::MaptileError,
+        service::{ReadTarget, TileOutcome, TileStack},
+        transport::MAX_DECODED_TILE_BYTES,
+    };
+
     let Some(dsn) = common::postgres::pg_dsn() else {
         return;
     };
@@ -499,28 +528,31 @@ async fn batch_keeps_null_empty_order_and_resumes_its_byte_prefix() {
     let pool = make_pool(&dsn).await;
     pool.get().await.unwrap().batch_execute(&format!(r#"
       CREATE FUNCTION "{s}".batch_tiles(z integer,x integer,y integer) RETURNS bytea LANGUAGE sql AS $$
-      SELECT CASE WHEN x=0 THEN NULL::bytea WHEN x=1 THEN ''::bytea ELSE
+      SELECT CASE WHEN x=0 THEN NULL::bytea WHEN x=1 THEN ''::bytea
+        WHEN x=3 AND y=1 THEN repeat('x', {MAX_DECODED_TILE_BYTES} + 1)::bytea ELSE
         (SELECT ST_AsMVT(tile,'points',4096,'geom','id') FROM (
           SELECT ST_AsMVTGeom(ST_Centroid(ST_TileEnvelope(z,x,y)),ST_TileEnvelope(z,x,y),4096,64,true) AS geom,
           (x*10+y)::bigint AS id,repeat('x',5*1024*1024) AS payload
         ) AS tile) END
       $$;
     "#,s=guard.name)).await.unwrap();
-    let source = PostgresFunctionSource::open(
-        pool,
-        PostgresFunctionConfig {
-            id: "batch-function".into(),
-            schema: guard.name.clone(),
-            function: "batch_tiles".into(),
-            description: None,
-            minzoom: None,
-            maxzoom: None,
-            bounds: None,
-            cache_zoom: None,
-        },
-    )
-    .await
-    .unwrap();
+    let source = Arc::new(
+        PostgresFunctionSource::open(
+            pool,
+            PostgresFunctionConfig {
+                id: "batch-function".into(),
+                schema: guard.name.clone(),
+                function: "batch_tiles".into(),
+                description: None,
+                minzoom: None,
+                maxzoom: None,
+                bounds: None,
+                cache_zoom: None,
+            },
+        )
+        .await
+        .unwrap(),
+    );
     let coords = [
         TileCoord { z: 2, x: 2, y: 0 },
         TileCoord { z: 2, x: 0, y: 0 },
@@ -552,6 +584,51 @@ async fn batch_keeps_null_empty_order_and_resumes_its_byte_prefix() {
             .await
             .is_err()
     );
+
+    let oversized = TileCoord { z: 2, x: 3, y: 1 };
+    for error in [
+        source.get_tile(oversized, None).await.unwrap_err(),
+        source
+            .read_tile_batch(&[oversized], None)
+            .await
+            .unwrap_err(),
+    ] {
+        assert!(matches!(
+            error,
+            MaptileError::PayloadTooLarge {
+                limit: MAX_DECODED_TILE_BYTES
+            }
+        ));
+    }
+
+    let engine = Arc::new(CatalogService::new(TileCache::new(4, None, None).unwrap()));
+    let mut update = engine.catalog().update();
+    update.put(source).unwrap();
+    engine.catalog().publish(update).unwrap();
+    let stack = TileStack::builder(engine).build();
+    let target = ReadTarget::new("batch-function", "public");
+    let page = stack.read_batch(target, &coords).await.unwrap();
+    assert_eq!(page.consumed, 4);
+    assert!(
+        page.tiles[0]
+            .tile()
+            .is_some_and(|tile| !tile.data.is_empty())
+    );
+    assert!(matches!(page.tiles[1], TileOutcome::NoTile));
+    assert!(
+        page.tiles[2]
+            .tile()
+            .is_some_and(|tile| tile.data.is_empty())
+    );
+    assert!(
+        page.tiles[3]
+            .tile()
+            .is_some_and(|tile| !tile.data.is_empty())
+    );
+    assert!(matches!(
+        stack.begin_export(target),
+        Err(MaptileError::Unsupported(_))
+    ));
 }
 
 #[tokio::test]
@@ -583,6 +660,133 @@ async fn invalid_requests_are_rejected_before_function_sql() {
         .await
         .unwrap();
         common::postgres::assert_invalid_tile_requests(&source, None).await;
+    }
+}
+
+#[tokio::test]
+async fn catalog_revocation_waits_for_cancelled_postgres_statements() {
+    use maptile_core::{
+        cache::TileCache,
+        control::CatalogService,
+        error::MaptileError,
+        service::{ReadTarget, TileStack},
+    };
+    use std::time::Duration;
+    use tokio::time::{Instant, timeout};
+
+    let Some(dsn) = common::postgres::pg_dsn() else {
+        return;
+    };
+    let guard = common::postgres::SchemaGuard::create(&dsn).await;
+    let pool = make_pool(&dsn).await;
+    let monitor = pool.get().await.unwrap();
+    monitor
+        .batch_execute(&format!(
+            r#"
+        CREATE FUNCTION "{}".hold_for_revocation(z integer, x integer, y integer)
+        RETURNS bytea LANGUAGE plpgsql AS $$
+        BEGIN
+            IF x = 0 THEN
+                BEGIN PERFORM pg_sleep(30);
+                EXCEPTION WHEN query_canceled THEN PERFORM pg_sleep(1); END;
+            END IF;
+            RETURN ''::bytea;
+        END $$;
+    "#,
+            guard.name
+        ))
+        .await
+        .unwrap();
+    let catalog = Arc::new(CatalogService::new(TileCache::new(4, None, None).unwrap()));
+    let stack = TileStack::builder(Arc::clone(&catalog)).build();
+    for (id, batch) in [("single", false), ("batch", true)] {
+        let config = PostgresFunctionConfig {
+            id: id.into(),
+            schema: guard.name.clone(),
+            function: "hold_for_revocation".into(),
+            description: None,
+            minzoom: None,
+            maxzoom: None,
+            bounds: None,
+            cache_zoom: None,
+        };
+        let source = PostgresFunctionSource::open(pool.clone(), config.clone())
+            .await
+            .unwrap();
+        let live = PostgresFunctionSource::open(
+            pool.clone(),
+            PostgresFunctionConfig {
+                id: "unrelated".into(),
+                ..config
+            },
+        )
+        .await
+        .unwrap();
+        let mut update = catalog.catalog().update();
+        update.put(Arc::new(source)).unwrap();
+        update.put(Arc::new(live)).unwrap();
+        catalog.catalog().publish(update).unwrap();
+        let observed = catalog.catalog().snapshot();
+
+        let job = tokio::spawn({
+            let stack = stack.clone();
+            async move {
+                let coord = TileCoord { z: 1, x: 0, y: 0 };
+                let target = ReadTarget::new(id, "public");
+                if batch {
+                    stack.read_batch(target, &[coord]).await.map(|_| ())
+                } else {
+                    stack.read(target.at(coord)).await.map(|_| ())
+                }
+            }
+        });
+        let pid: i32 = timeout(Duration::from_secs(3), async {
+            loop {
+                let active = monitor
+                    .query_opt(
+                        "SELECT pid FROM pg_stat_activity
+                     WHERE wait_event = 'PgSleep' AND position($1 in query) > 0",
+                        &[&guard.name],
+                    )
+                    .await
+                    .unwrap();
+                if let Some(row) = active {
+                    break row.get(0);
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let short = catalog
+            .catalog()
+            .revoke(&observed, id, Instant::now() + Duration::from_millis(100))
+            .await;
+        assert!(matches!(short, Err(MaptileError::Deadline)));
+        assert!(matches!(job.await.unwrap(), Err(MaptileError::Cancelled)));
+        let unrelated = ReadTarget::new("unrelated", "public").at(TileCoord { z: 1, x: 1, y: 0 });
+        assert!(
+            timeout(Duration::from_secs(1), stack.read(unrelated))
+                .await
+                .unwrap()
+                .is_ok()
+        );
+
+        catalog
+            .catalog()
+            .revoke(&observed, id, Instant::now() + Duration::from_secs(3))
+            .await
+            .unwrap();
+        let remains_active: bool = monitor
+            .query_one(
+                "SELECT EXISTS (SELECT FROM pg_stat_activity WHERE pid = $1 AND state = 'active')",
+                &[&pid],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert!(!remains_active);
     }
 }
 

@@ -1,7 +1,8 @@
 //! PostgreSQL connection pool with PostGIS version probing and optional rustls TLS.
 
 use deadpool_postgres::{
-    Manager, ManagerConfig, Object, Pool, QueueMode, RecyclingMethod, Runtime, Timeouts,
+    Manager, ManagerConfig, Object, Pool, PoolError, QueueMode, RecyclingMethod, Runtime, Status,
+    TimeoutType, Timeouts,
 };
 use futures_util::{StreamExt, future::join_all};
 use semver::Version;
@@ -13,11 +14,14 @@ use tokio_postgres::config::SslMode;
 use tokio_postgres::{CancelToken, Client, Config, NoTls};
 
 use crate::cache::ContentVersion;
+use crate::control::{CatalogBuildLease, SourceReadLease};
 use crate::error::{MaptileError, MaptileResult};
+use crate::transport::{CATALOG_BUILD_LEASE, SOURCE_READ_LEASE};
 
 use super::{MINIMUM_POSTGIS_VERSION, MINIMUM_POSTGRES_VERSION, ST_TILE_ENVELOPE_MARGIN_VERSION};
 
-/// Pool tunables. Defaults aim at small server workloads — tweak per deployment.
+/// Pool tunables. Sessions default to 4 MiB `work_mem` and 30 s
+/// `statement_timeout`. Override either through the DSN's `options`.
 #[derive(Clone, Debug)]
 pub struct PoolSettings {
     pub max_size: usize,
@@ -57,20 +61,39 @@ pub struct PostgresPool {
 
 impl PostgresPool {
     pub async fn connect(dsn: &str, settings: PoolSettings) -> MaptileResult<Self> {
+        if !(1..=Semaphore::MAX_PERMITS).contains(&settings.max_size) {
+            return Err(MaptileError::Config(
+                "PostgreSQL max_size must be a valid positive pool size".into(),
+            ));
+        }
         if !(1..=Semaphore::MAX_PERMITS).contains(&settings.batch_concurrency) {
             return Err(MaptileError::Config(format!(
                 "batch_concurrency must be between 1 and {}",
                 Semaphore::MAX_PERMITS
             )));
         }
+        if [
+            settings.wait_timeout_ms,
+            settings.create_timeout_ms,
+            settings.recycle_timeout_ms,
+        ]
+        .contains(&0)
+        {
+            return Err(MaptileError::Config(
+                "PostgreSQL pool timeouts must be positive".into(),
+            ));
+        }
         let mut pg_config =
             Config::from_str(dsn).map_err(|e| MaptileError::Config(format!("invalid DSN: {e}")))?;
-        // JIT compilation costs more than it saves for short tile queries, including on replacement connections.
+        // Startup options apply to every connection. DSN settings can tune the resource defaults.
         pg_config.options(format!(
-            "{} -c jit=off",
+            "-c work_mem=4MB -c statement_timeout=30s {} -c jit=off",
             pg_config.get_options().unwrap_or_default()
         ));
+        crate::transport::finish_discovery_open(Self::connect_pool(pg_config, settings)).await
+    }
 
+    async fn connect_pool(pg_config: Config, settings: PoolSettings) -> MaptileResult<Self> {
         let tls_config = match pg_config.get_ssl_mode() {
             SslMode::Disable => None,
             _ => Some(build_rustls_config()?),
@@ -129,10 +152,27 @@ impl PostgresPool {
     }
 
     pub async fn get(&self) -> MaptileResult<Object> {
-        self.pool.get().await.map_err(MaptileError::backend)
+        self.pool.get().await.map_err(|error| match error {
+            PoolError::Timeout(TimeoutType::Wait) => MaptileError::CapacityExhausted,
+            error => MaptileError::backend(error),
+        })
     }
 
-    pub(crate) async fn get_batch(self: &Arc<Self>) -> MaptileResult<BatchConnection> {
+    /// Current PostgreSQL connection pool occupancy.
+    pub fn connection_status(&self) -> Status {
+        self.pool.status()
+    }
+
+    /// Available batch slots. `None` means backend completion could not be confirmed and admission closed.
+    pub fn batch_slots_available(&self) -> Option<usize> {
+        (!self.batch_admission.is_closed()).then(|| self.batch_admission.available_permits())
+    }
+
+    pub(super) async fn get_query(self: &Arc<Self>) -> MaptileResult<QueryConnection> {
+        self.query_connection(None).await
+    }
+
+    pub(super) async fn get_batch(self: &Arc<Self>) -> MaptileResult<QueryConnection> {
         let permit = Arc::clone(&self.batch_admission)
             .acquire_owned()
             .await
@@ -141,17 +181,28 @@ impl PostgresPool {
                     "archive SQL admission closed after unconfirmed backend completion; verify PostgreSQL before recreating this pool".into(),
                 )
             })?;
-        Ok(BatchConnection {
-            connection: Some(self.get().await?),
+        self.query_connection(Some(permit)).await
+    }
+
+    async fn query_connection(
+        self: &Arc<Self>,
+        permit: Option<OwnedSemaphorePermit>,
+    ) -> MaptileResult<QueryConnection> {
+        Ok(QueryConnection {
             pool: Arc::clone(self),
-            permit: Some(BatchPermit {
-                permit,
-                ready: false,
+            pending: Some(QueryResources {
+                connection: Some(self.get().await?),
+                batch: permit.map(|permit| BatchPermit {
+                    permit,
+                    ready: false,
+                }),
+                lease: SOURCE_READ_LEASE.try_with(Arc::clone).ok(),
+                build: CATALOG_BUILD_LEASE.try_with(Arc::clone).ok(),
             }),
         })
     }
 
-    pub(crate) async fn cancel_query(&self, token: CancelToken) -> MaptileResult<()> {
+    async fn cancel_query(&self, token: CancelToken) -> MaptileResult<()> {
         match &self.tls_config {
             None => token.cancel_query(NoTls).await,
             Some(config) => {
@@ -178,57 +229,119 @@ impl PostgresPool {
     }
 }
 
-pub(crate) struct BatchConnection {
-    connection: Option<Object>,
-    pool: Arc<PostgresPool>,
-    permit: Option<BatchPermit>,
+pub(super) fn validate_source_window(
+    minzoom: Option<u8>,
+    maxzoom: Option<u8>,
+    bounds: Option<[f64; 4]>,
+) -> MaptileResult<()> {
+    let minzoom = minzoom.unwrap_or(0);
+    let maxzoom = maxzoom.unwrap_or(crate::sources::tile_math::MAX_ZOOM);
+    if minzoom > maxzoom || maxzoom > crate::sources::tile_math::MAX_ZOOM {
+        return Err(MaptileError::Config(
+            "invalid PostgreSQL source zoom range".into(),
+        ));
+    }
+    if bounds.is_some_and(|bounds| !bounds.into_iter().all(f64::is_finite)) {
+        return Err(MaptileError::Config(
+            "PostgreSQL bounds must be finite".into(),
+        ));
+    }
+    Ok(())
 }
-impl BatchConnection {
-    pub(crate) fn connection(&self) -> &Object {
-        self.connection.as_ref().expect("batch connection is held")
+
+pub(super) struct QueryConnection {
+    pool: Arc<PostgresPool>,
+    pending: Option<QueryResources>,
+}
+impl QueryConnection {
+    pub(super) fn connection(&self) -> &Object {
+        self.pending
+            .as_ref()
+            .expect("query is in progress")
+            .connection()
     }
 
-    pub(crate) async fn finish(mut self) -> MaptileResult<()> {
-        wait_for_ready(self.connection())
-            .await
-            .map_err(MaptileError::backend)?;
-        drop(self.connection.take());
-        self.permit.take().expect("batch permit is held").release();
+    pub(super) async fn finish(mut self) -> MaptileResult<()> {
+        let pending = self.pending.as_ref().expect("query is in progress");
+        if pending.batch.is_some() || pending.build.is_some() {
+            wait_for_ready(pending.connection())
+                .await
+                .map_err(MaptileError::backend)?;
+        }
+        self.pending.take().unwrap().release(false);
         Ok(())
     }
 }
-impl Drop for BatchConnection {
+impl Drop for QueryConnection {
     fn drop(&mut self) {
-        let Some(connection) = self.connection.take() else {
+        let Some(pending) = self.pending.take() else {
             return;
         };
-        // A delayed cancel must never hit a later query on a reused backend.
-        let connection = Object::take(connection);
-        let permit = self.permit.take().expect("batch permit is held");
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
         let pool = Arc::clone(&self.pool);
         runtime.spawn(async move {
-            // Cleanup retains its slot and stays within this pool's batch budget.
-            let drain = wait_for_ready(&connection);
-            tokio::pin!(drain);
-            let result = tokio::select! {
-                result = &mut drain => result,
-                result = tokio::time::timeout(
-                    Duration::from_secs(5), pool.cancel_query(connection.cancel_token())
-                ) => {
-                    if !matches!(result, Ok(Ok(()))) {
-                        tracing::warn!("archive batch cancellation failed; waiting for backend completion");
+            let result = {
+                let connection = pending.connection();
+                let drain = wait_for_ready(connection);
+                tokio::pin!(drain);
+                tokio::select! {
+                    result = &mut drain => result,
+                    result = tokio::time::timeout(
+                        Duration::from_secs(5), pool.cancel_query(connection.cancel_token())
+                    ) => {
+                        if !matches!(result, Ok(Ok(()))) {
+                            tracing::warn!("PostgreSQL cancellation failed; waiting for backend completion");
+                        }
+                        drain.await
                     }
-                    drain.await
                 }
             };
             if result.is_ok() {
-                permit.release();
+                pending.release(true);
             }
-            // Failure or task/runtime interruption closes admission through BatchPermit::drop.
         });
+    }
+}
+
+struct QueryResources {
+    connection: Option<Object>,
+    batch: Option<BatchPermit>,
+    lease: Option<Arc<SourceReadLease>>,
+    build: Option<Arc<CatalogBuildLease>>,
+}
+
+impl QueryResources {
+    fn connection(&self) -> &Object {
+        self.connection.as_ref().expect("query connection is held")
+    }
+
+    fn release(mut self, interrupted: bool) {
+        let connection = self.connection.take().expect("query connection is held");
+        if interrupted {
+            // A delayed cancel must never reach a later query on this backend.
+            drop(Object::take(connection));
+        } else {
+            drop(connection);
+        }
+        if let Some(batch) = self.batch.take() {
+            batch.release();
+        }
+    }
+}
+
+impl Drop for QueryResources {
+    fn drop(&mut self) {
+        if let Some(connection) = self.connection.take() {
+            drop(Object::take(connection));
+            if let Some(lease) = &self.lease {
+                lease.mark_unconfirmed();
+            }
+            if let Some(build) = &self.build {
+                build.mark_unconfirmed();
+            }
+        }
     }
 }
 
@@ -369,6 +482,55 @@ mod tests {
     use semver::Version;
     use std::sync::Arc;
     use tokio::sync::Semaphore;
+
+    #[tokio::test]
+    async fn invalid_pool_sizes_and_timeouts_are_rejected_before_connecting() {
+        for (settings, expected) in [
+            (
+                PoolSettings {
+                    max_size: 0,
+                    ..Default::default()
+                },
+                "max_size",
+            ),
+            (
+                PoolSettings {
+                    max_size: Semaphore::MAX_PERMITS + 1,
+                    ..Default::default()
+                },
+                "max_size",
+            ),
+            (
+                PoolSettings {
+                    wait_timeout_ms: 0,
+                    ..Default::default()
+                },
+                "timeouts",
+            ),
+            (
+                PoolSettings {
+                    create_timeout_ms: 0,
+                    ..Default::default()
+                },
+                "timeouts",
+            ),
+            (
+                PoolSettings {
+                    recycle_timeout_ms: 0,
+                    ..Default::default()
+                },
+                "timeouts",
+            ),
+        ] {
+            let error = PostgresPool::connect("invalid dsn", settings)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                crate::error::MaptileError::Config(message) if message.contains(expected)
+            ));
+        }
+    }
 
     #[tokio::test]
     async fn invalid_batch_concurrency_is_rejected_before_connecting() {

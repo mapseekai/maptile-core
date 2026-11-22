@@ -1,20 +1,20 @@
 # 数据源与查询
 
-`maptile-core` 通过 [`TileSource`](../src/sources/mod.rs) 统一瓦片读取与元数据访问。应用打开具体数据源，将其注册到 [`SourceManager`](../src/sources/manager.rs)，再按源 ID 和 XYZ 坐标请求瓦片。本文说明归档、数据库、过滤和组合源的接入方式。
+`maptile-core` 通过 [`TileStack`](../src/service.rs) 读取已发布目录中的数据源。应用打开具体源，发布到 [`CatalogService`](../src/control.rs)，再按源 ID 和 XYZ 坐标请求瓦片。已有 `TileSource` 实现可直接加入目录；应用也可实现 `TileDriver`。
 
 ## 按数据形态选择入口
 
 | 数据 | 入口 | Feature | 准备条件 |
 | --- | --- | --- | --- |
-| 本地 PMTiles v3 | `LocalPmtilesSource::open` | 默认 | 可读取的归档路径 |
-| HTTP(S) PMTiles v3 | `HttpPmtilesSource::open` | 默认 | 提供 Range 和 206 响应的文件地址 |
-| 对象存储 PMTiles | `CloudPmtilesSource::open_with_store` | `cloud` | 应用注入 `ObjectStore` 客户端 |
-| 本地 MBTiles | `MbtilesSource::open` | 默认 | 可读取的 SQLite 归档 |
-| PostGIS 表 | `PostgresTableSource::open` | 默认 | PostgreSQL 连接池、空间表与几何列 |
-| PostgreSQL 瓦片函数 | `PostgresFunctionSource::open` | 默认 | 返回 MVT `bytea` 的 SQL 函数 |
+| 本地 PMTiles v3 | `LocalPmtilesSource::open` | `pmtiles` | 可读取的归档路径 |
+| HTTP(S) PMTiles v3 | `HttpPmtilesSource::open` | `pmtiles` | 提供 Range 和 206 响应的文件地址 |
+| 对象存储 PMTiles | `CloudPmtilesSource::open_with_store` | `pmtiles,cloud` | 应用注入 `ObjectStore` 客户端 |
+| 本地 MBTiles | `MbtilesSource::open` | `mbtiles` | 可读取的 SQLite 归档 |
+| PostGIS 表 | `PostgresTableSource::open` | `postgres` | PostgreSQL 连接池、空间表与几何列 |
+| PostgreSQL 瓦片函数 | `PostgresFunctionSource::open` | `postgres` | 返回 MVT `bytea` 的 SQL 函数 |
 | GeoParquet / FlatGeobuf | `GeoParquetSource` / `FlatGeobufSource` | `geoparquet` / `local-vector` | [矢量文件指南](geoparquet.md)中的扩展与数据配置 |
-| DuckDB 查询 | `DuckDbSource::open` | `duckdb` | DuckDB 文件或连接配置、单条 SQL 模板 |
-| COG / STAC / 栅格镶嵌 | `AsyncCogSource` / `StacSource` / `MosaicSource` | `agtiff` / `stac` / `raster` | [栅格接入](rendering.md)中的样式和读取环境 |
+| 预编码 Parquet 瓦片 | `ParquetArchiveSource::open` | `parquet-archive` | 包含坐标和瓦片字节的本地归档 |
+| COG / STAC / 栅格镶嵌 | `AsyncCogSource` / `StacSource` / `MosaicSource` | `agtiff` / `stac` / `agtiff` | [栅格接入](rendering.md)中的样式和读取环境 |
 
 各源的构造参数见对应 Rustdoc。Feature 的依赖关系见[功能开关](features.md)。
 
@@ -29,7 +29,7 @@ use maptile_core::prelude::*;
 use maptile_core::sources::mbtiles::{MbtilesConfig, MbtilesSource};
 use std::sync::Arc;
 
-async fn register_mbtiles(manager: &SourceManager) -> MaptileResult<()> {
+async fn register_mbtiles(catalog: &CatalogService) -> MaptileResult<()> {
     let source = MbtilesSource::open(MbtilesConfig {
         id: "basemap".into(),
         path: "data/basemap.mbtiles".into(),
@@ -37,7 +37,9 @@ async fn register_mbtiles(manager: &SourceManager) -> MaptileResult<()> {
         description: Some("基础地图".into()),
     })
     .await?;
-    manager.register(Arc::new(source));
+    let mut update = catalog.catalog().update();
+    update.put(Arc::new(source))?;
+    catalog.catalog().publish(update)?;
     Ok(())
 }
 ```
@@ -65,7 +67,7 @@ use maptile_core::sources::postgres::{
 };
 use std::{collections::HashSet, sync::Arc};
 
-async fn open_roads(dsn: &str) -> MaptileResult<SourceManager> {
+async fn open_roads(dsn: &str) -> MaptileResult<Arc<CatalogService>> {
     let pool = Arc::new(PostgresPool::connect(dsn, PoolSettings::default()).await?);
     let mut config = PostgresTableConfig::new("roads", "public", "roads");
     config.geometry_column = Some("geom".into());
@@ -80,21 +82,25 @@ async fn open_roads(dsn: &str) -> MaptileResult<SourceManager> {
         .await?
         .with_allowed_columns(Arc::new(allowed));
 
-    let manager = SourceManager::new();
-    manager.register(Arc::new(source));
-    Ok(manager)
+    let catalog = Arc::new(CatalogService::new(TileCache::new(64, None, None)?));
+    let mut update = catalog.catalog().update();
+    update.put(Arc::new(source))?;
+    catalog.catalog().publish(update)?;
+    Ok(catalog)
 }
 ```
 
-`properties` 选择输出属性，`with_allowed_columns` 指定 CQL2 可以引用的字段。两者分别控制输出内容与查询条件。几何列、ID 列和属性配置应对应实际表结构，空间索引用于支撑范围查询。普通、批量和过滤读取都由 SQL 判断空间相交，保留 MVT buffer（64/4096）内的边界要素；普通与批量读取仍保留由数据范围推导的 minzoom 短路。
+`properties` 选择输出属性，`with_allowed_columns` 指定 CQL2 可以引用的字段。空间索引支持带 buffer 的范围查询。表源默认使用 4096 的正数 extent，默认 minzoom 从数据范围推导，也可通过配置覆盖。单取、过滤和批量读取都遵循有效 minzoom。
+
+表源调用 `with_edit_revision(Some(...))` 后可按配置的 zoom 范围缓存。数据发布方需在行数据改变时更新修订并重新发布。无修订的表、函数和 OutDB 直接读取数据库，包含这些源的组合也绕过规范缓存。会话默认 `work_mem=4MB` 和 `statement_timeout=30s`，可通过连接串的 `options` 调整。
 
 ### 属性与空间范围查询
 
 [`filter`](../src/filter.rs)接收 CQL2 文本或 JSON，支持比较、`AND`、`OR`、`NOT`、`IN`、`LIKE` 和空值判断。PostGIS 表源依据已配置的字段白名单验证条件。空间范围通过 `TileQuery.bbox` 单独传入，坐标顺序为 WGS84 的 `[west, south, east, north]`。
 
-PostgreSQL 表源、函数源、OutDB 源及独立 DuckDB 源在单张和批量入口检查 `z <= 30`、`x,y < 2^z`，以及 typed `bbox` 的四个值均为有限数；非法输入返回 `MaptileError::InvalidRequest`，不会执行 SQL。合法坐标处于源自身 zoom 范围外时仍沿用原来的空瓦片或 `TileNotFound` 行为。
+PostgreSQL 表源、函数源及 OutDB 源在单张和批量入口检查 `z <= 30`、`x,y < 2^z`，以及 typed `bbox` 的四个值均为有限数；非法输入返回 `MaptileError::InvalidRequest`，不会执行 SQL。合法坐标处于源自身 zoom 范围外时仍沿用原来的空瓦片或 `TileNotFound` 行为。
 
-`bbox` 保持现有合约，不新增经纬度范围或端点顺序限制。表源使用 `geom && ST_MakeEnvelope(w,s,e,n,4326)` 的平面包围盒语义；例如 `[170,-10,-170,10]` 仍表示两端点之间的范围，不会自动拆成日期线两侧。函数源将有限的 bbox 按原顺序作为逗号分隔字符串交给四参数函数。DuckDB 和 OutDB 当前不使用 `TileQuery.bbox` 筛选数据；入口校验不改变这一能力边界。
+`bbox` 保持现有合约，不新增经纬度范围或端点顺序限制。表源使用 `geom && ST_MakeEnvelope(w,s,e,n,4326)` 的平面包围盒语义；例如 `[170,-10,-170,10]` 仍表示两端点之间的范围，不会自动拆成日期线两侧。函数源将有限的 bbox 按原顺序作为逗号分隔字符串交给四参数函数。OutDB 当前不使用 `TileQuery.bbox` 筛选数据；`TileStack` 对不支持 bbox 的源拒绝该请求。
 
 在上面的 `roads` 源注册完成后，可以按道路类别读取瓦片：
 
@@ -102,16 +108,16 @@ PostgreSQL 表源、函数源、OutDB 源及独立 DuckDB 源在单张和批量�
 use maptile_core::filter::parse_cql2;
 use maptile_core::prelude::*;
 
-async fn read_primary_roads(manager: &SourceManager) -> MaptileResult<TileResponse> {
+async fn read_primary_roads(stack: &TileStack) -> MaptileResult<TileOutcome> {
     let filter = parse_cql2("class = 'primary'")?;
     let query = TileQuery {
         filter: Some(&filter),
         bbox: Some([115.4, 39.4, 117.6, 41.1]),
         ..TileQuery::default()
     };
-    manager
-        .get_tile("roads", TileCoord { z: 10, x: 843, y: 388 }, Some(&query))
-        .await
+    let mut target = ReadTarget::new("roads", "public");
+    target.query = Some(&query);
+    stack.read(target.at(TileCoord { z: 10, x: 843, y: 388 })).await
 }
 ```
 
@@ -156,7 +162,7 @@ TLS 使用显式 ring provider，无需宿主安装全局 rustls provider，也�
 
 `batch_concurrency` 必须为正数且不超过 Tokio 信号量上限。克隆 `PostgresPool` 会共享同一额度；分别 `connect` 得到的池具有独立额度。在线 `get_tile` 不占批量额度，但与批量查询共享连接池。如果 SQL 取消后无法确认后端已经结束，该池停止接受新批量任务；核实数据库残留任务后再重建池。应用还可在启动时通过 `transport::configure_blocking_concurrency` 配置本 crate 的共享阻塞任务额度，见[并发额度](architecture.md#并发额度)。
 
-Postgres 表源和函数源不持有瓦片结果缓存。原先的源级 `with_cache`，以及函数源的 `set_cache` / `cache` 接口已移除；将缓存配置迁移到 `SourceManager::with_cache`，并通过管理器读取。`cache_zoom` 继续控制管理器缓存的层级，直接调用源会重新查询数据库。
+Postgres 表源和函数源不持有瓦片结果缓存。通过 `CatalogService` 配置缓存并使用 `TileStack` 读取；`cache_zoom` 控制缓存层级。直接调用源会重新查询数据库。旧 `SourceManager::with_cache` 仍可用于兼容调用方。
 
 ```rust
 use maptile_core::sources::postgres::PoolSettings;
@@ -174,35 +180,46 @@ let settings = PoolSettings {
 
 `MosaicSource` 用固定的 `MosaicMember` 列表生成栅格瓦片。每个 `bbox_wgs84` 都是该成员自己的 WGS84 `[west, south, east, north]` 范围，与配置的 `srid` 无关；`MosaicSourceConfig::bounds` 和 `srid` 只控制对外公布的合并范围，不覆盖成员范围。请求先将合法瓦片范围转换为 WGS84，按正面积相交筛选成员并保留原顺序，再由上游应用默认每瓦片 64 个候选的限制；只有边界相接的成员不计入候选。WebMercatorQuad 和 WorldCrs84Quad 的首列西界、末列东界分别采用精确的 -180° 和 +180°，避免世界外缘成员被浮点舍入误排；内列边界仍使用 TMS 计算值。正面积相交不保证输出有有效像素；极窄影像仍受上游投影、读取和栅格采样精度限制。
 
-显式 `bounds` 的四个分量必须有限且南纬不大于北纬，否则打开源时返回 `MaptileError::Config`。未指定或非正数 `srid` 沿用 WGS84，纬度必须在 `[-90, 90]` 内，包含两极和等边点范围。正数非 4326 的 SRID 先按原有 GDAL 路径投影，再检查 WGS84 输出域，不把投影坐标当作纬度。展开经度仍可输入，例如 `190..200` 对外公布为 `-170..-160`；跨日期线或覆盖整圈时，单个 TileJSON bbox 用 `[-180, 180]` 包住两侧。这样 bounds 符合 [TileJSON 3.0 的坐标域](https://github.com/mapbox/tilejson-spec/blob/master/3.0.0/README.md#35-bounds)，center 位于公布的范围内。`MosaicSource` 本身仅在 `raster` feature 下导出，`stac` 单独启用不开放此 API。
+显式 `bounds` 的四个分量必须有限且南纬不大于北纬，否则打开源时返回 `MaptileError::Config`。未指定或非正数 `srid` 沿用 WGS84，纬度必须在 `[-90, 90]` 内，包含两极和等边点范围。正数非 4326 的 SRID 先通过 PROJ 投影，再检查 WGS84 输出域，不把投影坐标当作纬度。展开经度仍可输入，例如 `190..200` 对外公布为 `-170..-160`；跨日期线或覆盖整圈时，单个 TileJSON bbox 用 `[-180, 180]` 包住两侧。这样 bounds 符合 [TileJSON 3.0 的坐标域](https://github.com/mapbox/tilejson-spec/blob/master/3.0.0/README.md#35-bounds)，center 位于公布的范围内。`MosaicSource` 由 `agtiff` feature 提供。
 
 跨日期线可以用 `west > east` 表示，也可提供递增的未折回经度，例如 `175..185`。成员范围未知时可用 `[0; 4]`；非有限、倒置纬度、越出纬度范围或退化 bbox 都保守地作为所有瓦片的候选，并计入上限。因此 65 个未知范围仍可能超限，应尽量提供准确的成员范围。接近 360° 的跨度如果在折回时舍入为同一经度，会保守覆盖整条纬度带，避免漏选成员。未显式配置合并范围时，未知成员会扩大 TileJSON 范围到世界，跨日期线成员会使单个 TileJSON bbox 覆盖两侧。
 
 全局统计仍使用完整、有序的成员集，不能用单瓦片候选替代。锁定的 async-geotiff 0.13.0 在统计发现阶段也应用默认 64 个资产的限制，超过 64 个成员的全局统计拉伸仍不受支持；需要统计的样式还会读取远处成员，远处坏文件可能使统计失败。普通固定样式下，65 个成员中只有 1 个相交的场景已由真实投影 TIFF 回归覆盖。
 
-内容版本包含成员身份和归一化范围，修改范围后重新打开并注册会分开瓦片缓存。成员内容本身变化时，应用仍需更新其 `source_id`/内容身份。配置与真实样式示例见[栅格渲染](rendering.md#stac固定镶嵌与-outdb)及 [`mosaic_source.rs`](../src/sources/mosaic_source.rs)。
+需要跨页一致导出时，通过 `MosaicSource::open_immutable` 打开，调用方须保证每个成员都是不可变版本，且重叠成员次序固定。普通 `open` 提供按请求的瓦片读取。内容版本包含成员身份和归一化范围，修改范围后重新打开并注册会分开瓦片缓存。成员内容本身变化时，应用仍需更新其 `source_id`/内容身份。配置与真实样式示例见[栅格渲染](rendering.md#stac固定镶嵌与-outdb)及 [`mosaic_source.rs`](../src/sources/mosaic_source.rs)。
 
 ## FlatGeobuf 文件版本
 
-FlatGeobuf 在 Unix 上将完整 FileStamp（含设备号、inode、ctime、长度和 mtime）纳入内容版本，同长度、同 mtime 的不同 inode 替换文件重新打开后也获得不同版本。其他平台每次打开分配新代次，克隆共享版本。更新文件后仍须重新打开和注册；热缓存命中不会自动执行文件变化检查。查询与关闭流程见[矢量文件指南](geoparquet.md#直接读取-flatgeobuf)。
+FlatGeobuf 在 Unix 上将完整 FileStamp（含设备号、inode、ctime、长度和 mtime）纳入内容版本，同长度、同 mtime 的不同 inode 替换文件重新打开后也获得不同版本。Windows 的读取检查和内容版本包括卷、文件 ID 和变更时间。其余平台每次打开分配新代次，克隆共享版本。更新文件后仍须重新打开和注册；热缓存命中不会自动执行文件变化检查。查询与关闭流程见[矢量文件指南](geoparquet.md#读取本地几何数据)。
 
 ## 组合多个 MVT 源
 
-`CompositeSource` 合并多个 MVT 源的图层。已有源注册后，可以通过管理器创建组合源：
+通过目录更新发布 `CompositeDeclaration`。各成员须为 MVT、保证合规且完整声明图层名；未知图层集合的源不能加入严格组合。发布时检查缺失成员、循环、重复叶子和深度限制。成员顺序固定在目录快照中。
 
 ```rust
 use maptile_core::prelude::*;
 
-fn register_city_layers(manager: &SourceManager) -> MaptileResult<()> {
-    manager.register_composite_from_ids("city", &["roads", "buildings"])
+fn register_city_layers(catalog: &CatalogService) -> MaptileResult<()> {
+    let mut update = catalog.catalog().update();
+    update.composite(CompositeDeclaration {
+        id: "city".into(),
+        members: vec!["roads".into(), "buildings".into()],
+        lazy: false,
+        duplicate_layer: DuplicateLayer::Error,
+        failure_policy: MemberFailurePolicy::FailFast,
+    })?;
+    catalog.catalog().publish(update)?;
+    Ok(())
 }
 ```
 
-这里的 `roads` 和 `buildings` 应预先注册并输出 MVT。查询 `city` 时，组合源按成员配置读取并合并瓦片；`CompositeChild` 可配置图层名前缀。需要在读取时按 ID 解析当前成员的应用，可使用 `LazyCompositeSource`。实现见 [`composite`](../src/sources/composite.rs) 和 [`lazy_composite`](../src/sources/lazy_composite.rs)。
+普通未信任的外部归档可独立读取，不能仅凭一张抽样瓦片推定其所有坐标合规。归档生产端能保证所有坐标的 MVT 合规并完整声明层名时，应用可通过 `put_trusted_mvt` 明确声明该信任契约；其余来源维持普通 `put`。
 
-`LazyCompositeSource` 跳过缺失成员；全部成员缺失时，单瓦片读取返回 `TileNotFound`，批量读取保留对应的空瓦片。没有可用成员且存在加载失败记录时返回 `SourceUnavailable`。成员格式错误或管理器已销毁等错误会继续向调用方传播，批量导出也不会将它们当作成功的空结果。
+默认 `DuplicateLayer::Error` 拒绝重复图层。`KeepFirst` 和 `KeepLast` 按每张瓦片实际出现的同名层裁决。由 0.3 迁移且依赖后层覆盖时可选择 `KeepLast`。严格组合不做运行时 `layer_prefix` 改写；需先调整生产端图层名与样式引用。
 
-普通、ETag 和批量读取都会检查组合源的实例解析路径：间接循环或超过 64 层的惰性组合返回 `Config`，避免递归耗尽栈。检查发生在读取时，因此成员晚注册或替换形成的环同样会被拒绝。合法嵌套以及多个分支共享一个子组仍可使用；静态组合保留的旧实例与同 ID 新实例不会被误判为循环。直接自引用仍按原约定跳过。
+`lazy: true` 允许目录发布时缺少成员，但保留完整声明参与环检查。全部成员缺失时组合不可用。默认 `FailFast` 遇到故障返回错误；`SkipTransient` 可跳过暂时不可用的成员并返回 `Partial`。全部成员故障仍返回错误。无效输入、能力不支持、取消及超限不降级。部分结果不进入规范缓存，HTTP 层必须使用 `no-store` 且不生成强 ETag。
+
+组合成员共享请求并发、压缩输入、解码和工作内存预算。过滤等条件必须得到所有成员支持。按逗号分隔 ID 的临时组合在当前快照内编译，不写入全局目录。可用 `CompositeLimits` 配置预算。
 
 ## 格式与压缩编码
 
@@ -210,37 +227,12 @@ fn register_city_layers(manager: &SourceManager) -> MaptileResult<()> {
 
 [`transport`](../src/transport.rs)提供显式 gzip、zlib、brotli、zstd 编解码，以及异步包装。启用 `mlt` 后，[`transcode`](../src/transcode/mod.rs)提供 MVT 与 MLT 转换。`transcode_with_gzip` 可自动识别 gzip、zstd、zlib；Brotli 载荷先通过已知编码调用 `transport::decode`，再传入转码器。
 
-独立 DuckDB 源可通过单条 SQL 模板返回预编码 BLOB，或配置 WGS84 WKB 几何列生成 MVT。其连接等待和执行共享 10 秒期限，配置与模板语法见 [`duckdb.rs`](../src/sources/duckdb.rs)。GeoParquet 的查询预算单独通过 `query_options` 配置。
+DuckDB 几何切片与预编码 Parquet 归档的边界和预算见 [GeoParquet 指南](geoparquet.md)。
 
 ## 数据更新与关闭
 
-应用更新数据时，按以下顺序维护数据源与缓存的一致性：
+1. 准备具有明确版本身份的新文件、对象或数据库修订号。
+2. 打开并校验新源，通过 `catalog.update()` 和 `put` 准备变更，再调用 `publish` 一次发布。
+3. 等待持有旧快照的请求和导出会话结束，再回收旧文件。紧急撤销时使用 `revoke` 并等待排空。
 
-1. 准备具有明确版本身份的新数据，例如带版本的文件路径、对象存储 URI 或数据库修订号。
-2. 打开并检查新源，使用目标数据源 ID 调用 `register`。管理器会将后续查询切换到新对象，并对旧对象发起 `start_close`。
-3. 对相同内容版本内的业务更新，按应用策略调用 `TileCache::invalidate_source`；PostGIS 表源也可通过 `with_edit_revision` 将业务修订号加入内容身份。
-4. 下线一个源时，调用 `close_source(id).await`，完成移除、缓存失效和资源关闭等待。
-
-目录扫描与 `reload_from_discovery` 用于同步新增和删除的源 ID。更新已有 ID 的文件时，使用重新打开和注册流程。缓存键、内容版本和显式关闭的关系见[架构与生命周期](architecture.md)。
-
-异步故障回调应携带实际使用的源引用，调用 `manager.mark_unavailable_if_current(&source)`；按 ID 的 `mark_unavailable` 用于管理操作。请求触发恢复时，直接调用 `recover_unavailable`，由管理器检查退避、协调工厂并校验结果身份：
-
-```rust,no_run
-use maptile_core::prelude::*;
-use maptile_core::sources::mbtiles::{MbtilesConfig, MbtilesSource};
-use std::sync::Arc;
-
-async fn recover_basemap(manager: &SourceManager) -> MaptileResult<Arc<dyn TileSource>> {
-    manager.recover_unavailable("basemap", || async {
-        let source = MbtilesSource::open(MbtilesConfig {
-            id: "basemap".into(),
-            path: "data/basemap.mbtiles".into(),
-            serve_as: None,
-            description: None,
-        }).await?;
-        Ok(Arc::new(source) as Arc<dyn TileSource>)
-    }).await
-}
-```
-
-退避期间或同一注册项已有恢复任务时返回 `SourceUnavailable`，未获准的调用不执行工厂。若源已经就绪，直接返回当前引用；若已删除，返回 `SourceNotFound`。不要把 `unavailable_retry_due` 的观察结果当成独占恢复资格。
+`reconcile` 可根据完整或部分发现清单更新绑定。完整清单会下线本命名空间中不再出现的源，并保留其数据集绑定，部分清单不会删除；失败清单保留旧目录。具体语义见[目录发布与生命周期](architecture.md#目录发布与生命周期)。

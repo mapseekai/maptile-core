@@ -23,7 +23,7 @@ use crate::sources::composite::{CompositeChild, CompositeSource};
 use crate::sources::manager::SourceManager;
 use crate::sources::{
     TileCoord, TileEncoding, TileEtagResponse, TileFormat, TileInfo, TileQuery, TileResponse,
-    TileSource, validate_tile_batch,
+    TileSource,
 };
 
 tokio::task_local! {
@@ -147,6 +147,17 @@ impl TileSource for LazyCompositeSource {
         })
     }
 
+    // The resolved composite validates every member in the pinned read.
+    fn supports_filter(&self) -> bool {
+        true
+    }
+    fn supports_bbox(&self) -> bool {
+        true
+    }
+    fn supports_url_query(&self) -> bool {
+        true
+    }
+
     fn cache_zoom(&self) -> crate::cache::CacheZoomRange {
         // Member registrations may change between key construction, rendering,
         // and ETag calculation. Preserve one snapshot per request instead of
@@ -159,6 +170,7 @@ impl TileSource for LazyCompositeSource {
         xyz: TileCoord,
         query: Option<&TileQuery<'_>>,
     ) -> MaptileResult<TileResponse> {
+        super::tile_math::validate_tile_request(&[xyz], query)?;
         self.guard_cycle(async {
             let (manager, composite) = snapshot(&self.id, &self.member_ids, &self.manager)?
                 .ok_or(MaptileError::TileNotFound(xyz.z, xyz.x, xyz.y))?;
@@ -176,7 +188,7 @@ impl TileSource for LazyCompositeSource {
         coords: &[TileCoord],
         query: Option<&TileQuery<'_>>,
     ) -> MaptileResult<Vec<TileResponse>> {
-        validate_tile_batch(coords)?;
+        super::tile_math::validate_tile_request(coords, query)?;
         if coords.is_empty() {
             return Ok(Vec::new());
         }
@@ -203,6 +215,7 @@ impl TileSource for LazyCompositeSource {
         query: Option<&TileQuery<'_>>,
         if_none_match: Option<&str>,
     ) -> MaptileResult<TileEtagResponse> {
+        super::tile_math::validate_tile_request(&[xyz], query)?;
         self.guard_cycle(async {
             let (manager, composite) = snapshot(&self.id, &self.member_ids, &self.manager)?
                 .ok_or(MaptileError::TileNotFound(xyz.z, xyz.x, xyz.y))?;
@@ -565,13 +578,13 @@ mod tests {
         let xyz = TileCoord { z: 0, x: 0, y: 0 };
         assert!(matches!(
             manager.get_tile("group", xyz, Some(&query)).await,
-            Err(MaptileError::InvalidRequest(_))
+            Err(MaptileError::Unsupported(_))
         ));
         assert!(matches!(
             manager
                 .get_tile_with_etag("group", xyz, Some(&query), None)
                 .await,
-            Err(MaptileError::InvalidRequest(_))
+            Err(MaptileError::Unsupported(_))
         ));
     }
 

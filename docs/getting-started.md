@@ -1,6 +1,6 @@
 # 读取第一张瓦片
 
-本教程通过仓库自带的 PMTiles 合成样例，验证 `LocalPmtilesSource`、`SourceManager` 和 `TileCache` 的接入流程。完成后，你可以用同样的 API 读取自己的瓦片归档。
+本教程通过仓库自带的 PMTiles 合成样例，验证 `LocalPmtilesSource`、`CatalogService` 和 `TileStack` 的接入流程。完成后，你可以用同样的 API 读取自己的瓦片归档。
 
 实现与完整代码见 [`examples/read_pmtiles.rs`](../examples/read_pmtiles.rs)，数据说明见[测试样例](../tests/fixtures/README.md)。
 
@@ -21,13 +21,13 @@ rustup show active-toolchain
 在仓库根目录运行：
 
 ```sh
-cargo run --locked --example read_pmtiles
+cargo run --locked --features pmtiles --example read_pmtiles
 ```
 
 程序读取 `tests/fixtures/sample.pmtiles` 的 `z=0、x=0、y=0`，预期输出：
 
 ```text
-sample 0/0/0: 14 bytes
+sample 0/0/0: 14 bytes (Mvt, Uncompressed)
 ```
 
 这 14 字节是合成载荷 `test-tile-data`，用于验证归档读取和组件连接。示例使用 `CARGO_MANIFEST_DIR` 定位文件，因此路径由仓库位置确定。
@@ -36,13 +36,13 @@ sample 0/0/0: 14 bytes
 
 示例依次完成以下操作：
 
-1. 用 `TileCache::new(64, Some(Duration::from_secs(3600)), None)?` 创建共享缓存。容量参数按 MiB 换算，第二个参数配置存活时间，第三个参数配置空闲过期时间。
-2. 用 `SourceManager::new().with_cache(cache)` 创建带缓存的数据源管理器。
-3. 用 `LocalPmtilesSource::open(config).await?` 打开归档，并将源注册到管理器。
-4. 用 `get_tile("sample", TileCoord { z: 0, x: 0, y: 0 }, None)` 读取瓦片。
-5. 用 `close_source("sample").await?` 移除数据源、失效其缓存并等待源自身的关闭操作。
+1. 用 `TileCache::new` 和 `CatalogService::new` 创建带缓存的目录服务。
+2. 用 `LocalPmtilesSource::open(config).await?` 打开归档。
+3. 用 `update.put` 和 `catalog.publish` 原子发布目录。
+4. 用 `TileStack::builder(catalog).build()` 构建默认栈。
+5. 用 `stack.read(ReadTarget::new("sample", "cli").at(coord)).await` 读取瓦片。
 
-缓存处理与关闭语义详见[架构与生命周期](architecture.md)。
+`scope` 用于隔离规范缓存。应用先鉴权，再根据实际可见范围设定 scope。目录快照和关闭语义详见[架构与生命周期](architecture.md)。
 
 ## 4. 接入自己的 PMTiles
 
@@ -50,7 +50,7 @@ sample 0/0/0: 14 bytes
 
 ```toml
 [dependencies]
-maptile-core = { git = "https://github.com/mapseekai/maptile-core.git" }
+maptile-core = { git = "https://github.com/mapseekai/maptile-core.git", features = ["pmtiles"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -58,11 +58,11 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 `PmtilesConfig.id` 是应用内的数据源标识，后续查询和替换操作使用同一个 ID。`serve_as: None` 使用归档声明的格式；格式转换可通过[数据源与查询](sources.md#格式与压缩编码)中介绍的转码入口完成。
 
-注册前可通过 `source.tilejson()` 查看边界、层级和图层信息；注册后可调用 `manager.get(id)` 取得源，或用 `snapshot_tilejson()` 获取目录快照。`TileSource` trait 由 `prelude` 导出。
+注册前可通过 `source.tilejson()` 查看元数据；发布后可用 `catalog.catalog().snapshot().describe(id)` 查看同一代目录中的描述符。内部 TileJSON 不含对外瓦片地址。
 
 ## 5. 处理瓦片结果
 
-`get_tile` 返回 [`TileResponse`](../src/sources/mod.rs)，其字段说明如下：
+`stack.read` 返回 `TileOutcome`。`NoTile` 表示没有瓦片，`Present` 包含完整的 `TileResponse`，`Partial` 表示组合源降级，可带瓦片或没有瓦片。`TileResponse` 的字段如下：
 
 | 字段 | 内容 | 使用方式 |
 | --- | --- | --- |
@@ -81,11 +81,19 @@ fn decoded_bytes(tile: &TileResponse) -> MaptileResult<Bytes> {
 }
 ```
 
-应用需要 ETag 验证时，可使用 `manager.get_tile_with_etag(...)`，并将 `TileEtagResponse::Fresh` 或 `NotModified` 映射为相应的应用响应。具体签名见 [`SourceManager`](../src/sources/manager.rs)。
+HTTP 应用在选择最终格式和编码后计算强 ETag，并处理 `If-None-Match`。`Partial` 不应生成强 ETag，必须下发 `Cache-Control: no-store`。[HTTP 示例](../examples/archive_http.rs)演示了协商、条件请求、TileJSON 和 WMTS。
+
+在仓库根目录启动示例，再访问 `http://127.0.0.1:3000/tilejson.json` 或 `/wmts.xml`：
+
+```sh
+cargo run --locked --features pmtiles --example archive_http -- http://127.0.0.1:3000
+```
+
+参数是应用配置的可信公开 origin，不能从客户端的 `Host` 请求头推导。进程只监听 `127.0.0.1:3000`，使用与 CLI 相同的目录和归档。也可以在 origin 后传入其他 PMTiles 路径。示例不包含鉴权，并使用 512 像素的 WMTS 矩阵；发布真实服务前须匹配数据和访问策略。
 
 ## 后续任务
 
 - 接入 MBTiles、PostGIS、CQL2 或组合图层：阅读[数据源与查询](sources.md)。
-- 从 GeoParquet、FlatGeobuf、GeoJSON 或 Shapefile 生成 MVT：阅读[GeoParquet 与本地矢量](geoparquet.md)。
+- 从 GeoParquet 或 FlatGeobuf 生成 MVT：阅读[GeoParquet 与本地矢量](geoparquet.md)。
 - 生成静态地图和栅格图片：阅读[样式与渲染](rendering.md)。
 - 选择依赖组合并运行检查：阅读[功能开关](features.md)和[开发与构建](development.md)。

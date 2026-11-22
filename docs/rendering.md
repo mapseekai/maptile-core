@@ -177,10 +177,10 @@ bash scripts/ci/maptile-render-cargo.sh run --locked --features render --example
 | 入口 | 影像组织方式 | 接入要点 |
 | --- | --- | --- |
 | `StacSource` | 按瓦片范围搜索 STAC Item，并通过 async-geotiff 镶嵌 COG 资产 | 配置 API、集合、时间条件和资产角色；用 `list_assets_for_tile` 查看候选资产 |
-| `MosaicSource` | 应用提供固定的 `MosaicMember` 列表，使用 async-geotiff 镶嵌 | 配置成员边界、内容标识、存储客户端和共享块缓存；显式边界的 CRS 转换使用 GDAL |
+| `MosaicSource` | 应用提供固定的 `MosaicMember` 列表，使用 async-geotiff 镶嵌 | 配置成员边界、内容标识、存储客户端和共享块缓存；显式边界的 CRS 转换使用 PROJ |
 | `PostgresOutDbRasterSource` | 从 PostgreSQL 查询外部栅格路径，使用 GDAL 读取与渲染 | 配置连接池、查询函数及栅格文件访问环境 |
 
-`stac` 包含 `agtiff`；固定镶嵌和 OutDB 通过 `raster` 启用。STAC 和固定镶嵌提供 `first`、`highest`、`lowest`、`mean`、`median` 像元组合方式，应用可通过 `TileQuery.pixel_selection` 选择请求使用的方式。
+`stac` 包含 `agtiff`；固定镶嵌通过 `agtiff` 启用。OutDB 同时需要 `postgres` 和 `raster`。STAC 和固定镶嵌提供 `first`、`highest`、`lowest`、`mean`、`median` 像元组合方式，应用可通过 `TileQuery.pixel_selection` 选择请求使用的方式。
 
 固定镶嵌先按成员 WGS84 范围筛选每瓦片候选，但全局统计仍使用全部成员，并继续受上游默认 64 个资产的统计发现限制。跨日期线、未知范围和缓存版本规则见[成员范围说明](sources.md#固定栅格镶嵌与成员范围)。
 

@@ -4,7 +4,7 @@
 
 /// Bump to invalidate every cache entry across the system. Embedded into
 /// every hash input below and every cold-cache object metadata header.
-pub const CACHE_SCHEMA_VERSION: u16 = 3;
+pub const CACHE_SCHEMA_VERSION: u16 = 4;
 
 /// Full 256-bit canonical style identity.
 #[derive(Copy, Clone, Eq, PartialEq, Hash)]

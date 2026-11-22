@@ -153,12 +153,26 @@ async fn batch_coordinates_are_not_shadowed_by_source_identifiers() {
                 .unwrap();
         }
         let mut config = cfg_for(&guard.name, table);
-        config.properties = Some(vec!["name".into()]);
+        let property = if table == "tile" {
+            pool.get()
+                .await
+                .unwrap()
+                .batch_execute(&format!(
+                    "ALTER TABLE \"{}\".\"{table}\" RENAME COLUMN name TO tile",
+                    guard.name
+                ))
+                .await
+                .unwrap();
+            "tile"
+        } else {
+            "name"
+        };
+        config.properties = Some(vec![property.into()]);
         config.id_column = Some("id".into());
         let source = PostgresTableSource::open(pool, config)
             .await
             .unwrap()
-            .with_allowed_columns(Arc::new(std::collections::HashSet::from(["name".into()])));
+            .with_allowed_columns(Arc::new(std::collections::HashSet::from([property.into()])));
         let coords = [
             TileCoord {
                 z: 8,
@@ -176,7 +190,7 @@ async fn batch_coordinates_are_not_shadowed_by_source_identifiers() {
                 y: 127,
             },
         ];
-        let filter = parse_cql2("name = 'a'").unwrap();
+        let filter = parse_cql2(&format!("{property} = 'a'")).unwrap();
         let query = TileQuery {
             filter: Some(&filter),
             ..TileQuery::default()
@@ -199,7 +213,7 @@ async fn batch_coordinates_are_not_shadowed_by_source_identifiers() {
             }
             let decoded = mvt::decode(&actual[0].data).unwrap();
             assert_eq!(decoded.layers[0].name, table);
-            assert_eq!(decoded.layers[0].keys, ["name"]);
+            assert_eq!(decoded.layers[0].keys, [property]);
             assert!(
                 decoded.layers[0]
                     .features
@@ -326,10 +340,12 @@ async fn batch_preserves_projected_properties_feature_ids_and_filter_validation(
     let filtered = source.read_tile_batch(&coords, Some(&query)).await.unwrap();
     for (coord, tile) in coords.into_iter().zip(filtered) {
         let single = source.get_tile(coord, Some(&query)).await.unwrap();
-        assert_eq!(
-            tile.data,
-            maptile_core::transport::decode(&single.data, single.info.encoding).unwrap()
-        );
+        assert_eq!(tile.data, single.data);
+        assert_eq!(tile.info, single.info);
+        if coord.z == 0 {
+            assert!(tile.data.is_empty());
+            continue;
+        }
         assert_ne!(tile.data, unfiltered[0].data);
         let decoded = mvt::decode(&tile.data).unwrap();
         assert_eq!(decoded.layers[0].keys, ["name"]);
@@ -342,6 +358,113 @@ async fn batch_preserves_projected_properties_feature_ids_and_filter_validation(
         ..TileQuery::default()
     };
     assert!(source.read_tile_batch(&coords, Some(&query)).await.is_err());
+}
+
+#[tokio::test]
+async fn extent_and_explicit_minzoom_apply_to_single_and_batch_sql() {
+    use maptile_core::{
+        error::MaptileError,
+        filter::parse_cql2,
+        sources::{TileQuery, mvt},
+    };
+
+    let Some(dsn) = common::postgres::pg_dsn() else {
+        return;
+    };
+    let guard = common::postgres::SchemaGuard::create(&dsn).await;
+    create_simple_table(&dsn, &guard.name, "extent").await;
+    let pool = make_pool(&dsn).await;
+    let mut config = cfg_for(&guard.name, "extent");
+    config.extent = 0;
+    assert!(matches!(
+        PostgresTableSource::open(pool.clone(), config.clone()).await,
+        Err(MaptileError::Config(_))
+    ));
+    config.extent = 1024;
+    config.minzoom = Some(1);
+    let source = PostgresTableSource::open(pool, config)
+        .await
+        .unwrap()
+        .with_allowed_columns(Arc::new(["name".into()].into_iter().collect()));
+    assert_eq!(source.tilejson().minzoom, Some(1));
+    assert!(source.table_info().derived_min_zoom.unwrap() > 1);
+    let filter = parse_cql2("name = 'b'").unwrap();
+    let query = TileQuery {
+        filter: Some(&filter),
+        bbox: Some([-1.0, -1.0, 2.0, 2.0]),
+        ..Default::default()
+    };
+    let coords = [
+        TileCoord { z: 0, x: 0, y: 0 },
+        TileCoord { z: 1, x: 1, y: 0 },
+    ];
+    let batch = source.read_tile_batch(&coords, Some(&query)).await.unwrap();
+    for (coord, batched) in coords.into_iter().zip(batch.iter()) {
+        let single = source.get_tile(coord, Some(&query)).await.unwrap();
+        assert_eq!(single.data, batched.data);
+        assert_eq!(single.info, batched.info);
+    }
+    assert!(batch[0].data.is_empty());
+    let rendered = mvt::decode(&batch[1].data).unwrap();
+    assert_eq!(rendered.layers[0].extent, Some(1024));
+    assert_eq!(rendered.layers[0].features.len(), 1);
+}
+
+#[tokio::test]
+async fn large_postgis_tiles_report_output_and_candidate_limits() {
+    use maptile_core::{error::MaptileError, transport::MAX_DECODED_TILE_BYTES};
+
+    let Some(dsn) = common::postgres::pg_dsn() else {
+        return;
+    };
+    let guard = common::postgres::SchemaGuard::create(&dsn).await;
+    create_simple_table(&dsn, &guard.name, "limited").await;
+    let pool = make_pool(&dsn).await;
+    let table = format!("\"{}\".limited", guard.name);
+    let conn = pool.get().await.unwrap();
+    conn.batch_execute(&format!(
+        "UPDATE {table} SET name = repeat('x', 17 * 1024 * 1024) WHERE id = 1"
+    ))
+    .await
+    .unwrap();
+    let mut config = cfg_for(&guard.name, "limited");
+    config.minzoom = Some(0);
+    let source = PostgresTableSource::open(pool, config).await.unwrap();
+    let coord = TileCoord { z: 0, x: 0, y: 0 };
+    for error in [
+        source.get_tile(coord, None).await.unwrap_err(),
+        source.read_tile_batch(&[coord], None).await.unwrap_err(),
+    ] {
+        assert!(matches!(
+            error,
+            MaptileError::PayloadTooLarge {
+                limit: MAX_DECODED_TILE_BYTES
+            }
+        ));
+    }
+    conn.batch_execute(&format!(
+        "UPDATE {table} SET name = repeat('x', 65 * 1024 * 1024) WHERE id = 1"
+    ))
+    .await
+    .unwrap();
+    assert!(matches!(
+        source.get_tile(coord, None).await,
+        Err(MaptileError::Resource(_))
+    ));
+    conn.batch_execute(&format!(
+        "UPDATE {table} SET name = 'x';
+         INSERT INTO {table} (name, geom)
+         SELECT 'x', ST_SetSRID(ST_MakePoint(1, 1), 4326)
+         FROM generate_series(1, 100000)"
+    ))
+    .await
+    .unwrap();
+    for error in [
+        source.get_tile(coord, None).await.unwrap_err(),
+        source.read_tile_batch(&[coord], None).await.unwrap_err(),
+    ] {
+        assert!(matches!(error, MaptileError::Resource(_)));
+    }
 }
 
 #[tokio::test]
@@ -582,6 +705,104 @@ async fn point_table_keeps_its_exact_degenerate_extent() {
 }
 
 #[tokio::test]
+async fn shutdown_waits_for_cancelled_table_discovery_sql() {
+    use maptile_core::{
+        cache::{ContentVersion, TileCache},
+        control::{CatalogService, DiscoveredDataset, Inventory, TileDriver},
+        error::MaptileError,
+    };
+    use tokio::time::{Duration, Instant, timeout};
+
+    let Some(dsn) = common::postgres::pg_dsn() else {
+        return;
+    };
+    let schema = common::postgres::SchemaGuard::create(&dsn).await;
+    create_simple_table(&dsn, &schema.name, "input").await;
+    let pool = make_pool(&dsn).await;
+    let monitor = pool.get().await.unwrap();
+    monitor
+        .batch_execute(&format!(
+            r#"
+            CREATE FUNCTION "{s}".hold_bounds(value geometry) RETURNS geometry LANGUAGE plpgsql AS $$
+            BEGIN
+                BEGIN PERFORM pg_sleep(30);
+                EXCEPTION WHEN query_canceled THEN PERFORM pg_sleep(1); END;
+                RETURN value;
+            END $$;
+            CREATE VIEW "{s}".discovery AS
+                SELECT "{s}".hold_bounds(geom)::geometry(Point,4326) AS geom
+                FROM "{s}".input LIMIT 1;
+            "#,
+            s = schema.name,
+        ))
+        .await
+        .unwrap();
+    let config = cfg_for(&schema.name, "discovery");
+    let service = Arc::new(CatalogService::new(TileCache::new(4, None, None).unwrap()));
+    let reconcile = tokio::spawn({
+        let service = service.clone();
+        async move {
+            let inventory = [DiscoveredDataset {
+                id: config.id.clone().into(),
+                dataset: "postgis:discovery".into(),
+                revision: ContentVersion::from_input(b"test"),
+            }];
+            service
+                .catalog()
+                .reconcile(0, "postgis", Inventory::Complete(&inventory), |_| {
+                    let (pool, config) = (pool.clone(), config.clone());
+                    async move {
+                        Ok(Arc::new(PostgresTableSource::open(pool, config).await?)
+                            as Arc<dyn TileDriver>)
+                    }
+                })
+                .await
+        }
+    });
+    let pid: i32 = timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(row) = monitor
+                .query_opt(
+                    "SELECT pid FROM pg_stat_activity
+                     WHERE wait_event = 'PgSleep' AND position($1 in query) > 0",
+                    &[&schema.name],
+                )
+                .await
+                .unwrap()
+            {
+                break row.get(0);
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("PostGIS bounds discovery SQL must reach the fixture");
+    reconcile.abort();
+    assert!(reconcile.await.unwrap_err().is_cancelled());
+    assert!(matches!(
+        service
+            .catalog()
+            .shutdown(Instant::now() + Duration::from_millis(100))
+            .await,
+        Err(MaptileError::Deadline),
+    ));
+    service
+        .catalog()
+        .shutdown(Instant::now() + Duration::from_secs(3))
+        .await
+        .unwrap();
+    let active: bool = monitor
+        .query_one(
+            "SELECT EXISTS (SELECT FROM pg_stat_activity WHERE pid = $1 AND state = 'active')",
+            &[&pid],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(!active);
+}
+
+#[tokio::test]
 async fn opening_source_leaves_busy_connections_to_tile_queries() {
     let Some(dsn) = common::postgres::pg_dsn() else {
         return;
@@ -751,6 +972,64 @@ async fn edited_revision_bypasses_old_tiles_and_rediscovers_fields() {
     manager.register(Arc::new(fresh));
     let after = manager.get_tile(&id, coord, None).await.unwrap();
     assert_ne!(before.data, after.data);
+}
+
+#[tokio::test]
+async fn versionless_table_reads_committed_edits_without_republishing() {
+    use maptile_core::{
+        cache::{CacheZoomRange, TileCache},
+        control::CatalogService,
+        service::{ReadTarget, TileStack},
+    };
+
+    let Some(dsn) = common::postgres::pg_dsn() else {
+        return;
+    };
+    let guard = common::postgres::SchemaGuard::create(&dsn).await;
+    create_simple_table(&dsn, &guard.name, "live").await;
+    let pool = make_pool(&dsn).await;
+    let mut config = cfg_for(&guard.name, "live");
+    config.cache_zoom = Some(CacheZoomRange::default());
+    let source = Arc::new(
+        PostgresTableSource::open(pool.clone(), config)
+            .await
+            .unwrap(),
+    );
+    let engine = Arc::new(CatalogService::new(TileCache::new(4, None, None).unwrap()));
+    let mut update = engine.catalog().update();
+    update.put(source.clone()).unwrap();
+    engine.catalog().publish(update).unwrap();
+    let stack = TileStack::builder(engine).build();
+    let request = ReadTarget::new("t", "public").at(TileCoord {
+        z: 8,
+        x: 128,
+        y: 127,
+    });
+    let original = stack
+        .read(request)
+        .await
+        .unwrap()
+        .tile()
+        .unwrap()
+        .data
+        .clone();
+
+    pool.get()
+        .await
+        .unwrap()
+        .batch_execute(&format!(
+            "UPDATE \"{}\".live SET name = 'edited'",
+            guard.name
+        ))
+        .await
+        .unwrap();
+    let updated = stack.read(request).await.unwrap();
+    let updated = &updated.tile().unwrap().data;
+    assert_ne!(*updated, original);
+    assert_eq!(
+        *updated,
+        source.get_tile(request.coord, None).await.unwrap().data
+    );
 }
 
 #[tokio::test]
@@ -1065,7 +1344,9 @@ async fn finite_reversed_bbox_retains_postgis_envelope_semantics() {
     };
     let guard = common::postgres::SchemaGuard::create(&dsn).await;
     create_simple_table(&dsn, &guard.name, "envelope").await;
-    let source = PostgresTableSource::open(make_pool(&dsn).await, cfg_for(&guard.name, "envelope"))
+    let mut config = cfg_for(&guard.name, "envelope");
+    config.minzoom = Some(0);
+    let source = PostgresTableSource::open(make_pool(&dsn).await, config)
         .await
         .unwrap();
     let xyz = TileCoord { z: 0, x: 0, y: 0 };

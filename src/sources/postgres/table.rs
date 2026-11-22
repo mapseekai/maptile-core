@@ -22,12 +22,19 @@ use crate::cache::CacheZoomRange;
 use crate::error::{MaptileError, MaptileResult};
 use crate::sources::{
     MAX_TILE_BATCH_BYTES, TileCoord, TileEncoding, TileFormat, TileInfo, TileQuery, TileResponse,
-    TileSource,
+    TileSource, validate_source_request,
 };
-
-use crate::sources::tile_math::validate_tile_request;
+use crate::transport::MAX_DECODED_TILE_BYTES;
 
 use super::pool::PostgresPool;
+
+const DEFAULT_EXTENT: u32 = 4096;
+const BUFFER: u32 = 64;
+const MAX_ZOOM: u8 = 22;
+const MAX_TABLE_CANDIDATES: usize = 100_000;
+const MAX_TABLE_INPUT_BYTES: usize = 4 * MAX_DECODED_TILE_BYTES;
+const SINGLE_COORDS: [&str; 3] = ["$1::integer", "$2::integer", "$3::integer"];
+const BATCH_COORDS: [&str; 3] = ["batch_coords.z", "batch_coords.x", "batch_coords.y"];
 
 #[derive(Debug, Clone)]
 pub struct PostgresTableConfig {
@@ -36,11 +43,16 @@ pub struct PostgresTableConfig {
     pub table: String,
     pub description: Option<String>,
     pub bounds: Option<[f64; 4]>,
+    /// Minimum served zoom. By default the source derives it from its bounds.
+    pub minzoom: Option<u8>,
+    /// Positive MVT grid extent. Defaults to 4096.
+    pub extent: u32,
 
     pub geometry_column: Option<String>,
     pub id_column: Option<String>,
     pub properties: Option<Vec<String>>,
 
+    /// Cache policy when a durable edit revision is supplied.
     pub cache_zoom: Option<CacheZoomRange>,
 }
 
@@ -52,6 +64,8 @@ impl PostgresTableConfig {
             table: table.into(),
             description: None,
             bounds: None,
+            minzoom: None,
+            extent: DEFAULT_EXTENT,
             geometry_column: None,
             id_column: None,
             properties: None,
@@ -73,9 +87,9 @@ pub struct TableInfo {
     pub has_spatial_index: bool,
     /// Minimum zoom at which the dataset spans at least
     /// `MIN_ZOOM_PIXELS` px — derived from `bounds` at open time.
-    /// `None` when bounds are unknown. Below this zoom `get_tile`
-    /// short-circuits to an empty tile without a DB round-trip.
+    /// `None` when bounds are unknown. The source's explicit minzoom can override this.
     pub derived_min_zoom: Option<u8>,
+    pub extent: u32,
 }
 
 pub struct PostgresTableSource {
@@ -88,13 +102,8 @@ pub struct PostgresTableSource {
     /// each pooled connection prepares and reuses the statement on demand.
     inline_query: String,
     batch_query: String,
-    batch_base_select_no_where: String,
-    batch_bbox_search_expr: String,
-    /// Inner SELECT to which the filter path adds CQL2 and bounding-box
-    /// conditions before closing the subquery.
-    base_select_no_where: String,
-    /// SRID-aware bbox-search fragment, computed once at open time.
-    bbox_search_expr: String,
+    single_sql: TileSql,
+    batch_sql: TileSql,
     /// Columns that CQL2 filters may reference. Callers populate this set
     /// through [`Self::with_allowed_columns`] before sharing the source.
     allowed_columns: Arc<std::collections::HashSet<String>>,
@@ -138,25 +147,24 @@ fn table_definition_version(
 
 impl PostgresTableSource {
     pub async fn open(pool: Arc<PostgresPool>, cfg: PostgresTableConfig) -> MaptileResult<Self> {
+        super::pool::validate_source_window(cfg.minzoom, Some(MAX_ZOOM), cfg.bounds)?;
+        if !(1..=i32::MAX as u32 - 2 * BUFFER).contains(&cfg.extent) {
+            return Err(MaptileError::Config("invalid PostgreSQL MVT extent".into()));
+        }
         let info = discover_table(&pool, &cfg).await?;
         let columns = discover_property_types(&pool, &info).await?;
 
         let tj = build_tilejson_with_vector_layers(
             &cfg,
             cfg.bounds.or(info.bounds),
-            info.derived_min_zoom,
+            cfg.minzoom.or(info.derived_min_zoom),
             &columns,
         );
 
-        let inline_query = build_inline_tile_query(&info, &columns, pool.supports_tile_margin());
-        let batch_query = build_batch_tile_query(&info, &columns, pool.supports_tile_margin());
-        let batch_coords = ["batch_coords.z", "batch_coords.x", "batch_coords.y"];
-        let batch_base_select_no_where =
-            build_base_select_with_coordinates(&info, &columns, batch_coords);
-        let batch_bbox_search_expr =
-            build_bbox_search_with_coordinates(&info, pool.supports_tile_margin(), batch_coords);
-        let base_select_no_where = build_base_select_no_where(&info, &columns);
-        let bbox_search_expr = build_bbox_search(&info, pool.supports_tile_margin());
+        let single_sql = TileSql::new(&info, &columns, pool.supports_tile_margin(), SINGLE_COORDS);
+        let batch_sql = TileSql::new(&info, &columns, pool.supports_tile_margin(), BATCH_COORDS);
+        let inline_query = single_sql.build(&info, "", None);
+        let batch_query = compose_batch_sql(&batch_sql.build(&info, "batch_coords.enabled", None));
         let info_meta = TileInfo {
             format: TileFormat::Mvt,
             encoding: TileEncoding::Uncompressed,
@@ -170,59 +178,12 @@ impl PostgresTableSource {
             tj,
             inline_query,
             batch_query,
-            batch_base_select_no_where,
-            batch_bbox_search_expr,
-            base_select_no_where,
-            bbox_search_expr,
+            single_sql,
+            batch_sql,
             allowed_columns: Arc::new(std::collections::HashSet::new()),
             info_meta,
             definition_version,
             content_version: crate::cache::ContentVersion::new_generation(),
-        })
-    }
-
-    /// Validate CQL2 against the configured columns and combine the predicate
-    /// with the optional geographic bounding box. Each request prepares its
-    /// generated SQL separately, keeping variable predicates out of the
-    /// connection's fixed-statement cache.
-    ///
-    /// Filtered queries execute directly because their predicates are specific
-    /// to the request. Ordinary tile requests use the configured tile cache.
-    async fn run_filtered(
-        &self,
-        xyz: TileCoord,
-        query: Option<&TileQuery<'_>>,
-    ) -> MaptileResult<TileResponse> {
-        let filter_sql = self.filter_sql(query)?;
-        let user_bbox = query.and_then(|q| q.bbox);
-
-        let sql = compose_filtered_sql(
-            &self.base_select_no_where,
-            &self.bbox_search_expr,
-            &self.info,
-            &filter_sql,
-            user_bbox,
-        );
-
-        let conn = self.pool.get().await?;
-        let stmt = conn
-            .prepare_typed(&sql, &[Type::INT4, Type::INT4, Type::INT4])
-            .await
-            .map_err(MaptileError::backend)?;
-        let z = i32::from(xyz.z);
-        let x = xyz.x as i32;
-        let y = xyz.y as i32;
-        let row_opt = conn
-            .query_opt(&stmt, &[&z, &x, &y])
-            .await
-            .map_err(MaptileError::backend)?;
-        let bytes: Vec<u8> = row_opt
-            .and_then(|row| row.get::<_, Option<Vec<u8>>>(0))
-            .unwrap_or_default();
-        Ok(TileResponse {
-            data: Bytes::from(bytes),
-            info: self.info_meta,
-            last_modified: None,
         })
     }
 
@@ -241,45 +202,16 @@ impl PostgresTableSource {
         Ok(sql)
     }
 
-    /// Run the fixed tile query and gzip a nonempty result before caching.
-    /// The response records its encoding so the application can reuse the
-    /// encoded payload. Empty query results retain an empty byte buffer.
-    async fn fetch_and_encode(&self, xyz: TileCoord) -> MaptileResult<TileResponse> {
-        let conn = self.pool.get().await?;
-        let stmt = conn
-            .prepare_typed_cached(&self.inline_query, &[Type::INT4; 3])
-            .await
-            .map_err(MaptileError::backend)?;
-        let z = i32::from(xyz.z);
-        let x = xyz.x as i32;
-        let y = xyz.y as i32;
-        let row_opt = conn
-            .query_opt(&stmt, &[&z, &x, &y])
-            .await
-            .map_err(MaptileError::backend)?;
-
-        let bytes: Vec<u8> = row_opt
-            .and_then(|row| row.get::<_, Option<Vec<u8>>>(0))
-            .unwrap_or_default();
-
-        drop(conn);
-
-        let (data, encoding) = if bytes.is_empty() {
-            (Bytes::new(), TileEncoding::Uncompressed)
-        } else {
-            let gz =
-                crate::transport::encode_as_async(Bytes::from(bytes), TileEncoding::Gzip).await?;
-            (gz, TileEncoding::Gzip)
-        };
-
-        Ok(TileResponse {
-            data,
-            info: TileInfo {
-                format: TileFormat::Mvt,
-                encoding,
-            },
+    fn empty_tile(&self) -> TileResponse {
+        TileResponse {
+            data: Bytes::new(),
+            info: self.info_meta,
             last_modified: None,
-        })
+        }
+    }
+
+    fn zoom_enabled(&self, zoom: u8) -> bool {
+        self.tj.minzoom.is_none_or(|min| zoom >= min)
     }
 
     /// Set the columns that CQL2 attribute filters may reference.
@@ -315,8 +247,47 @@ impl PostgresTableSource {
     }
 }
 
+fn tile_response(
+    row: &tokio_postgres::Row,
+    size_column: usize,
+    info: TileInfo,
+) -> MaptileResult<TileResponse> {
+    let size: Option<i32> = row.try_get(size_column).map_err(MaptileError::backend)?;
+    let size = size.ok_or_else(|| {
+        MaptileError::Resource(
+            "PostGIS tile exceeds the candidate count or input byte limit".into(),
+        )
+    })?;
+    if size as usize > MAX_DECODED_TILE_BYTES {
+        return Err(MaptileError::PayloadTooLarge {
+            limit: MAX_DECODED_TILE_BYTES,
+        });
+    }
+    let data: Vec<u8> = row
+        .try_get(size_column + 1)
+        .map_err(MaptileError::backend)?;
+    Ok(TileResponse {
+        data: Bytes::from(data),
+        info,
+        last_modified: None,
+    })
+}
+
 #[async_trait]
 impl TileSource for PostgresTableSource {
+    fn source_kind(&self) -> crate::sources::SourceKind {
+        crate::sources::SourceKind::PostgresTable
+    }
+    fn supports_bbox(&self) -> bool {
+        true
+    }
+    fn strict_mvt(&self) -> bool {
+        true
+    }
+    fn native_batch(&self) -> bool {
+        true
+    }
+
     fn id(&self) -> &str {
         &self.cfg.id
     }
@@ -337,8 +308,12 @@ impl TileSource for PostgresTableSource {
         true
     }
 
-    fn cache_zoom(&self) -> crate::cache::CacheZoomRange {
-        self.cfg.cache_zoom.unwrap_or_default()
+    fn cache_zoom(&self) -> CacheZoomRange {
+        if self.tj.other.contains_key("mapseek_revision") {
+            self.cfg.cache_zoom.unwrap_or_default()
+        } else {
+            CacheZoomRange::disabled()
+        }
     }
 
     fn clone_source(&self) -> Box<dyn TileSource> {
@@ -349,10 +324,8 @@ impl TileSource for PostgresTableSource {
             tj: self.tj.clone(),
             inline_query: self.inline_query.clone(),
             batch_query: self.batch_query.clone(),
-            batch_base_select_no_where: self.batch_base_select_no_where.clone(),
-            batch_bbox_search_expr: self.batch_bbox_search_expr.clone(),
-            base_select_no_where: self.base_select_no_where.clone(),
-            bbox_search_expr: self.bbox_search_expr.clone(),
+            single_sql: self.single_sql.clone(),
+            batch_sql: self.batch_sql.clone(),
             allowed_columns: self.allowed_columns.clone(),
             info_meta: self.info_meta,
             definition_version: self.definition_version,
@@ -371,30 +344,32 @@ impl TileSource for PostgresTableSource {
         xyz: TileCoord,
         query: Option<&TileQuery<'_>>,
     ) -> MaptileResult<TileResponse> {
-        validate_tile_request(std::slice::from_ref(&xyz), query)?;
-        // Filter or bbox requests use request-specific SQL. Other requests
-        // use the fixed tile query. Applications translate table-source URL
-        // parameters into TileQuery.filter or TileQuery.bbox before this call.
-        let filter_present = query.and_then(|q| q.filter).is_some();
-        let bbox_present = query.and_then(|q| q.bbox).is_some();
-        if filter_present || bbox_present {
-            return self.run_filtered(xyz, query).await;
+        validate_source_request(self, &[xyz], query)?;
+        let filter = self.filter_sql(query)?;
+        if !self.zoom_enabled(xyz.z) {
+            return Ok(self.empty_tile());
         }
 
-        // Min-zoom short-circuit: below the derived minzoom the whole
-        // dataset clips to sub-pixel — skip the DB round-trip. Clients
-        // that honor `TileJSON.minzoom` never request these zooms; this
-        // covers the ones that don't.
-        if self.info.derived_min_zoom.is_some_and(|mz| xyz.z < mz) {
-            return Ok(TileResponse {
-                data: Bytes::new(),
-                info: self.info_meta,
-                last_modified: None,
-            });
+        let bbox = query.and_then(|q| q.bbox);
+        let pending = self.pool.get_query().await?;
+        let conn = pending.connection();
+        let types = [Type::INT4; 3];
+        let stmt = if filter.is_empty() && bbox.is_none() {
+            conn.prepare_typed_cached(&self.inline_query, &types).await
+        } else {
+            let sql = self.single_sql.build(&self.info, &filter, bbox);
+            conn.prepare_typed(&sql, &types).await
         }
-
-        // SQL owns spatial rejection so its MVT buffer is preserved.
-        self.fetch_and_encode(xyz).await
+        .map_err(MaptileError::backend)?;
+        let row = conn
+            .query_one(
+                &stmt,
+                &[&i32::from(xyz.z), &(xyz.x as i32), &(xyz.y as i32)],
+            )
+            .await
+            .map_err(MaptileError::backend)?;
+        pending.finish().await?;
+        tile_response(&row, 0, self.info_meta)
     }
 
     async fn read_tile_batch(
@@ -402,43 +377,27 @@ impl TileSource for PostgresTableSource {
         coords: &[TileCoord],
         query: Option<&TileQuery<'_>>,
     ) -> MaptileResult<Vec<TileResponse>> {
-        validate_tile_request(coords, query)?;
-        if coords.is_empty() {
-            return Ok(Vec::new());
+        validate_source_request(self, coords, query)?;
+        let filter = self.filter_sql(query)?;
+        let enabled: Vec<_> = coords
+            .iter()
+            .map(|coord| self.zoom_enabled(coord.z))
+            .collect();
+        if !enabled.contains(&true) {
+            return Ok(vec![self.empty_tile(); coords.len()]);
         }
-        let filtered = query.is_some_and(|q| q.filter.is_some() || q.bbox.is_some());
-        let dynamic_sql = if filtered {
-            let filter = self.filter_sql(query)?;
+        let bbox = query.and_then(|q| q.bbox);
+        let dynamic_sql = if filter.is_empty() && bbox.is_none() {
+            None
+        } else {
             let filter = if filter.is_empty() {
                 "batch_coords.enabled".into()
             } else {
                 format!("batch_coords.enabled AND ({filter})")
             };
-            let tile = compose_filtered_sql(
-                &self.batch_base_select_no_where,
-                &self.batch_bbox_search_expr,
-                &self.info,
-                &filter,
-                query.and_then(|q| q.bbox),
-            );
+            let tile = self.batch_sql.build(&self.info, &filter, bbox);
             Some(compose_batch_sql(&tile))
-        } else {
-            None
         };
-        let enabled: Vec<_> = coords
-            .iter()
-            .map(|coord| filtered || !self.info.derived_min_zoom.is_some_and(|min| coord.z < min))
-            .collect();
-        if !enabled.contains(&true) {
-            return Ok(coords
-                .iter()
-                .map(|_| TileResponse {
-                    data: Bytes::new(),
-                    info: self.info_meta,
-                    last_modified: None,
-                })
-                .collect());
-        }
         let zs: Vec<_> = coords.iter().map(|c| i32::from(c.z)).collect();
         let xs: Vec<_> = coords.iter().map(|c| c.x as i32).collect();
         let ys: Vec<_> = coords.iter().map(|c| c.y as i32).collect();
@@ -472,18 +431,9 @@ impl TileSource for PostgresTableSource {
                         "tile batch returned coordinates out of order".into(),
                     ));
                 }
-                let data: Option<Vec<u8>> = row.try_get(1).map_err(MaptileError::backend)?;
-                let data = crate::transport::decode_async(
-                    Bytes::from(data.unwrap_or_default()),
-                    TileEncoding::Uncompressed,
-                )
-                .await?;
-                bytes += data.len();
-                tiles.push(TileResponse {
-                    data,
-                    info: self.info_meta,
-                    last_modified: None,
-                });
+                let tile = tile_response(&row, 1, self.info_meta)?;
+                bytes += tile.data.len();
+                tiles.push(tile);
                 if bytes >= MAX_TILE_BATCH_BYTES {
                     break;
                 }
@@ -503,25 +453,37 @@ impl TileSource for PostgresTableSource {
 // === Discovery helpers ===
 
 async fn discover_table(
-    pool: &PostgresPool,
+    pool: &Arc<PostgresPool>,
     cfg: &PostgresTableConfig,
 ) -> MaptileResult<TableInfo> {
-    let conn = pool.get().await?;
+    let pending = pool.get_query().await?;
+    let conn = pending.connection();
 
     let geometry_column = match cfg.geometry_column.clone() {
         Some(c) => c,
-        None => find_geometry_column(&conn, &cfg.schema, &cfg.table).await?,
+        None => find_geometry_column(conn, &cfg.schema, &cfg.table).await?,
     };
 
     let (srid, geometry_type) =
-        get_geometry_info(&conn, &cfg.schema, &cfg.table, &geometry_column).await?;
+        get_geometry_info(conn, &cfg.schema, &cfg.table, &geometry_column).await?;
+    if srid <= 0 {
+        return Err(MaptileError::Config(format!(
+            "table {}.{} must declare a positive SRID",
+            cfg.schema, cfg.table,
+        )));
+    }
+    if cfg.id_column.as_ref() == Some(&geometry_column) {
+        return Err(MaptileError::Config(
+            "the PostGIS geometry and feature ID columns must differ".into(),
+        ));
+    }
 
     let properties = match cfg.properties.clone() {
         Some(p) => p,
-        None => discover_properties(&conn, &cfg.schema, &cfg.table, &geometry_column).await?,
+        None => discover_properties(conn, &cfg.schema, &cfg.table, &geometry_column).await?,
     };
 
-    let has_spatial_index = check_spatial_index(&conn, &cfg.schema, &cfg.table).await?;
+    let has_spatial_index = check_spatial_index(conn, &cfg.schema, &cfg.table).await?;
     if !has_spatial_index {
         tracing::warn!(
             "table {}.{} has no spatial index on '{}'; tile queries will be slow",
@@ -533,8 +495,9 @@ async fn discover_table(
 
     let bounds = match cfg.bounds {
         Some(b) => Some(b),
-        None => estimate_bounds(&conn, &cfg.schema, &cfg.table, &geometry_column).await,
+        None => estimate_bounds(conn, &cfg.schema, &cfg.table, &geometry_column).await,
     };
+    pending.finish().await?;
 
     Ok(TableInfo {
         schema: cfg.schema.clone(),
@@ -547,6 +510,7 @@ async fn discover_table(
         bounds,
         has_spatial_index,
         derived_min_zoom: bounds.as_ref().map(derive_min_zoom),
+        extent: cfg.extent,
     })
 }
 
@@ -571,7 +535,7 @@ fn derive_min_zoom(bounds: &[f64; 4]) -> u8 {
     if z.is_nan() {
         0
     } else {
-        z.clamp(0.0, 22.0) as u8
+        z.clamp(0.0, f64::from(MAX_ZOOM)) as u8
     }
 }
 
@@ -681,7 +645,7 @@ fn build_tilejson_with_vector_layers(
     // Publish an explicit zoom range for catalog consumers, using the
     // bounds-derived minimum when available.
     tj.minzoom = Some(min_zoom.unwrap_or(0));
-    tj.maxzoom = Some(22);
+    tj.maxzoom = Some(MAX_ZOOM);
     let fields: std::collections::BTreeMap<String, String> = columns
         .iter()
         .map(|(name, ty)| (name.clone(), pg_type_to_tilejson_field(ty).to_string()))
@@ -696,205 +660,147 @@ fn build_tilejson_with_vector_layers(
     tj
 }
 
-/// Build the inline `SELECT ST_AsMVT(...)` query used for unfiltered tile
-/// requests. Template mirrors **martin** (`martin/src/config/file/tiles/
-/// postgres/resolver/query_tables.rs`, `table_to_query`) and **tileserver-rs**
-/// (`crates/tileserver-rs/src/sources/postgres/table.rs`, `build_tile_query`)
-/// byte-for-byte where the configurable bits are constants in our build.
-///
-/// Key invariants kept identical to martin:
-/// - `ST_AsMVTGeom` bounds = **unbuffered** `ST_TileEnvelope($1,$2,$3)`;
-///   buffer is the 4th arg, not the bounds.
-/// - SRID-aware bbox_search: 4 branches for buffer=0, 3857+margin, 4326
-///   (ST_Expand to dodge the antimeridian wrap), and the generic fallback.
-/// - `id_column` is passed as the 5th `feature_id_name` arg of `ST_AsMVT`.
-///
-/// Departure from martin: no `ST_CurveToLine` wrapper. See
-/// `build_base_select_no_where` for the reasoning.
-///
-/// Constants we don't yet expose as TableInfo fields: `extent=4096`,
-/// `buffer=64`, `clip_geom=true`, no `LIMIT`. Add config plumbing later
-/// if a workload needs to tune them.
-///
-/// Returns a SQL string parameterized on `(z,x,y)` as `$1,$2,$3` INT4.
-/// Pair with `prepare_typed_cached(&[INT4, INT4, INT4])` for plan reuse.
-fn build_inline_tile_query(
-    info: &TableInfo,
-    columns: &[(String, String)],
-    supports_tile_margin: bool,
-) -> String {
-    let base = build_base_select_no_where(info, columns);
-    let bbox = build_bbox_search(info, supports_tile_margin);
-    let geom = pg_escape::quote_identifier(&info.geometry_column);
-    format!("{base}\n  WHERE\n    {geom} && {bbox}\n) AS tile")
-}
-
-fn build_batch_tile_query(
-    info: &TableInfo,
-    columns: &[(String, String)],
-    supports_tile_margin: bool,
-) -> String {
-    let coords = ["batch_coords.z", "batch_coords.x", "batch_coords.y"];
-    let base = build_base_select_with_coordinates(info, columns, coords);
-    let bbox = build_bbox_search_with_coordinates(info, supports_tile_margin, coords);
-    let tile = compose_filtered_sql(&base, &bbox, info, "batch_coords.enabled", None);
-    compose_batch_sql(&tile)
-}
-
 fn compose_batch_sql(tile: &str) -> String {
     // Dropping a row stream does not stop PostgreSQL from rendering its suffix.
     format!(
-        "WITH RECURSIVE batch_coords AS MATERIALIZED (\n\
-         SELECT * FROM unnest($1::integer[], $2::integer[], $3::integer[], $4::boolean[]) \
-         WITH ORDINALITY AS coords(z,x,y,enabled,ordinality)),\n\
-         batch_tiles AS (\n\
-         SELECT batch_coords.ordinality, result.mvt, \
-         COALESCE(octet_length(result.mvt), 0)::bigint AS total_bytes \
-         FROM batch_coords CROSS JOIN LATERAL ({tile}) AS result(mvt) \
-         WHERE batch_coords.ordinality = 1\n\
-         UNION ALL\n\
-         SELECT batch_coords.ordinality, result.mvt, \
-         previous.total_bytes + COALESCE(octet_length(result.mvt), 0) \
-         FROM batch_tiles AS previous JOIN batch_coords \
-         ON batch_coords.ordinality = previous.ordinality + 1 \
-         CROSS JOIN LATERAL ({tile}) AS result(mvt) \
-         WHERE previous.total_bytes < {MAX_TILE_BATCH_BYTES})\n\
-         SELECT batch_tiles.ordinality, batch_tiles.mvt FROM batch_tiles \
+        "WITH RECURSIVE batch_coords AS (
+         SELECT * FROM unnest($1::integer[], $2::integer[], $3::integer[], $4::boolean[])
+         WITH ORDINALITY AS coords(z,x,y,enabled,ordinality)),
+         batch_tiles AS (
+         SELECT batch_coords.ordinality, result.size, result.mvt,
+         COALESCE(result.size, {MAX_TILE_BATCH_BYTES})::bigint AS total_bytes
+         FROM batch_coords CROSS JOIN LATERAL ({tile}) AS result
+         WHERE batch_coords.ordinality = 1
+         UNION ALL
+         SELECT batch_coords.ordinality, result.size, result.mvt,
+         previous.total_bytes + COALESCE(result.size, {MAX_TILE_BATCH_BYTES})
+         FROM batch_tiles AS previous JOIN batch_coords
+         ON batch_coords.ordinality = previous.ordinality + 1
+         CROSS JOIN LATERAL ({tile}) AS result
+         WHERE previous.total_bytes < {MAX_TILE_BATCH_BYTES})
+         SELECT batch_tiles.ordinality, batch_tiles.size, batch_tiles.mvt FROM batch_tiles
          ORDER BY batch_tiles.ordinality"
     )
 }
 
-/// Inner SELECT including FROM but no WHERE. Re-used by the filter
-/// path to splice extra conditions before closing the subquery.
-fn build_base_select_no_where(info: &TableInfo, columns: &[(String, String)]) -> String {
-    build_base_select_with_coordinates(info, columns, ["$1::integer", "$2::integer", "$3::integer"])
+#[derive(Clone)]
+struct TileSql {
+    candidates: String,
+    bbox_search: String,
+    output: String,
 }
 
-fn build_base_select_with_coordinates(
-    info: &TableInfo,
-    columns: &[(String, String)],
-    [z, x, y]: [&str; 3],
-) -> String {
-    const EXTENT: u32 = 4096;
-    const BUFFER: u32 = 64;
-    let geom = pg_escape::quote_identifier(&info.geometry_column);
-    let schema = pg_escape::quote_identifier(&info.schema);
-    let table = pg_escape::quote_identifier(&info.table);
-    let layer_name = pg_escape::quote_literal(&info.table);
+impl TileSql {
+    fn new(
+        info: &TableInfo,
+        columns: &[(String, String)],
+        supports_tile_margin: bool,
+        coords: [&str; 3],
+    ) -> Self {
+        let [z, x, y] = coords;
+        let geom = pg_escape::quote_identifier(&info.geometry_column);
+        let geom_name = pg_escape::quote_literal(&info.geometry_column);
+        let schema = pg_escape::quote_identifier(&info.schema);
+        let table = pg_escape::quote_identifier(&info.table);
+        let layer = pg_escape::quote_literal(&info.table);
+        let extent = info.extent;
 
-    let properties = if columns.is_empty() {
-        String::new()
-    } else {
-        columns
-            .iter()
-            .map(|(c, _)| format!(", {}", pg_escape::quote_identifier(c)))
-            .collect::<Vec<_>>()
-            .join("")
-    };
-
-    let (id_name, id_field) = match info.id_column.as_deref() {
-        Some(c) => {
-            let ident = pg_escape::quote_identifier(c);
-            let literal = pg_escape::quote_literal(c);
-            (
-                format!(", {literal}"),
-                format!(", {ident}::bigint AS {ident}"),
-            )
+        let mut projected = String::new();
+        let mut input_bytes = format!("COALESCE(ST_MemSize({geom}), 0)::bigint");
+        let id_name = info.id_column.as_deref().map_or_else(String::new, |name| {
+            let ident = pg_escape::quote_identifier(name);
+            projected.push_str(&format!(", {ident}::bigint AS {ident}"));
+            input_bytes.push_str(" + 8");
+            format!(", {}", pg_escape::quote_literal(name))
+        });
+        for (column, data_type) in columns {
+            let ident = pg_escape::quote_identifier(column);
+            projected.push_str(&format!(", {ident}"));
+            let size = match data_type.as_str() {
+                "text" | "character varying" | "character" | "json" | "jsonb" => {
+                    format!("octet_length({ident}::text)")
+                }
+                _ => format!("pg_column_size({ident})"),
+            };
+            input_bytes.push_str(&format!(" + COALESCE({size}, 0)"));
         }
-        None => (String::new(), String::new()),
-    };
 
-    // No `ST_CurveToLine` wrapper: it's a no-op for the standard PostGIS
-    // geometry types (Point/Line/Polygon/Multi*, with or without Z/M)
-    // that this tile pipeline ever sees. martin emits the call defensively
-    // for the rare CircularString / CompoundCurve / CurvePolygon cases —
-    // we do not, since dropping it shaves a per-row function dispatch
-    // (~5–10 % at high zoom). If a Curve* source ever shows up, validate
-    // it at discovery (geometry_columns.type) and re-add the wrapper there.
-    // Keep the physical table name from shadowing correlated batch coordinates.
-    format!(
-        "\
-SELECT
-  ST_AsMVT(tile, {layer_name}, {EXTENT}, 'geom'{id_name})
-FROM (
-  SELECT
-    ST_AsMVTGeom(
-        ST_Transform({geom}::geometry, 3857),
-        ST_TileEnvelope({z}, {x}, {y}),
-        {EXTENT}, {BUFFER}, true
-    ) AS geom{id_field}{properties}
-  FROM
-    {schema}.{table} AS source_features",
-    )
-}
+        let candidates =
+            format!("SELECT {geom}{projected} FROM {schema}.{table} AS source_features");
+        // The CASE gates aggregation on preflight. OFFSET 0 keeps its result
+        // from being inlined and aggregated again for each use of data.
+        let output = format!(
+            "SELECT octet_length(data) AS size,
+                    CASE WHEN octet_length(data) <= {MAX_DECODED_TILE_BYTES} THEN data END AS mvt
+             FROM (
+                 SELECT CASE WHEN NOT EXISTS (
+                     SELECT 1 FROM candidates
+                     HAVING count(*) > {MAX_TABLE_CANDIDATES}
+                         OR sum({input_bytes}) > {MAX_TABLE_INPUT_BYTES}
+                 ) THEN (
+                     SELECT COALESCE(ST_AsMVT(tile.*, {layer}, {extent}, {geom_name}{id_name}), ''::bytea)
+                     FROM (
+                         SELECT ST_AsMVTGeom(
+                             ST_Transform({geom}::geometry, 3857),
+                             ST_TileEnvelope({z}, {x}, {y}),
+                             {extent}, {BUFFER}, true
+                         ) AS {geom}{projected} FROM candidates
+                     ) AS tile
+                 ) END AS data OFFSET 0
+             ) AS payload"
+        );
 
-/// SRID-aware bbox-search expression; 4 branches matching martin
-/// (query_tables.rs:206-218) byte-for-byte.
-fn build_bbox_search(info: &TableInfo, supports_tile_margin: bool) -> String {
-    build_bbox_search_with_coordinates(
-        info,
-        supports_tile_margin,
-        ["$1::integer", "$2::integer", "$3::integer"],
-    )
-}
+        Self {
+            candidates,
+            bbox_search: build_bbox_search(info, supports_tile_margin, coords),
+            output,
+        }
+    }
 
-fn build_bbox_search_with_coordinates(
-    info: &TableInfo,
-    supports_tile_margin: bool,
-    [z, x, y]: [&str; 3],
-) -> String {
-    const BUFFER: u32 = 64;
-    const EXTENT: u32 = 4096;
-    const MARGIN: f64 = BUFFER as f64 / EXTENT as f64;
-    const EARTH_CIRCUMFERENCE_DEGREES: f64 = 360.0;
-    let srid = info.srid;
-    if BUFFER == 0 {
-        format!("ST_Transform(ST_TileEnvelope({z}, {x}, {y}), {srid})")
-    } else if supports_tile_margin && srid == 3857 {
+    fn build(&self, info: &TableInfo, filter: &str, user_bbox: Option<[f64; 4]>) -> String {
+        let geom = pg_escape::quote_identifier(&info.geometry_column);
+        let mut predicates = format!("{geom} && {}", self.bbox_search);
+        if let Some([w, s, e, n]) = user_bbox {
+            // Keep the WGS84 envelope in its own CRS after indexed tile pruning.
+            let geometry = if info.srid == 4326 {
+                geom
+            } else {
+                format!("ST_Transform({geom}::geometry, 4326)").into()
+            };
+            predicates.push_str(&format!(
+                " AND {geometry} && ST_MakeEnvelope({w}, {s}, {e}, {n}, 4326)"
+            ));
+        }
+        if !filter.is_empty() {
+            predicates.push_str(&format!(" AND ({filter})"));
+        }
         format!(
-            "ST_Transform(ST_TileEnvelope({z}, {x}, {y}, \
-             margin => {MARGIN}), {srid})"
+            "WITH candidates AS ({} WHERE {predicates} LIMIT {})
+             {}",
+            self.candidates,
+            MAX_TABLE_CANDIDATES + 1,
+            self.output,
         )
+    }
+}
+
+fn build_bbox_search(info: &TableInfo, supports_tile_margin: bool, [z, x, y]: [&str; 3]) -> String {
+    let margin = f64::from(BUFFER) / f64::from(info.extent);
+    let srid = info.srid;
+    if supports_tile_margin && srid == 3857 {
+        format!("ST_TileEnvelope({z}, {x}, {y}, margin => {margin})")
     } else if srid == 4326 {
+        // Expanding after transforming avoids wrap-around at the antimeridian.
         format!(
-            "ST_Expand(ST_Transform(ST_TileEnvelope({z}, {x}, {y}), {srid}), \
-             ({MARGIN} * {EARTH_CIRCUMFERENCE_DEGREES}) / 2^{z})"
+            "ST_Expand(ST_Transform(ST_TileEnvelope({z}, {x}, {y}), {srid}),
+             ({margin} * 360.0) / 2^{z})"
         )
     } else {
-        format!("ST_Transform(ST_TileEnvelope({z}, {x}, {y}), {srid})")
+        format!(
+            "ST_Transform(ST_Expand(ST_TileEnvelope({z}, {x}, {y}),
+             ({margin} * 40075016.68557849) / 2^{z}), {srid})"
+        )
     }
-}
-
-/// Compose the per-request inline SQL for a filtered get_tile call.
-/// `filter_sql` may be empty when only `?bbox=` is set; `user_bbox`
-/// may be `None` when only `?filter=` is set.
-fn compose_filtered_sql(
-    base_select_no_where: &str,
-    bbox_search: &str,
-    info: &TableInfo,
-    filter_sql: &str,
-    user_bbox: Option<[f64; 4]>,
-) -> String {
-    let mut conds: Vec<String> = Vec::with_capacity(3);
-    let geom_col = pg_escape::quote_identifier(&info.geometry_column);
-    conds.push(format!("{geom_col} && {bbox_search}"));
-    if let Some([w, s, e, n]) = user_bbox {
-        // Test the geographic bounding box after the indexed tile predicate.
-        // Projecting only the envelope corners can lose matches in curved CRSs.
-        let geometry = if info.srid == 4326 {
-            geom_col
-        } else {
-            format!("ST_Transform({geom_col}::geometry, 4326)").into()
-        };
-        conds.push(format!(
-            "{geometry} && ST_MakeEnvelope({w}, {s}, {e}, {n}, 4326)"
-        ));
-    }
-    if !filter_sql.trim().is_empty() {
-        conds.push(format!("({filter_sql})"));
-    }
-    let where_clause = conds.join("\n    AND ");
-    format!("{base_select_no_where}\n  WHERE\n    {where_clause}\n) AS tile")
 }
 
 #[cfg(test)]
@@ -913,23 +819,29 @@ mod inline_filter_tests {
             bounds: None,
             has_spatial_index: true,
             derived_min_zoom: None,
+            extent: DEFAULT_EXTENT,
         }
     }
 
     #[test]
-    fn unfiltered_split_matches_legacy_one_shot_form() {
+    fn unfiltered_sql_includes_spatial_predicate() {
         let info = fixture_info();
-        let sql = build_inline_tile_query(&info, &[], true);
+        let sql = TileSql::new(&info, &[], true, SINGLE_COORDS).build(&info, "", None);
         assert!(sql.contains("ST_AsMVT"));
         assert!(sql.contains(" && "));
-        assert!(sql.ends_with(") AS tile"));
     }
 
     #[test]
     fn batch_sql_uses_ordered_arrays_without_rewriting_quoted_identifiers() {
         let mut info = fixture_info();
         info.geometry_column = "$1::integer".into();
-        let sql = build_batch_tile_query(&info, &[("$2::integer".into(), "text".into())], true);
+        let template = TileSql::new(
+            &info,
+            &[("$2::integer".into(), "text".into())],
+            true,
+            BATCH_COORDS,
+        );
+        let sql = compose_batch_sql(&template.build(&info, "batch_coords.enabled", None));
         assert!(sql.contains("unnest($1::integer[], $2::integer[], $3::integer[], $4::boolean[])"));
         assert!(sql.contains("WITH ORDINALITY"));
         assert!(sql.contains("ST_TileEnvelope(batch_coords.z, batch_coords.x, batch_coords.y)"));
@@ -941,11 +853,7 @@ mod inline_filter_tests {
     #[test]
     fn compose_filtered_includes_filter_and_bbox() {
         let info = fixture_info();
-        let base = build_base_select_no_where(&info, &[]);
-        let bbox = build_bbox_search(&info, true);
-        let sql = compose_filtered_sql(
-            &base,
-            &bbox,
+        let sql = TileSql::new(&info, &[], true, SINGLE_COORDS).build(
             &info,
             "(\"class\" = 'highway')",
             Some([10.0, 20.0, 30.0, 40.0]),
@@ -953,27 +861,29 @@ mod inline_filter_tests {
         assert!(sql.contains("ST_AsMVT"));
         assert!(sql.contains("\"class\" = 'highway'"));
         assert!(sql.contains("ST_MakeEnvelope(10, 20, 30, 40, 4326)"));
-        assert!(sql.ends_with(") AS tile"));
     }
 
     #[test]
     fn compose_with_only_filter_omits_user_bbox_clause() {
         let info = fixture_info();
-        let base = build_base_select_no_where(&info, &[]);
-        let bbox = build_bbox_search(&info, true);
-        let sql = compose_filtered_sql(&base, &bbox, &info, "(\"class\" = 'highway')", None);
+        let sql = TileSql::new(&info, &[], true, SINGLE_COORDS).build(
+            &info,
+            "(\"class\" = 'highway')",
+            None,
+        );
         assert!(sql.contains("\"class\" = 'highway'"));
         assert!(!sql.contains("ST_MakeEnvelope"));
         assert!(sql.contains(" && "));
-        assert!(sql.ends_with(") AS tile"));
     }
 
     #[test]
     fn compose_with_only_bbox_omits_filter_clause() {
         let info = fixture_info();
-        let base = build_base_select_no_where(&info, &[]);
-        let bbox = build_bbox_search(&info, true);
-        let sql = compose_filtered_sql(&base, &bbox, &info, "", Some([10.0, 20.0, 30.0, 40.0]));
+        let sql = TileSql::new(&info, &[], true, SINGLE_COORDS).build(
+            &info,
+            "",
+            Some([10.0, 20.0, 30.0, 40.0]),
+        );
         assert!(sql.contains("ST_MakeEnvelope"));
         // No "()" empty filter group.
         assert!(!sql.contains("AND ()"));
@@ -988,36 +898,40 @@ mod inline_filter_tests {
         info.id_column = Some(r#"id"col"#.into());
         let columns = vec![(r#"name"col"#.to_string(), "text".to_string())];
 
-        let sql = build_inline_tile_query(&info, &columns, true);
+        let sql = TileSql::new(&info, &columns, true, SINGLE_COORDS).build(&info, "", None);
 
         assert!(sql.contains(r#""tenant""1"."select""#));
         assert!(sql.contains(r#"ST_Transform("geom""col"::geometry, 3857)"#));
         assert!(sql.contains(r#""id""col"::bigint AS "id""col""#));
         assert!(sql.contains(r#""name""col""#));
-        assert!(sql.contains(r#"ST_AsMVT(tile, 'select', 4096, 'geom', 'id"col')"#));
+        assert!(sql.contains(r#"ST_AsMVT(tile.*, 'select', 4096, 'geom"col', 'id"col')"#));
     }
 
     #[test]
     fn filtered_sql_quotes_geometry_identifier() {
-        let base = "SELECT 1 FROM \"tenant\".\"table\"";
         let mut info = fixture_info();
         info.geometry_column = r#"geom"col"#.into();
-        let sql = compose_filtered_sql(base, "bbox", &info, "", Some([10.0, 20.0, 30.0, 40.0]));
+        let sql = TileSql::new(&info, &[], true, SINGLE_COORDS).build(
+            &info,
+            "",
+            Some([10.0, 20.0, 30.0, 40.0]),
+        );
 
-        assert!(sql.contains(r#""geom""col" && bbox"#));
+        assert!(sql.contains(r#""geom""col" && ST_Expand"#));
         assert!(sql.contains(r#""geom""col" && ST_MakeEnvelope(10, 20, 30, 40, 4326)"#));
     }
 }
 
 async fn discover_property_types(
-    pool: &PostgresPool,
+    pool: &Arc<PostgresPool>,
     info: &TableInfo,
 ) -> MaptileResult<Vec<(String, String)>> {
     if info.properties.is_empty() {
         return Ok(Vec::new());
     }
-    let conn = pool.get().await?;
-    let rows = conn
+    let pending = pool.get_query().await?;
+    let rows = pending
+        .connection()
         .query(
             "SELECT column_name::text, data_type::text FROM information_schema.columns
              WHERE table_schema = $1 AND table_name = $2 AND column_name = ANY($3)
@@ -1026,7 +940,15 @@ async fn discover_property_types(
         )
         .await
         .map_err(MaptileError::backend)?;
-    Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
+    pending.finish().await?;
+    Ok(rows
+        .iter()
+        .filter_map(|row| {
+            let name: String = row.get(0);
+            (Some(&name) != info.id_column.as_ref() && name != info.geometry_column)
+                .then(|| (name, row.get(1)))
+        })
+        .collect())
 }
 
 async fn check_spatial_index(

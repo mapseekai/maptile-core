@@ -8,8 +8,7 @@
 use crate::cache::{TileCache, TileCacheKey};
 use crate::error::{MaptileError, MaptileResult};
 use crate::sources::{
-    MosaicPixelSelection, TileCoord, TileEtagResponse, TileQuery, TileResponse, TileSource,
-    effective_pixel_selection,
+    TileCoord, TileEtagResponse, TileQuery, TileResponse, TileSource, effective_pixel_selection,
 };
 use std::sync::Arc;
 
@@ -452,7 +451,7 @@ impl SourceManager {
     ) -> MaptileResult<TileEtagResponse> {
         let source = self.require(id)?;
         if source.cache_zoom().is_disabled() {
-            validate_pixel_selection(id, query, source.mosaic_pixel_selection())?;
+            super::validate_source_request(source.as_ref(), &[xyz], query)?;
             // Dynamic sources retain their own one-snapshot validator semantics.
             let response = source.get_tile_with_etag(xyz, query, if_none_match).await?;
             if let TileEtagResponse::Fresh { resp, .. } = &response {
@@ -479,7 +478,7 @@ impl SourceManager {
     ) -> MaptileResult<TileResponse> {
         let id = source.id();
         let selection_fallback = source.mosaic_pixel_selection();
-        validate_pixel_selection(id, query, selection_fallback)?;
+        super::validate_source_request(source.as_ref(), &[xyz], query)?;
         let effective_selection =
             selection_fallback.map(|fallback| effective_pixel_selection(query, fallback));
 
@@ -606,19 +605,6 @@ impl SourceManager {
     }
 }
 
-fn validate_pixel_selection(
-    id: &str,
-    query: Option<&TileQuery<'_>>,
-    fallback: Option<MosaicPixelSelection>,
-) -> MaptileResult<()> {
-    if query.is_some_and(|q| q.pixel_selection.is_some()) && fallback.is_none() {
-        return Err(MaptileError::InvalidRequest(format!(
-            "source {id:?} does not support mosaic pixel_selection"
-        )));
-    }
-    Ok(())
-}
-
 fn check_tile_size(tile: &TileResponse) -> MaptileResult<()> {
     if tile.data.len() > crate::transport::MAX_DECODED_TILE_BYTES {
         return Err(MaptileError::PayloadTooLarge {
@@ -675,6 +661,12 @@ mod tests {
 
     #[async_trait]
     impl TileSource for CountingSource {
+        fn supports_bbox(&self) -> bool {
+            true
+        }
+        fn supports_filter(&self) -> bool {
+            true
+        }
         fn id(&self) -> &str {
             &self.id
         }
@@ -1009,6 +1001,12 @@ mod tests {
 
     #[async_trait]
     impl TileSource for ResponseSource {
+        fn supports_bbox(&self) -> bool {
+            true
+        }
+        fn supports_filter(&self) -> bool {
+            true
+        }
         fn id(&self) -> &str {
             self.inner.id()
         }
@@ -1310,7 +1308,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(matches!(err, MaptileError::InvalidRequest(_)));
+        assert!(matches!(err, MaptileError::Unsupported(_)));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
@@ -1331,14 +1329,14 @@ mod tests {
         };
         assert!(matches!(
             manager.get_tile("live", xyz, Some(&query)).await,
-            Err(MaptileError::InvalidRequest(_))
+            Err(MaptileError::Unsupported(_))
         ));
         for etag in [None, Some("\"authoritative\"")] {
             assert!(matches!(
                 manager
                     .get_tile_with_etag("live", xyz, Some(&query), etag)
                     .await,
-                Err(MaptileError::InvalidRequest(_))
+                Err(MaptileError::Unsupported(_))
             ));
         }
         assert_eq!(calls.load(Ordering::SeqCst), 0);

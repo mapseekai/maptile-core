@@ -69,6 +69,7 @@ pub(crate) fn declared_tile_size(tj: &tilejson::TileJSON) -> MaptileResult<Optio
     Ok(size)
 }
 
+#[cfg(any(feature = "mbtiles", feature = "pmtiles", feature = "parquet-archive"))]
 pub(crate) fn set_raster_tile_size(
     tj: &mut tilejson::TileJSON,
     bytes: &bytes::Bytes,

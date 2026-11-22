@@ -20,7 +20,7 @@ use std::thread::{self, JoinHandle};
 /// Pool configuration.
 #[derive(Debug, Clone)]
 pub struct PoolConfig {
-    /// Number of durable render threads. Zero is normalized to one.
+    /// Number of durable render threads. Must be positive.
     pub max_concurrent: usize,
     /// Initial canvas size for renderers created by a worker.
     pub default_size: (u32, u32),
@@ -50,7 +50,12 @@ impl PoolConfig {
                 "renderer queue_depth_per_worker must be greater than zero".into(),
             ));
         }
-        let worker_count = self.max_concurrent.max(1);
+        let worker_count = self.max_concurrent;
+        if worker_count == 0 {
+            return Err(MaptileError::Config(
+                "renderer max_concurrent must be positive".into(),
+            ));
+        }
         let queue_capacity = worker_count
             .checked_mul(self.queue_depth_per_worker)
             .ok_or_else(|| MaptileError::Config("renderer queue capacity overflow".into()))?;
@@ -402,6 +407,25 @@ impl RendererPool {
             .await
     }
 
+    /// Apply a caller deadline across admission and execution. A running native call
+    /// keeps its worker and resources until it returns.
+    pub async fn render_until(
+        &self,
+        request: RenderRequest,
+        admission_timeout: std::time::Duration,
+        deadline: tokio::time::Instant,
+    ) -> MaptileResult<RenderedImage> {
+        if deadline <= tokio::time::Instant::now() {
+            return Err(MaptileError::Deadline);
+        }
+        tokio::time::timeout_at(
+            deadline,
+            self.try_render_with_timeout(request, admission_timeout),
+        )
+        .await
+        .map_err(|_| MaptileError::Deadline)?
+    }
+
     /// Returns [`MaptileError::CapacityExhausted`] if the queue cannot accept
     /// the request within `admission_timeout`. This does not time out rendering.
     pub async fn try_render_with_timeout(
@@ -589,16 +613,14 @@ mod tests {
     }
 
     #[test]
-    fn zero_workers_clamp_to_one_and_zero_queue_depth_is_rejected() {
-        let clamped = PoolConfig {
+    fn zero_workers_and_zero_queue_depth_are_rejected() {
+        let invalid_workers = PoolConfig {
             max_concurrent: 0,
             default_size: (512, 512),
             queue_depth_per_worker: 2,
         }
-        .validated()
-        .unwrap();
-        assert_eq!(clamped.worker_count, 1);
-        assert_eq!(clamped.queue_capacity, 2);
+        .validated();
+        assert!(matches!(invalid_workers, Err(MaptileError::Config(_))));
 
         let invalid = PoolConfig {
             max_concurrent: 1,

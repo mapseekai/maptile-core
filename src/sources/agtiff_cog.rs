@@ -6,21 +6,26 @@
 //! [`crate::raster::agtiff_style::to_tile_style`] adapts that style for the tiler.
 //!
 //! [`AsyncCogSourceConfig`] accepts a shared decoded-block cache and a content
-//! identity supplied by the application. Reopen a changed dataset with a new
-//! content identity to separate its cached blocks and tiles.
+//! identity supplied by the application. Each open pins an object snapshot
+//! and assigns a distinct rendered-tile cache revision.
+//! A TIFF or resource error from a raw point or coverage read can leave native
+//! work without a join handle. The catalog reports unconfirmed drain for that generation.
 
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use async_geotiff::crs::Crs;
-use async_geotiff::io::{BlockCache, CacheConfig, CogReader, ReaderConfig};
+use async_geotiff::io::{BlockCache, CacheConfig, CogReader, ReaderConfig, SnapshotPolicy};
 use async_geotiff::tiler::Tiler;
 use async_geotiff::tms::{TileCoord as AgTileCoord, TileMatrixSet};
 use bytes::Bytes;
-use object_store::{ObjectStore, path::Path as OsPath};
+use object_store::{ObjectStore, path::Path as OsPath, prefix::PrefixStore};
 use tilejson::{TileJSON, tilejson};
 
+use super::agtiff_snapshot::RemoteSnapshot;
+use crate::cache::ContentVersion;
 use crate::error::{MaptileError, MaptileResult};
 use crate::raster::agtiff_style::to_tile_style;
+use crate::sources::file_stamp::FileStamp;
 use crate::sources::{
     RasterPointQuery, RasterPointResponse, TileCoord, TileEncoding, TileFormat, TileInfo,
     TileQuery, TileResponse, TileSource,
@@ -43,8 +48,7 @@ fn reader_config(source_id: &str, block_cache: &Arc<BlockCache>) -> ReaderConfig
     let mut config = ReaderConfig::default();
     config.source_id = source_id.to_string();
     config.block_cache = Arc::clone(block_cache);
-    // Prefetch one surrounding ring of blocks for adjacent tile requests.
-    config.prefetch_ring = 1;
+    config.snapshot_policy = SnapshotPolicy::RequireValidator;
     config
 }
 
@@ -54,6 +58,7 @@ pub enum CogObjectSource {
     /// Public HTTP(S) COG. `url` is the full https URL.
     Http(String),
     /// Object store (e.g. MinIO) reusing an already-built store handle.
+    /// The supplied store owns cancellation and cleanup of work it detaches from the read future.
     /// `key` is the object path within that store.
     ObjectStore {
         store: Arc<dyn ObjectStore>,
@@ -75,8 +80,8 @@ pub struct AsyncCogSourceConfig {
     pub bounds: Option<[f64; 4]>,
     pub cache_zoom: Option<crate::cache::CacheZoomRange>,
     /// Nonempty identity of this dataset version, such as a versioned URI or
-    /// content fingerprint. Supply a new value when the underlying bytes change;
-    /// readers and tile caches use it to distinguish content generations.
+    /// content fingerprint. It scopes decoded-block sharing along with the
+    /// object location and its verified validator.
     pub content_id: String,
     /// Shared decoded-block cache for a common memory budget across readers.
     /// Readers with the same content identity can reuse decoded blocks.
@@ -91,43 +96,128 @@ pub struct AsyncCogSource {
     reader: Arc<CogReader>,
     tiler: Arc<Tiler>,
     cache_zoom: crate::cache::CacheZoomRange,
-    content_id: String,
+    content_version: ContentVersion,
+    snapshot: CogSnapshot,
+}
+
+#[derive(Clone)]
+enum CogSnapshot {
+    Local(Arc<LocalSnapshot>),
+    Remote(Arc<RemoteSnapshot>),
+}
+
+impl CogSnapshot {
+    async fn check(&self, id: &str) -> MaptileResult<()> {
+        match self {
+            Self::Local(local) => local.check(id).await,
+            Self::Remote(remote) => remote.check(id),
+        }
+    }
+}
+
+struct LocalSnapshot {
+    path: PathBuf,
+    stamp: FileStamp,
+    store: Arc<RemoteSnapshot>,
+}
+
+impl LocalSnapshot {
+    async fn check(self: &Arc<Self>, id: &str) -> MaptileResult<()> {
+        let local = self.clone();
+        let unchanged =
+            crate::transport::run_blocking(move || match FileStamp::read(&local.path) {
+                Ok(stamp) => Ok(stamp == local.stamp),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(error) => Err(error.into()),
+            })
+            .await?;
+        if !unchanged {
+            return Err(MaptileError::VersionChanged(id.into()));
+        }
+        self.store.check(id)
+    }
 }
 
 impl AsyncCogSource {
+    #[cfg(test)]
+    pub(super) fn cpu_limiter(&self) -> async_geotiff::CpuLimiter {
+        self.reader.cpu_limiter()
+    }
+
     pub async fn open(cfg: AsyncCogSourceConfig) -> MaptileResult<Self> {
         if cfg.content_id.is_empty() {
             return Err(MaptileError::Config(
                 "COG content identity is required".into(),
             ));
         }
-        let source_id = cfg.content_id.clone();
+        let backend_identity = match &cfg.source {
+            CogObjectSource::Http(url) => (0, url.as_str(), None),
+            CogObjectSource::ObjectStore { key, .. } => (
+                1,
+                key.as_str(),
+                Some(ContentVersion::new_generation().to_hex()),
+            ),
+            CogObjectSource::Local(path) => (2, path.as_str(), None),
+        };
+        let source_id =
+            ContentVersion::from_input(&serde_json::to_vec(&(&cfg.content_id, backend_identity))?)
+                .to_hex();
         let block_cache = cfg
             .block_cache
             .clone()
             .unwrap_or_else(|| Arc::new(BlockCache::new(CacheConfig::default())));
 
-        let reader = match cfg.source {
-            CogObjectSource::Http(url) => CogReader::builder()
-                .reader_config(reader_config(&source_id, &block_cache))
-                .open_http(&url)
-                .await
-                .map_err(|e| MaptileError::Config(format!("open http COG: {e}")))?,
-            CogObjectSource::ObjectStore { store, key } => CogReader::builder()
-                .reader_config(reader_config(&source_id, &block_cache))
-                .open_object_store(store, &key)
-                .await
-                .map_err(|e| MaptileError::Config(format!("open object_store COG: {e}")))?,
-            CogObjectSource::Local(p) => {
-                let store: Arc<dyn ObjectStore> =
-                    Arc::new(object_store::local::LocalFileSystem::new());
-                let path = OsPath::from_filesystem_path(&p)
-                    .map_err(|e| MaptileError::Config(format!("bad local path {p}: {e}")))?;
-                CogReader::builder()
+        let (reader, snapshot) = match cfg.source {
+            CogObjectSource::Http(url) => {
+                let (remote, resolved_id) = RemoteSnapshot::http(&url).await?;
+                let snapshot = Arc::new(remote);
+                let cache_id = format!("{source_id}:{resolved_id}");
+                let reader = CogReader::builder()
+                    .reader_config(reader_config(&cache_id, &block_cache))
+                    .open_object_store(snapshot.clone(), "")
+                    .await;
+                snapshot.check(&cfg.id)?;
+                (
+                    reader.map_err(|_| MaptileError::Config("open HTTP COG failed".into()))?,
+                    CogSnapshot::Remote(snapshot),
+                )
+            }
+            CogObjectSource::ObjectStore { store, key } => {
+                let snapshot = Arc::new(RemoteSnapshot::new(store));
+                let reader = CogReader::builder()
                     .reader_config(reader_config(&source_id, &block_cache))
-                    .open_object_store(store, path.as_ref())
-                    .await
-                    .map_err(|e| MaptileError::Config(format!("open local COG: {e}")))?
+                    .open_object_store(snapshot.clone(), &key)
+                    .await;
+                snapshot.check(&cfg.id)?;
+                (
+                    reader
+                        .map_err(|e| MaptileError::Config(format!("open object_store COG: {e}")))?,
+                    CogSnapshot::Remote(snapshot),
+                )
+            }
+            CogObjectSource::Local(p) => {
+                let snapshot = crate::transport::run_blocking(move || {
+                    let path = std::fs::canonicalize(p)?;
+                    let key = OsPath::from_absolute_path(&path).map_err(MaptileError::backend)?;
+                    let store = PrefixStore::new(object_store::local::LocalFileSystem::new(), key);
+                    let store = Arc::new(RemoteSnapshot::local(Arc::new(store)));
+                    let stamp = FileStamp::read(&path)?;
+                    Ok(Arc::new(LocalSnapshot { path, stamp, store }))
+                })
+                .await?;
+                let local_id = ContentVersion::from_input(
+                    format!("{source_id}:{:?}", snapshot.stamp).as_bytes(),
+                )
+                .to_hex();
+                let result = CogReader::builder()
+                    .reader_config(reader_config(&local_id, &block_cache))
+                    .open_object_store(snapshot.store.clone(), "")
+                    .await;
+                snapshot.check(&cfg.id).await?;
+                (
+                    result.map_err(|e| MaptileError::Config(format!("open local COG: {e}")))?,
+                    CogSnapshot::Local(snapshot),
+                )
             }
         };
         let reader = Arc::new(reader);
@@ -170,8 +260,19 @@ impl AsyncCogSource {
             reader,
             tiler,
             cache_zoom: cfg.cache_zoom.unwrap_or_default(),
-            content_id: cfg.content_id,
+            content_version: ContentVersion::new_generation(),
+            snapshot,
         })
+    }
+
+    async fn read_snapshot<T>(
+        &self,
+        read: impl Future<Output = MaptileResult<T>>,
+    ) -> MaptileResult<T> {
+        self.snapshot.check(&self.id).await?;
+        let result = read.await;
+        self.snapshot.check(&self.id).await?;
+        result
     }
 }
 
@@ -179,6 +280,10 @@ impl AsyncCogSource {
 impl TileSource for AsyncCogSource {
     fn id(&self) -> &str {
         &self.id
+    }
+
+    fn source_kind(&self) -> super::SourceKind {
+        super::SourceKind::Cog
     }
 
     fn tilejson(&self) -> &TileJSON {
@@ -200,11 +305,8 @@ impl TileSource for AsyncCogSource {
         Box::new(self.clone())
     }
 
-    /// Cache version derived from the application-supplied content identity.
     fn content_version(&self) -> crate::cache::ContentVersion {
-        let mut buf = self.content_id.as_bytes().to_vec();
-        buf.push(0);
-        crate::cache::ContentVersion::from_input(&buf)
+        self.content_version
     }
 
     #[tracing::instrument(name = "cog.get_tile", skip_all, fields(z = %xyz.z, x = %xyz.x, y = %xyz.y))]
@@ -213,6 +315,7 @@ impl TileSource for AsyncCogSource {
         xyz: TileCoord,
         query: Option<&TileQuery<'_>>,
     ) -> MaptileResult<TileResponse> {
+        super::validate_source_request(self, &[xyz], query)?;
         let style = query.and_then(|q| q.style).ok_or_else(|| {
             MaptileError::InvalidRequest("canonical raster style is required".into())
         })?;
@@ -223,18 +326,23 @@ impl TileSource for AsyncCogSource {
         // Map an empty tiler result to TileNotFound so the application can
         // represent a coordinate outside the dataset or projection domain.
         let tile: Bytes = self
-            .tiler
-            .tile(
-                AgTileCoord {
-                    tms: TileMatrixSet::WebMercatorQuad,
-                    z: xyz.z,
-                    x: xyz.x,
-                    y: xyz.y,
-                },
-                &tile_style,
-            )
-            .await
-            .map_err(crate::raster::agtiff_style::render_error)?
+            .read_snapshot(super::agtiff_request::render(|limiter| async {
+                self.tiler
+                    .as_ref()
+                    .clone()
+                    .with_request_limiter(limiter)
+                    .tile(
+                        AgTileCoord {
+                            tms: TileMatrixSet::WebMercatorQuad,
+                            z: xyz.z,
+                            x: xyz.x,
+                            y: xyz.y,
+                        },
+                        &tile_style,
+                    )
+                    .await
+            }))
+            .await?
             .ok_or(MaptileError::TileNotFound(xyz.z, xyz.x, xyz.y))?;
 
         Ok(TileResponse {
@@ -256,7 +364,16 @@ impl TileSource for AsyncCogSource {
         &self,
         query: Option<&super::raster_coverage::CoverageQuery>,
     ) -> MaptileResult<super::raster_coverage::CoverageResponse> {
-        super::raster_coverage::read_coverage(self.reader.clone(), query).await
+        let reader = self.reader.clone();
+        let query = query.cloned();
+        self.read_snapshot(super::agtiff_request::reader_call(async move {
+            super::raster_coverage::read_coverage(reader, query.as_ref()).await
+        }))
+        .await
+    }
+
+    fn consistent_export(&self) -> bool {
+        true
     }
 
     fn supports_raster_point(&self) -> bool {
@@ -279,11 +396,19 @@ impl TileSource for AsyncCogSource {
         }
 
         let coord_crs = parse_coord_crs(&query.coord_crs)?;
+        let reader = self.reader.clone();
+        let (x, y) = (query.x, query.y);
+        let crs = coord_crs.clone();
+        let bidx = query.bidx.clone();
         let point = self
-            .reader
-            .point(query.x, query.y, &coord_crs, &query.bidx)
-            .await
-            .map_err(|e| MaptileError::InvalidStyle(format!("raster point query failed: {e}")))?;
+            .read_snapshot(super::agtiff_request::reader_call(async move {
+                reader
+                    .point(x, y, &crs, &bidx)
+                    .await
+                    .map_err(super::agtiff_request::mark_reader_error)
+                    .map_err(crate::raster::agtiff_style::render_error)
+            }))
+            .await?;
 
         match point {
             Some(value) => Ok(RasterPointResponse {

@@ -5,16 +5,17 @@
 //!
 //! [`sources`] provides a common [`sources::TileSource`] interface for tile
 //! archives, PostgreSQL, and feature-enabled vector and raster backends.
-//! Applications construct sources from their configuration, register them with
-//! [`sources::manager::SourceManager`], and request tiles by source ID.
+//! Applications publish opened drivers through [`control::CatalogService`] and use
+//! [`service::TileStack`] for single reads, batches and version-pinned exports.
 //!
 //! [`cache`], [`filter`], [`styles`], and [`transport`] provide tile caching,
 //! CQL2 predicates, style loading, and payload encoding. Optional Cargo features
-//! add GeoParquet, local vector imports, COG/STAC tiling, and native map rendering.
+//! add archives, PostGIS, GeoParquet, FlatGeobuf, COG/STAC and native map rendering.
 //! Use [`prelude`] for common types and [`render`] for rendering requests and
 //! WMTS metadata.
 
 pub mod cache;
+pub mod control;
 pub mod discovery;
 pub mod error;
 pub mod filter;
@@ -24,6 +25,7 @@ pub mod metrics;
 pub mod prelude;
 pub mod raster;
 pub mod render;
+pub mod service;
 pub mod sources;
 pub mod styles;
 pub mod transcode;

@@ -15,6 +15,7 @@
 //! └── styles/<id>/style.json       -> DiscoveredStyle
 //! ```
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::error::{MaptileError, MaptileResult};
@@ -33,6 +34,8 @@ pub enum DiscoveredSourceKind {
     PmTiles,
     MbTiles,
     Cog,
+    Parquet,
+    FlatGeobuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,6 +62,15 @@ pub struct DiscoveryReport {
 /// In an async context (e.g. server reload paths) call [`scan_async`]
 /// instead so the runtime is not stalled on large directory trees.
 pub fn scan(root: impl AsRef<Path>) -> MaptileResult<DiscoveryReport> {
+    scan_with_ids(root, &HashMap::new())
+}
+
+/// Assign configured IDs to paths relative to the discovery root. An ambiguous
+/// automatic ID rejects the whole inventory, including when an earlier path sorts first.
+pub fn scan_with_ids(
+    root: impl AsRef<Path>,
+    ids: &HashMap<PathBuf, String>,
+) -> MaptileResult<DiscoveryReport> {
     let root = root.as_ref();
     if !root.exists() {
         return Err(MaptileError::Config(format!(
@@ -104,7 +116,10 @@ pub fn scan(root: impl AsRef<Path>) -> MaptileResult<DiscoveryReport> {
 
         // Tile sources: detected by extension.
         if let Some(kind) = detect_source_kind(name) {
-            let id = stem(name);
+            let id = ids
+                .get(path.strip_prefix(root).unwrap_or(path))
+                .cloned()
+                .unwrap_or_else(|| stem(name));
             sources.push(DiscoveredSource {
                 id,
                 kind,
@@ -114,12 +129,17 @@ pub fn scan(root: impl AsRef<Path>) -> MaptileResult<DiscoveryReport> {
         }
     }
 
-    // Sort sources by path so that the collision-suffix pass below picks a
-    // deterministic "winner" across runs (the lexicographically-first path
-    // keeps the bare id; later duplicates get a directory suffix).
-    sources.sort_by(|a, b| a.path.cmp(&b.path));
-    suffix_colliding_source_ids(&mut sources);
-    sources.sort_by(|a, b| a.id.cmp(&b.id));
+    sources.sort_by(|a, b| a.id.cmp(&b.id).then_with(|| a.path.cmp(&b.path)));
+    for pair in sources.windows(2) {
+        if pair[0].id == pair[1].id {
+            return Err(MaptileError::Config(format!(
+                "source id {:?} is claimed by {} and {}",
+                pair[0].id,
+                pair[0].path.display(),
+                pair[1].path.display()
+            )));
+        }
+    }
     styles.sort_by(|a, b| a.id.cmp(&b.id));
 
     Ok(DiscoveryReport {
@@ -127,40 +147,6 @@ pub fn scan(root: impl AsRef<Path>) -> MaptileResult<DiscoveryReport> {
         sources,
         styles,
     })
-}
-
-/// Disambiguate identical source ids that originated from different
-/// directories. The first occurrence (already sorted by path) keeps its
-/// stem; subsequent duplicates get `__<dir-name>` appended. If the
-/// directory-suffix is itself ambiguous, a numeric counter is appended.
-fn suffix_colliding_source_ids(sources: &mut [DiscoveredSource]) {
-    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    for src in sources.iter_mut() {
-        let original = src.id.clone();
-        let count = *seen.entry(original.clone()).or_insert(0);
-        if count > 0 {
-            // Find the immediate parent directory name.
-            let dir_name = src
-                .path
-                .parent()
-                .and_then(|p| p.file_name())
-                .and_then(|s| s.to_str())
-                .map(str::to_string)
-                .unwrap_or_else(|| format!("{count}"));
-            let mut candidate = format!("{original}__{dir_name}");
-            // If the suffix is also taken (e.g. data/a/world.pmtiles +
-            // data/b/world.pmtiles + data/b/world2.pmtiles re-shaped),
-            // tack on a counter.
-            let mut n = 2;
-            while seen.contains_key(&candidate) {
-                candidate = format!("{original}__{dir_name}_{n}");
-                n += 1;
-            }
-            src.id = candidate.clone();
-            seen.insert(candidate, 1);
-        }
-        *seen.entry(original).or_insert(0) += 1;
-    }
 }
 
 /// Async wrapper over [`scan`] that runs the blocking directory walk on a
@@ -179,6 +165,10 @@ fn detect_source_kind(name: &str) -> Option<DiscoveredSourceKind> {
         Some(DiscoveredSourceKind::PmTiles)
     } else if lower.ends_with(".mbtiles") {
         Some(DiscoveredSourceKind::MbTiles)
+    } else if lower.ends_with(".parquet") || lower.ends_with(".geoparquet") {
+        Some(DiscoveredSourceKind::Parquet)
+    } else if lower.ends_with(".fgb") {
+        Some(DiscoveredSourceKind::FlatGeobuf)
     } else if lower.ends_with(".cog") || lower.ends_with(".tif") || lower.ends_with(".tiff") {
         Some(DiscoveredSourceKind::Cog)
     } else {
@@ -241,27 +231,17 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_ids_get_directory_suffix() {
+    fn adding_an_earlier_path_cannot_rebind_an_existing_id() {
         let tmp = tempfile::tempdir().unwrap();
-        write(&tmp.path().join("a/world.pmtiles"), b"x");
         write(&tmp.path().join("b/world.pmtiles"), b"x");
-        let r = scan(tmp.path()).unwrap();
-        assert_eq!(r.sources.len(), 2);
-        let ids: Vec<&str> = r.sources.iter().map(|s| s.id.as_str()).collect();
-        // One keeps the bare id, the other has a directory-disambiguating suffix.
-        assert!(ids.contains(&"world"));
-        assert!(ids.iter().any(|id| id.starts_with("world__")));
-    }
-
-    #[test]
-    fn triple_collision_disambiguates_all() {
-        let tmp = tempfile::tempdir().unwrap();
-        write(&tmp.path().join("a/x.pmtiles"), b"1");
-        write(&tmp.path().join("b/x.pmtiles"), b"1");
-        write(&tmp.path().join("c/x.pmtiles"), b"1");
-        let r = scan(tmp.path()).unwrap();
-        let ids: BTreeSet<&str> = r.sources.iter().map(|s| s.id.as_str()).collect();
-        assert_eq!(ids.len(), 3, "expected 3 unique ids, got {ids:?}");
+        assert_eq!(scan(tmp.path()).unwrap().sources[0].id, "world");
+        write(&tmp.path().join("a/world.pmtiles"), b"x");
+        let error = scan(tmp.path()).unwrap_err().to_string();
+        assert!(error.contains("a/world.pmtiles") && error.contains("b/world.pmtiles"));
+        let ids = HashMap::from([(PathBuf::from("a/world.pmtiles"), "world-a".into())]);
+        let result = scan_with_ids(tmp.path(), &ids).unwrap();
+        assert_eq!(result.sources[0].path, tmp.path().join("b/world.pmtiles"));
+        assert_eq!(result.sources[0].id, "world");
     }
 
     #[test]

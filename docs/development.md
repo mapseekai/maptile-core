@@ -16,7 +16,7 @@ cargo --version
 
 | 构建组合 | 环境要求 | 使用说明 |
 | --- | --- | --- |
-| 默认 | Rust、平台链接器与 C 编译工具 | 构建默认数据源和基础组件 |
+| 默认 | Rust、平台链接器与 C 编译工具 | 构建目录、默认读取栈和基础组件 |
 | `geoparquet` / `duckdb` | C/C++ 工具链 | 编译 bundled DuckDB；几何查询准备相应扩展 |
 | `local-vector` | `geoparquet` 的环境与 Spatial 扩展 | 使用扩展自带的矢量驱动 |
 | `agtiff` / `stac` | PROJ 及匹配的运行时坐标数据 | 当前 `proj-sys` 构建要求系统 PROJ ≥9.6.2，或由 CMake 构建随包源码 |
@@ -43,7 +43,7 @@ git diff --check
 新增的入门示例可独立运行：
 
 ```sh
-cargo run --locked --example read_pmtiles
+cargo run --locked --features pmtiles --example read_pmtiles
 ```
 
 `cargo doc` 的结果位于 `target/doc/maptile_core/index.html`。加上 `--open` 可在本地浏览。开发约定与测试组织方式见 [AGENTS.md](../AGENTS.md)。
@@ -67,7 +67,7 @@ GeoParquet 扩展的安装、校验和运行示例见[GeoParquet 与本地矢量
 为测试准备独立的 PostGIS 数据库，将 `DATABASE_URL` 设置为该库的连接串，再运行对应集成目标：
 
 ```sh
-cargo test --locked --test postgres_pool --test postgres_table --test postgres_function
+cargo test --locked --features postgres --test postgres_pool --test postgres_table --test postgres_function
 ```
 
 这些测试会创建测试表或函数，应使用专用测试库。测试辅助代码在缺少连接配置时会提前返回，因此数据库验证记录应包含实际连接环境。仓库 CI 使用独立 PostGIS 服务，配置见 [ci.yml](../.github/workflows/ci.yml)，测试入口见 [`tests/common/postgres.rs`](../tests/common/postgres.rs)。
@@ -75,7 +75,7 @@ cargo test --locked --test postgres_pool --test postgres_table --test postgres_f
 连接竞争微基准可以单独运行：
 
 ```sh
-cargo test --locked --test postgres_table \
+cargo test --locked --features postgres --test postgres_table \
   registration_under_tile_load -- --ignored --nocapture
 ```
 
@@ -153,3 +153,5 @@ archive 和 headers 必须来自上述同一 Native revision、目标架构及�
 公共接口、feature 或配置行为发生变化时，同步修改对应指南、Rustdoc 和示例。入口 README 保持项目定位、快速接入与导航；配置字段和执行约定放在其所属专题中。
 
 提交前检查 Markdown 相对链接、Rustdoc 链接、代码示例和声明的 feature 条件，并按本次修改涉及的路径运行验证。历史版本与迁移事实保存在 [CHANGELOG.md](CHANGELOG.md)，项目提取记录保存在 [EXTRACTION.md](EXTRACTION.md)。
+
+固定 PMTiles 归档的 HTTP 冷暖读结果、逐次 p95 和峰值 RSS 见[可复现的基准记录](catalog-stack-benchmark.md)。

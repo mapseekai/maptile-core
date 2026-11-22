@@ -1,5 +1,10 @@
-use duckdb::{Connection, InterruptHandle};
-use std::sync::{Arc, Mutex};
+#[cfg(test)]
+use duckdb::Connection;
+use duckdb::InterruptHandle;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 use tokio::{sync::Notify, time::Instant};
 
@@ -14,13 +19,29 @@ enum Status {
 pub(super) struct QueryControl {
     state: Mutex<QueryState>,
     wake: Notify,
+    cancelled: Notify,
 }
 
 struct QueryState {
     status: Status,
-    interrupt: Option<Arc<InterruptHandle>>,
+    interrupt: Option<Interrupt>,
+
     #[cfg(test)]
     pause_interrupt: Option<InterruptPause>,
+}
+
+struct Interrupt {
+    handle: Arc<InterruptHandle>,
+    tainted: Option<Arc<AtomicBool>>,
+}
+
+impl Interrupt {
+    fn cancel(&self) {
+        if let Some(tainted) = &self.tainted {
+            tainted.store(true, Ordering::Release);
+        }
+        self.handle.interrupt();
+    }
 }
 
 #[cfg(test)]
@@ -40,23 +61,44 @@ impl QueryControl {
                 pause_interrupt: None,
             }),
             wake: Notify::new(),
+            cancelled: Notify::new(),
         })
     }
 
-    #[must_use = "keep the attachment alive until the connection's work is finished"]
-    pub(super) fn attach<'a>(&'a self, connection: &'a Connection) -> AttachedQuery<'a> {
+    #[cfg(test)]
+    pub(super) fn attach(self: &Arc<Self>, connection: &Connection) -> AttachedQuery {
+        self.bind(connection.interrupt_handle(), None)
+    }
+
+    pub(super) fn bind(
+        self: &Arc<Self>,
+        interrupt: Arc<InterruptHandle>,
+        tainted: Option<Arc<AtomicBool>>,
+    ) -> AttachedQuery {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let interrupt = connection.interrupt_handle();
+        let interrupt = Interrupt {
+            handle: interrupt,
+            tainted,
+        };
+        debug_assert!(state.interrupt.is_none());
         if state.status == Status::Cancelled {
-            interrupt.interrupt();
+            interrupt.cancel();
         }
         state.interrupt = Some(interrupt);
         AttachedQuery {
-            query: self,
-            _connection: connection,
+            query: self.clone(),
+        }
+    }
+
+    pub(super) async fn wait_cancelled(&self) {
+        let notified = self.cancelled.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if !self.cancelled() {
+            notified.await;
         }
     }
 
@@ -90,7 +132,7 @@ impl QueryControl {
             pause.resume.recv_timeout(Duration::from_secs(5)).unwrap();
         }
         if let Some(interrupt) = &state.interrupt {
-            interrupt.interrupt();
+            interrupt.cancel();
         }
         #[cfg(test)]
         if let Some(pause) = pause {
@@ -103,6 +145,7 @@ impl QueryControl {
 
     pub(super) fn cancel(&self) {
         self.interrupt();
+        self.cancelled.notify_waiters();
         self.wake.notify_one();
     }
 
@@ -110,7 +153,7 @@ impl QueryControl {
         let query = self.clone();
         tokio::spawn(async move {
             tokio::select! {
-                () = tokio::time::sleep_until(deadline) => {},
+                () = tokio::time::sleep_until(deadline) => query.cancel(),
                 () = query.wake.notified() => {},
             }
             // DuckDB resets an interrupt sent before a query starts.
@@ -122,13 +165,12 @@ impl QueryControl {
     }
 }
 
-/// The borrow keeps Connection alive until any in-flight interrupt has returned.
-pub(super) struct AttachedQuery<'a> {
-    query: &'a QueryControl,
-    _connection: &'a Connection,
+/// Disarm this borrow generation before returning or destroying its connection.
+pub(super) struct AttachedQuery {
+    query: Arc<QueryControl>,
 }
 
-impl Drop for AttachedQuery<'_> {
+impl Drop for AttachedQuery {
     fn drop(&mut self) {
         self.query
             .state

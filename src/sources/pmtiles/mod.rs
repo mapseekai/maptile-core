@@ -34,6 +34,17 @@ pub struct PmtilesConfig {
     pub description: Option<String>,
 }
 
+fn checked_coord(xyz: crate::sources::TileCoord) -> MaptileResult<pmtiles::TileCoord> {
+    if xyz.z > 30 || xyz.x >= (1_u32 << xyz.z) || xyz.y >= (1_u32 << xyz.z) {
+        return Err(MaptileError::InvalidRequest(format!(
+            "invalid tile coordinate {}/{}/{}",
+            xyz.z, xyz.x, xyz.y
+        )));
+    }
+    pmtiles::TileCoord::new(xyz.z, xyz.x, xyz.y)
+        .map_err(|_| MaptileError::InvalidRequest("invalid tile coordinate".into()))
+}
+
 // Follow archive directory entries rather than guessing occupied coordinates.
 // Bound malformed/empty-entry traversal and remote I/O during source opening.
 async fn resolve_tile_size<B>(
@@ -55,7 +66,7 @@ where
     }
     let bytes = tokio::time::timeout(Duration::from_secs(5), reader.sample_tile())
         .await
-        .map_err(MaptileError::backend)??;
+        .map_err(|_| MaptileError::Deadline)??;
     set_raster_tile_size(tj, &bytes, info)
 }
 

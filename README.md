@@ -8,12 +8,12 @@
 | --- | --- | --- |
 | 发布已有瓦片 | 读取本地、HTTP 和对象存储中的 PMTiles，以及本地 MBTiles；获取瓦片与 TileJSON 元数据 | [数据源与查询](docs/sources.md) |
 | 从数据库生成矢量瓦片 | PostGIS 表动态生成 MVT，调用 PostgreSQL 瓦片函数，按属性与空间范围查询 | [PostgreSQL 接入](docs/sources.md#postgresql-与-postgis) |
-| 从矢量文件生成瓦片 | GeoParquet 动态切片、FlatGeobuf 直接切片、GeoJSON 与 ZIP Shapefile 导入 | [GeoParquet 与本地矢量](docs/geoparquet.md) |
+| 从矢量文件生成瓦片 | GeoParquet 动态切片、FlatGeobuf 直接切片及转换 | [GeoParquet 与本地矢量](docs/geoparquet.md) |
 | 发布遥感与栅格数据 | COG 动态切片、波段与色带处理、原始像元查询、STAC 检索与镶嵌 | [样式与渲染](docs/rendering.md) |
 | 生成地图图片 | MapLibre Native 渲染、静态地图、标记与路径叠加、PNG/JPEG/WebP 输出 | [地图图片渲染](docs/rendering.md#从样式生成地图图片) |
-| 组织服务运行 | 数据源注册与替换、MVT 组合、字节计权缓存、ETag、文件发现和缓存指标 | [架构与生命周期](docs/architecture.md) |
+| 组织服务运行 | 目录快照、MVT 组合、字节计权缓存、文件发现和缓存指标 | [架构与生命周期](docs/architecture.md) |
 
-默认构建包含 PMTiles、MBTiles、PostgreSQL、MVT 组合、CQL2 属性过滤、缓存、样式管理和压缩工具。GeoParquet、栅格处理、原生渲染等能力通过 [功能开关](docs/features.md) 选择。
+默认 features 为空。默认构建提供 `TileStack`、目录、严格 MVT 组合、CQL2、缓存及通用类型。PMTiles、MBTiles、PostgreSQL、DuckDB、栅格处理和原生渲染通过 [功能开关](docs/features.md) 显式选择。HTTP 协商、ETag 和对外地址由应用处理。
 
 ## 获取代码
 
@@ -34,13 +34,13 @@ cargo --version
 仓库提供一个可直接运行的[PMTiles 读取示例](examples/read_pmtiles.rs)：
 
 ```sh
-cargo run --locked --example read_pmtiles
+cargo run --locked --features pmtiles --example read_pmtiles
 ```
 
-示例打开仓库内的合成 PMTiles 归档，注册数据源，通过共享缓存读取 `0/0/0`，然后关闭数据源。预期输出：
+示例打开仓库内的合成 PMTiles 归档，发布目录，通过默认 `TileStack` 读取 `0/0/0`。预期输出：
 
 ```text
-sample 0/0/0: 14 bytes
+sample 0/0/0: 14 bytes (Mvt, Uncompressed)
 ```
 
 这个合成载荷用于验证文件读取与缓存接入。使用业务地图时，将路径和坐标替换为自己归档中的瓦片。完整步骤见[读取第一张瓦片](docs/getting-started.md)。
@@ -51,7 +51,7 @@ sample 0/0/0: 14 bytes
 
 ```toml
 [dependencies]
-maptile-core = { git = "https://github.com/mapseekai/maptile-core.git" }
+maptile-core = { git = "https://github.com/mapseekai/maptile-core.git", features = ["pmtiles"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -64,12 +64,8 @@ use std::{sync::Arc, time::Duration};
 
 #[tokio::main]
 async fn main() -> MaptileResult<()> {
-    let cache = Arc::new(TileCache::new(
-        64,
-        Some(Duration::from_secs(3600)),
-        None,
-    )?);
-    let manager = SourceManager::new().with_cache(cache);
+    let cache = TileCache::new(64, Some(Duration::from_secs(3600)), None)?;
+    let catalog = Arc::new(CatalogService::new(cache));
     let source = LocalPmtilesSource::open(PmtilesConfig {
         id: "basemap".into(),
         path: "data/basemap.pmtiles".into(),
@@ -78,17 +74,21 @@ async fn main() -> MaptileResult<()> {
     })
     .await?;
 
-    manager.register(Arc::new(source));
-    let tile = manager
-        .get_tile("basemap", TileCoord { z: 0, x: 0, y: 0 }, None)
+    let mut update = catalog.catalog().update();
+    update.put(Arc::new(source))?;
+    catalog.catalog().publish(update)?;
+    let stack = TileStack::builder(catalog).build();
+    let result = stack
+        .read(ReadTarget::new("basemap", "public").at(TileCoord { z: 0, x: 0, y: 0 }))
         .await?;
-    println!("{} bytes, {:?}", tile.data.len(), tile.info);
-    manager.close_source("basemap").await?;
+    if let Some(tile) = result.tile() {
+        println!("{} bytes, {:?}", tile.data.len(), tile.info);
+    }
     Ok(())
 }
 ```
 
-`TileResponse` 同时返回瓦片字节和本次响应的格式、压缩编码。应用据此组织响应、存储文件或继续处理数据。
+`TileOutcome` 区分无瓦片、完整瓦片和部分结果。`TileResponse` 携带本次实际格式和压缩编码。示例使用固定的 `public` 可见范围；多租户应用必须先鉴权，再为每个授权范围选择隔离的 scope。
 
 ## 文档导航
 
@@ -101,6 +101,7 @@ async fn main() -> MaptileResult<()> {
 - [样式与渲染](docs/rendering.md)：地图样式、栅格样式、图片渲染和 WMTS 元数据。
 - [架构与生命周期](docs/architecture.md)：模块职责、缓存身份、数据源关闭和应用集成。
 - [开发与构建](docs/development.md)：环境准备、测试、Rustdoc 和原生渲染构建。
+- [从 0.3 迁移](docs/migration-0.3.md)：迁移数据源、组合和 HTTP 适配。
 
 ## 构建与参与
 

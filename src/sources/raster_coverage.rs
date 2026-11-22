@@ -100,6 +100,7 @@ pub(crate) async fn read_coverage(
     let sample = reader
         .read_window(0, 0, 0, 1, 1)
         .await
+        .map_err(super::agtiff_request::mark_reader_error)
         .map_err(MaptileError::backend)?;
     let (sample_type, sample_bytes) = match &sample.pixels {
         PixelData::U8(_) => ("UInt8", 1),
@@ -176,6 +177,7 @@ pub(crate) async fn read_coverage(
     let pixels = reader
         .read_window(0, x, y, w, h)
         .await
+        .map_err(super::agtiff_request::mark_reader_error)
         .map_err(MaptileError::backend)?;
     let query = query.clone();
     let scales = reader

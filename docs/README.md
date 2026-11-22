@@ -4,15 +4,16 @@
 
 ## 入门教程
 
-[读取第一张瓦片](getting-started.md)使用仓库自带的 PMTiles 合成样例，完成打开文件、注册数据源、启用缓存、读取结果和关闭数据源。完成后，可以将同一流程用于自己的归档。
+[读取第一张瓦片](getting-started.md)使用仓库自带的 PMTiles 合成样例，完成打开文件、注册数据源、启用缓存、发布目录并读取结果。完成后，可以将同一流程用于自己的归档。
 
 ## 操作指南
 
 | 目标 | 阅读文档 | 可完成的操作 |
 | --- | --- | --- |
 | 发布归档或数据库中的瓦片 | [数据源与查询](sources.md) | 接入 PMTiles、MBTiles 和 PostGIS，配置过滤，组合图层，更新数据源 |
-| 使用矢量文件 | [GeoParquet 与本地矢量](geoparquet.md) | 准备 DuckDB 扩展，接入本地或远程 GeoParquet，读取 FlatGeobuf，导入 GeoJSON 与 Shapefile |
+| 使用矢量文件 | [GeoParquet 与本地矢量](geoparquet.md) | 准备 DuckDB 扩展，接入本地或远程 GeoParquet，读取 FlatGeobuf，转换为 GeoParquet |
 | 生成地图或影像图片 | [样式与渲染](rendering.md) | 加载样式，构造渲染请求，配置 COG 与 STAC，生成 WMTS 元数据 |
+| 从 0.3 迁移 | [迁移指南](migration-0.3.md) | 选择 features，迁移读取栈、组合策略和 HTTP 适配 |
 | 开发和验证本库 | [开发与构建](development.md) | 准备工具链，运行检查，配置数据库测试，构建原生渲染后端 |
 
 ## 技术参考
@@ -29,7 +30,7 @@ cargo doc --locked --no-deps --open
 
 [架构与生命周期](architecture.md)说明应用如何组合数据源、缓存和样式，以及内容版本、缓存键、文件变更和关闭操作之间的关系。
 
-公共接口的实现入口包括 [`TileSource`](../src/sources/mod.rs)、[`SourceManager`](../src/sources/manager.rs)、[`TileCache`](../src/cache/tile_cache.rs) 和 [`render`](../src/render/mod.rs)。每篇专题文档链接到其对应的实现，便于核对配置与行为。
+公共接口的实现入口包括 [`TileStack`](../src/service.rs)、[`CatalogService`](../src/control.rs)、[`TileDriver`](../src/control.rs)、[`TileCache`](../src/cache/tile_cache.rs) 和 [`render`](../src/render/mod.rs)。每篇专题文档链接到其对应的实现，便于核对配置与行为。
 
 ## 项目记录
 

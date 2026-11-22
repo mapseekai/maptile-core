@@ -6,60 +6,35 @@
 
 ## 组件职责
 
-| 组件 | 职责 | 应用的接入点 |
-| --- | --- | --- |
-| `TileSource` | 统一源标识、TileJSON、瓦片响应和关闭接口 | 实例化内置源，或实现自定义源 |
-| `SourceManager` | 按 ID 管理源，协调缓存和查询，生成目录快照 | 注册、替换、查询与下线源 |
-| `TileCache` | 按字节计权存储瓦片，管理 TTL/TTI，合并同键并发读取 | 配置缓存容量和有效期 |
-| `filter` | 解析和验证 CQL2 属性条件，生成 SQL 片段 | 配置可查询字段和源的过滤路径 |
-| `styles` | 读取样式、生成样式目录、重写资源 URL | 提供样式路径和应用资源地址 |
-| `raster` | 解析并执行栅格样式相关处理，提供图像编解码组件 | 配置波段、色带、输出与重采样 |
-| `render` | 构造地图请求、生成 WMTS 元数据；按 feature 执行原生渲染 | 创建渲染池，提交静态地图或瓦片请求 |
-| `transport` / `transcode` | 压缩编解码与矢量瓦片格式转换 | 按响应编码和目标格式处理字节 |
-| `discovery` / `watch` | 扫描文件，通知目录变化 | 将文件发现结果转换为具体数据源 |
+| 组件 | 职责 |
+| --- | --- |
+| `TileDriver` / `TileSource` | 自定义源接口及现有数据源接口，提供描述符、瓦片和关闭操作 |
+| `SourceCatalog` / `CatalogSnapshot` | 发布源和组合声明，固定一次请求使用的目录代次 |
+| `CatalogService` | 执行已发布的源或组合，并缓存完整规范瓦片 |
+| `TileStack` / `TileLayer` | 验证请求并按顺序执行调用方定义的层 |
+| `TileCache` | 按字节计权存储瓦片，管理 TTL 和 TTI |
+| `discovery` / `watch` | 扫描文件并通知变更，应用将发现结果映射为目录更新 |
+| `filter`、`styles`、`raster`、`render` | 提供过滤、样式、栅格处理与可选渲染能力 |
 
-应用层维护 HTTP 路由、鉴权、配置加载和资源地址，将这些上下文转为核心库需要的类型。字体和精灵图通过样式中的 glyph/sprite URL 接入，应用负责提供可访问的资源。
+应用负责鉴权、可见范围、配置、HTTP 路由、表示协商及对外地址。TileJSON 描述符只包含源元数据；应用必须补充绝对瓦片地址。
 
 ## 瓦片读取过程
 
-管理器根据查询内容、源的缓存层级策略和已配置缓存，选择读取路径：
+一次读取固定当前 `CatalogSnapshot`、源描述符及组合成员。`TileStack` 检查 XYZ、过滤能力和请求预算，然后按注册顺序进入 `TileLayer`，并按逆序返回。提前返回的瓦片也受大小检查。没有自定义层时直接进入默认 `CatalogService`。
 
-```mermaid
-flowchart TD
-    A["SourceManager 接收源 ID 与 XYZ"] --> B{"请求符合缓存条件"}
-    B -->|是| C["按内容版本与样式查缓存"]
-    B -->|直接查询| D["TileSource 读取或生成瓦片"]
-    C -->|命中| E["返回 TileResponse"]
-    C -->|缺失，同键请求合并| D
-    D --> F["校验载荷，按路径写入缓存"]
-    F --> E
-```
+`TileOutcome::NoTile`、`Present` 与 `Partial` 分别表示无瓦片、完整瓦片和组合降级。合法零字节 MVT 可作为 `Present`。部分结果可包含瓦片，也可没有瓦片。服务端必须对部分结果发送 `Cache-Control: no-store`，不生成强 ETag，并在条件请求时返回部分结果而非 304。
 
-缓存条件包括：管理器已关联缓存、源的 `cache_zoom()` 包含当前层级，以及查询属于可缓存的输入组合。`filter`、`bbox` 和 `url_query` 走直接查询路径；样式与镶嵌像元选择参与缓存身份。实现和对应回归见 [`manager.rs`](../src/sources/manager.rs)。
+`read_batch` 保留输入顺序和空位，`BatchPage.consumed` 表示已处理的坐标数。调用方从该位置继续。`begin_export` 固定跨页的目录条目；仅声明支持一致导出的源可使用。`read_export_page` 的游标检查源修订和请求身份，调用方必须保留稳定的坐标序列、相同的层配置，并对每次请求重新鉴权。
 
-`TileResponse` 携带实际字节、格式、压缩编码和可选修改时间。应用按本次响应的 `info` 处理结果。ETag 读取通过 `get_tile_with_etag` 返回新载荷及验证标识，或返回 `NotModified`。
-
-管理器的普通读取和 ETag 读取都会拒绝非镶嵌源上的 `pixel_selection` 参数，包括源已禁用缓存的情况。直接调用具体源时，由调用方按该源支持的能力构造查询。
-
-批量导出或归档构建可直接调用 `TileSource::read_tile_batch`。每次最多提交 128 个坐标，按 8 MiB 累计预算返回有序前缀，空瓦片保留其位置。非空请求至少返回一个结果，因此首张瓦片可占用超过累计预算的空间；调用方按已返回的长度继续剩余坐标。该入口直接读取源，具体预算和默认流程见 [`sources/mod.rs`](../src/sources/mod.rs)。
+[`SourceManager`](../src/sources/manager.rs) 和其 `get_tile_with_etag` 仍为兼容接口；新接入应使用 `TileStack`，由 HTTP 适配器针对最终表示生成验证标识。两个接口的缓存和生命周期各自独立。
 
 ## 缓存身份与预算
 
-瓦片结果缓存统一由 `SourceManager` 持有。Postgres 表源和函数源只负责读取与编码，直接调用源不会缓存瓦片；需要缓存时，将源注册到 `SourceManager::new().with_cache(cache)` 并通过管理器查询。源的 `cache_zoom()` 与 `content_version()` 仍决定管理器的缓存范围和内容身份。SQL 预编译缓存、归档目录缓存和数据集句柄缓存不属于瓦片结果缓存。
+`CatalogService` 的规范缓存键包含 schema 版本、源和组合修订、调用方指定的可见范围、XYZ、有效样式及镶嵌选择。过滤、bbox 和自定义参数按实现走直接读取。缓存只保存完整 `Present`，不保存部分结果和错误。自定义层改写返回内容时，改写值不会回填规范缓存。层应同步改写实际格式和编码，HTTP 层针对最终字节计算 ETag。
 
-管理器不再用 `Some(empty_query)` 通知源跳过缓存，无参数请求直接传入 `None`。自定义源不能在管理器填充缓存时重入同一个缓存键；如果自定义源自行管理瓦片缓存，应关闭该源的管理器缓存策略。
+源修订必须随数据或影响元数据的配置变化而更新。文件源使用文件身份或打开代次；数据库源可使用持久化编辑修订号；COG 应使用版本化地址或内容标识。远端归档需要不可变对象、固定版本或强 ETag，确保同一次打开的多个 Range 属于同一版本。
 
-动态组合源不缓存整个组，在线读取和 ETag 读取通过管理器缓存本次快照中的成员；请求期间成员重新注册不会改变该快照，下一次请求会使用新成员及其内容版本。批量读取继续直读源。静态组合源可缓存合并后的瓦片，首次合并直接读取其固定成员。
-
-[`TileCacheKey`](../src/cache/tile_cache.rs)由源 ID、内容版本、XYZ 坐标和样式散列组成。栅格输出的有效样式与镶嵌像元选择通过规范化散列区分；同一坐标的不同内容或样式可以拥有独立缓存项。
-
-FlatGeobuf 的 Unix 内容版本纳入完整 FileStamp，包含设备号、inode、ctime、长度与 mtime；其他平台每次打开使用新代次，克隆共享版本。同大小、同 mtime 的替换文件需要重新打开和注册，热缓存不会主动检查磁盘。固定栅格镶嵌还将成员范围纳入版本，因为范围决定本次瓦片的候选；全局统计继续保留全成员及上游 64 个资产的限制，见[成员范围说明](sources.md#固定栅格镶嵌与成员范围)。
-
-内容版本由数据源提供。归档和文件源使用文件身份、对象校验信息或打开代次；PostGIS 表源可结合应用持久化的编辑修订号。COG 的 `content_id` 由应用给出，适合使用版本化 URI 或数据版本标识。自定义源通过 `content_version()` 声明自己的内容身份。
-
-`TileCache::new` 接收容量、TTL 和 TTI。容量参数按 MiB 换算，权重包含瓦片载荷、键和记录开销；进程容量规划还应计入连接池、渲染器、数据解码与其他分配。同一缓存键的并发缺失请求共享一次计算，错误保留其结构化类型。
-
-`invalidate_source` 和 `invalidate_all` 发起失效操作，后台维护完成物理回收。测试可调用 `run_pending_tasks().await` 等待维护处理。实现见 [`tile_cache.rs`](../src/cache/tile_cache.rs)，样式与内容散列见 [`hashing.rs`](../src/cache/hashing.rs)。
+`TileCache::new` 接收按 MiB 计量的容量、TTL 和 TTI。容量不包含连接池、渲染器和其他分配。缓存命中不主动检查文件变化；更新数据后先打开新源并发布新目录。`invalidate_source` 和 `invalidate_all` 发起异步维护，测试可通过 `run_pending_tasks().await` 等待。
 
 ## 并发额度
 
@@ -71,7 +46,25 @@ Postgres 批量查询由每个连接池的 `PoolSettings.batch_concurrency` 控�
 
 取消等待者不会提前归还仍在运行的阻塞任务或 SQL 清理任务的额度。数据库只有确认后端完成才归还额度；无法确认时停止该池的新批量准入，其他池不受影响。此时应先核实数据库残留任务，再重建受影响的池，避免旧任务和新额度叠加。
 
-## 数据源生命周期
+## 目录发布与生命周期
+
+`catalog.update()` 基于当前快照创建更新。通过 `put`、`remove` 和 `composite` 编辑，再调用 `publish`。发布前检查组合依赖，成功后原子切换到新代次。并发发布遇到 `VersionChanged` 时，调用方从新快照重建更新。已固定的请求和导出会话继续读取旧代次。`revoke` 接收观察到的快照，可单独取消并排空该代源。`shutdown` 同时停止发布、读请求和仍有租约的旧代源，超过期限后可再次调用以等待排空。
+
+扫描前调用 `catalog.snapshot().generation()` 记录预期代次。用 `discovery::scan` 或 `scan_async` 获取清单，把该代次与清单传给 `SourceCatalog::reconcile`。扫描或构建期间发生并发发布时，重新从当前代次扫描。应用为每个发现项提供稳定的 ID、数据集身份与修订：
+
+- `Inventory::Complete` 更新所列项，并下线该命名空间中消失的源，保留 ID 与数据集的绑定。
+- `Inventory::Partial` 更新所列项，但不删除未列出的绑定。
+- `Inventory::Failed` 和 `Unchanged` 保留当前目录。
+
+为本地 GeoParquet、FlatGeobuf、Parquet 归档或自定义同步驱动提供发现工厂时，使用 `control::open_blocking`。即使调用方取消发现，目录关闭也会等待已提交的阻塞任务结束。工厂自行启动的其他后台任务需要由工厂或驱动持有并排空。
+
+ID 冲突或工厂返回不同的 ID 会拒绝更新。同一数据集恢复时可以重新使用原 ID；要把该 ID 分给其他数据集，须先显式发布 `CatalogUpdate::remove`。修订未变时复用当前源。扫描本身无法保证是完整清单，只有确认扫描完整后才传入 `Complete`。watcher 的通知可能合并，应用接收通知后应重新扫描，不能把它当作无损事件日志。
+
+发布新版本前准备好不可变文件或对象，打开并校验后一次发布。等待旧代请求和导出结束后再删除旧资源。GeoParquet 和 FlatGeobuf 使用共享查询池，`start_close` 停止准入，`close().await` 等待阻塞查询及文件租约退出，详见[矢量文件指南](geoparquet.md)。
+
+## 兼容 SourceManager
+
+旧接口的管理器按以下规则管理源，不能将这些操作等同于版本化目录的 `publish` 或 `revoke`。
 
 | 操作 | 管理器行为 | 适用场景 |
 | --- | --- | --- |
@@ -93,19 +86,9 @@ Postgres 批量查询由每个连接池的 `PoolSettings.batch_concurrency` 控�
 
 恢复资格按不可用注册项协调，不限制管理操作建立新代次后的工厂，也不接管工厂自行启动的后台任务。工厂负责清理尚未返回的资源；已经开始关闭的实例不能通过重新注册复活。
 
-具体的会话释放过程由源实现。GeoParquet 和 FlatGeobuf 的克隆共享会话，显式 `close().await` 用于等待查询、连接和读取资源退出，详见[矢量文件指南](geoparquet.md)。
-
-DuckDB 查询与 GeoParquet 远程打开只在阻塞闭包开始工作后发布中断句柄。局部守卫借用连接，并在中断共用的互斥锁下解除句柄；正常返回、错误和展开栈时，先等待在途中断退出，再释放连接或归还连接池。未启动的闭包没有已发布句柄，本地矢量导入也在同锁下解除中断句柄。这是针对已知析构窗口的预防性加固，未复现上游 UAF，也未改变锁定 DuckDB 依赖。
-
 替换源后，若应用还需要等待旧对象完全关闭，应在替换前保留旧引用，再对该引用调用 `close().await`。`close_source(id)` 操作的是调用时按 ID 注册的当前源。
 
-## 文件发现与更新
-
-[`discovery::scan`](../src/discovery.rs)与 `scan_async` 扫描数据和样式文件，返回发现报告；[`SourceWatcher`](../src/watch.rs)通知文件变更。应用保留 watcher 并消费事件，把发现信息交给自己的数据源工厂。
-
-watcher 默认保留 300ms 窗口的首个事件，并按种类补发尾沿，创建后迅速删除或原地覆写仍能触发终态重扫。事件通道与待处理路径表各最多 1024 项；拥塞时合并为 `Modified(root)`，在消费者恢复接收后重试，应用需据此重新扫描目录。Drop 会停止自有刷新线程，不等待消费者腾出队列，因此不能将它当作逐条无损事件日志。
-
-MBTiles 在打开时固定相对路径对应的绝对别名，后续 chdir 不改变源身份；文件替换、WAL 更新和 symlink 目标切换仍触发旧源失效。
+### 兼容管理器的发现重载
 
 `reload_from_discovery` 根据 ID 同步新增与删除条目，就绪源保持当前对象。报告中仍存在的不可用源会重新调用工厂构建；报告中已消失的 ID 会被移除，包括不可用记录，并列入 `ReloadDelta.removed`。对已有文件内容或配置的更新，应用重新打开具体源，再调用 `register`。这让文件发布、元数据检查和内容版本更新具有明确的接入位置。
 
@@ -113,15 +96,14 @@ MBTiles 在打开时固定相对路径对应的绝对别名，后续 chdir 不�
 
 工厂返回源的 `id()` 必须等于对应发现项的 ID。重载在发布前检查这一条件；不匹配返回 `Config`，并开始关闭本次已构建但未发布的源，保留原注册表状态。工厂若返回仍在注册表中的同一个 `Arc`，清理会保留该实例。
 
-发现报告中的源 ID 必须唯一，即使对应源已经就绪也不能重复。重载在调用任何工厂或修改注册表前检查完整报告，重复则返回 `Config`；现有就绪源和不可用记录保持不变。标准 `scan` 已处理文件重名，手工构造或合并的报告也需遵守这一约束。
+发现报告中的源 ID 必须唯一，即使对应源已经就绪也不能重复。重载在调用任何工厂或修改注册表前检查完整报告，重复则返回 `Config`；现有就绪源和不可用记录保持不变。标准 `scan` 遇到冲突会返回错误，应用可为路径显式配置稳定 ID。
 
-对于远程文件和对象存储，使用不可变、带版本的地址可以使数据快照与缓存身份保持一致。应用在发布成功后切换源，并按生命周期策略处理旧对象。
 
 ## 数据库与图像输入边界
 
 PostgreSQL 连接显式选择 rustls ring provider，无需宿主初始化全局 provider。`prefer` 在 TCP 上先尝试 TLS，只有服务器明确不支持 TLS 才回退；`require` 必须通过证书链与主机名校验。`disable` 保持明文，Unix socket 可用 disable/prefer；锁定驱动仅接受这三种模式，详见 [TLS 连接](sources.md#tls-连接)。
 
-PostGIS 表的普通、批量和过滤路径统一由 SQL 保留 MVT buffer 内的相交要素；普通和批量的 minzoom 短路不变。PostgreSQL 表/函数/OutDB 与独立 DuckDB 的坐标和 typed bbox 入口拒绝非法 XYZ 或非有限 bbox，返回 InvalidRequest；有限 bbox 保留各源既有语义，不自动新增日期线拆分。函数与 OutDB SQL 使用统一标识符转义，支持名称中的合法双引号。
+PostGIS 表的普通、批量和过滤路径统一由 SQL 保留 MVT buffer 内的相交要素；普通和批量的 minzoom 短路不变。PostgreSQL 表/函数/OutDB 的坐标和 typed bbox 入口拒绝非法 XYZ 或非有限 bbox，返回 InvalidRequest；有限 bbox 保留各源既有语义，不自动新增日期线拆分。函数与 OutDB SQL 使用统一标识符转义，支持名称中的合法双引号。
 
 PNG/WebP 编码将 1、3、4 波段的无效 mask 像素编码为透明像素，JPEG 继续忽略 alpha。Overlay 的括号、UTF-8 颜色和 polyline 整数边界通过解析检查处理，原生池的 panic guard 保留；URL 查询后缀按资源自身查询串合并到 fragment 前，并保留非查询后缀的直接追加用途。兼容性细节见[样式与渲染](rendering.md)。
 

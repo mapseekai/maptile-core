@@ -16,6 +16,42 @@ const MAX_LEAF_DEPTH: usize = 6;
 const MAX_SAMPLE_READS: usize = 1024;
 pub(super) const IO_TIMEOUT: Duration = Duration::from_secs(10);
 
+fn backend_error(error: pmtiles::PmtError) -> MaptileError {
+    match error {
+        pmtiles::PmtError::SourceModified => {
+            MaptileError::VersionChanged("PMTiles object changed".into())
+        }
+        pmtiles::PmtError::Http(ref error) if error.is_timeout() => MaptileError::Deadline,
+        pmtiles::PmtError::Http(ref error)
+            if error.is_connect()
+                || error
+                    .status()
+                    .is_some_and(|s| matches!(s.as_u16(), 502..=504)) =>
+        {
+            MaptileError::SourceUnavailable(error.to_string())
+        }
+        other => MaptileError::backend(other),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    struct Stalled;
+    impl AsyncBackend for Stalled {
+        async fn read(&self, _: usize, _: usize) -> pmtiles::PmtResult<pmtiles::BackendResponse> {
+            std::future::pending().await
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn stalled_open_returns_typed_deadline() {
+        assert!(matches!(
+            Reader::open(Stalled).await,
+            Err(MaptileError::Deadline)
+        ));
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct Range {
     offset: u64,
@@ -135,8 +171,8 @@ impl<B: AsyncBackend + Send + Sync> Reader<B> {
     pub(super) async fn open(backend: B) -> MaptileResult<Self> {
         let initial = tokio::time::timeout(IO_TIMEOUT, backend.read(0, INITIAL_BYTES))
             .await
-            .map_err(MaptileError::backend)?
-            .map_err(MaptileError::backend)?;
+            .map_err(|_| MaptileError::Deadline)?
+            .map_err(backend_error)?;
         if initial.bytes.len() < HEADER_BYTES {
             return Err(invalid_range());
         }
@@ -183,13 +219,14 @@ impl<B: AsyncBackend + Send + Sync> Reader<B> {
         if length == 0 {
             return Ok(Bytes::new());
         }
-        let response = self
-            .backend
-            .read_exact(offset, length)
+        let response = tokio::time::timeout(IO_TIMEOUT, self.backend.read_exact(offset, length))
             .await
-            .map_err(MaptileError::backend)?;
+            .map_err(|_| MaptileError::Deadline)?
+            .map_err(backend_error)?;
         if self.version.is_some() && self.version != response.data_version_string {
-            return Err(MaptileError::backend(pmtiles::PmtError::SourceModified));
+            return Err(MaptileError::VersionChanged(
+                "PMTiles object changed".into(),
+            ));
         }
         Ok(response.bytes)
     }
@@ -243,7 +280,7 @@ impl<B: AsyncBackend + Send + Sync> Reader<B> {
             ))
         })
         .await
-        .map_err(MaptileError::backend)?
+        .map_err(|_| MaptileError::Deadline)?
     }
 
     pub(super) async fn sample_tile(&self) -> MaptileResult<Bytes> {
@@ -276,7 +313,7 @@ impl<B: AsyncBackend + Send + Sync> Reader<B> {
     ) -> MaptileResult<serde_json::Map<String, serde_json::Value>> {
         let raw = tokio::time::timeout(IO_TIMEOUT, self.read(self.metadata, MAX_INDEX_BYTES))
             .await
-            .map_err(MaptileError::backend)??;
+            .map_err(|_| MaptileError::Deadline)??;
         let encoding = pmt_compression_to_encoding(self.header.internal_compression())?;
         run_blocking(move || {
             let decoded = decode_with_limit(&raw, encoding, MAX_INDEX_BYTES)?;

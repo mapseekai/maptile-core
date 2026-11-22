@@ -23,6 +23,11 @@ pub const MAX_DECODED_TILE_BYTES: usize = 16 * 1024 * 1024;
 
 static BLOCKING_SLOTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
+tokio::task_local! {
+    pub(crate) static SOURCE_READ_LEASE: Arc<crate::control::SourceReadLease>;
+    pub(crate) static CATALOG_BUILD_LEASE: Arc<crate::control::CatalogBuildLease>;
+}
+
 /// Configure the process-wide budget for this crate's bounded blocking work.
 /// Call once at application startup, before opening sources or running async
 /// decoding, encoding or other bounded CPU work. Without configuration the
@@ -70,9 +75,10 @@ pub fn decode_with_limit(
             check_decoded_size(data.len(), max_bytes)?;
             Ok(data.clone())
         }
-        TileEncoding::Gzip => read_decoded(flate2::read::GzDecoder::new(&data[..]), max_bytes),
+        TileEncoding::Gzip => read_decoded(flate2::read::MultiGzDecoder::new(&data[..]), max_bytes),
         TileEncoding::Zlib => read_decoded(flate2::read::ZlibDecoder::new(&data[..]), max_bytes),
         TileEncoding::Brotli => read_decoded(brotli::Decompressor::new(&data[..], 4096), max_bytes),
+        #[cfg(feature = "zstd")]
         TileEncoding::Zstd => {
             let mut reader = zstd::stream::read::Decoder::new(&data[..])
                 .map_err(|e| MaptileError::Transcode(format!("zstd decode: {e}")))?;
@@ -82,6 +88,8 @@ pub fn decode_with_limit(
                 .map_err(|e| MaptileError::Transcode(format!("zstd window: {e}")))?;
             read_decoded(reader, max_bytes)
         }
+        #[cfg(not(feature = "zstd"))]
+        TileEncoding::Zstd => Err(zstd_unavailable()),
     }
 }
 
@@ -123,12 +131,39 @@ pub(crate) async fn run_blocking<T: Send + 'static>(
         .acquire_owned()
         .await
         .map_err(MaptileError::backend)?;
-    tokio::task::spawn_blocking(move || {
+    spawn_blocking(move || {
         let _permit = permit;
         work()
     })
     .await
     .map_err(MaptileError::backend)?
+}
+
+/// Keep catalog ownership through the worker and the disposal of an abandoned result.
+pub(crate) fn spawn_blocking<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> impl Future<Output = Result<T, tokio::task::JoinError>> {
+    let reading = SOURCE_READ_LEASE.try_with(Arc::clone).ok();
+    let building = CATALOG_BUILD_LEASE.try_with(Arc::clone).ok();
+    let job = tokio::task::spawn_blocking(move || (work(), reading, building));
+    async move { job.await.map(|(result, _, _)| result) }
+}
+
+#[cfg(any(feature = "postgres", feature = "mbtiles"))]
+pub(crate) async fn finish_discovery_open<T: Send + 'static>(
+    open: impl Future<Output = MaptileResult<T>> + Send + 'static,
+) -> MaptileResult<T> {
+    let Ok(lease) = CATALOG_BUILD_LEASE.try_with(Arc::clone) else {
+        return open.await;
+    };
+    // A cancelled waiter can leave a database worker running or discard its newly opened pool.
+    let (result, _) = tokio::spawn(async move {
+        let result = CATALOG_BUILD_LEASE.scope(lease.clone(), open).await;
+        (result, lease)
+    })
+    .await
+    .map_err(MaptileError::backend)?;
+    result
 }
 
 /// Decode on a bounded blocking worker, keeping CPU work off Tokio workers.
@@ -166,7 +201,10 @@ pub fn encode_as(uncompressed: &[u8], encoding: TileEncoding) -> MaptileResult<B
         TileEncoding::Gzip => gzip_encode(uncompressed).map(Bytes::from),
         TileEncoding::Zlib => zlib_encode(uncompressed).map(Bytes::from),
         TileEncoding::Brotli => brotli_encode(uncompressed).map(Bytes::from),
+        #[cfg(feature = "zstd")]
         TileEncoding::Zstd => zstd_encode(uncompressed).map(Bytes::from),
+        #[cfg(not(feature = "zstd"))]
+        TileEncoding::Zstd => Err(zstd_unavailable()),
     }
 }
 
@@ -223,9 +261,15 @@ fn brotli_encode(data: &[u8]) -> MaptileResult<Vec<u8>> {
     Ok(out)
 }
 
+#[cfg(feature = "zstd")]
 fn zstd_encode(data: &[u8]) -> MaptileResult<Vec<u8>> {
     zstd::stream::encode_all(data, 0)
         .map_err(|e| MaptileError::Transcode(format!("zstd encode: {e}")))
+}
+
+#[cfg(not(feature = "zstd"))]
+fn zstd_unavailable() -> MaptileError {
+    MaptileError::Unsupported("zstd requires the zstd feature".into())
 }
 
 /// Inspect the first few bytes for a magic-number match. Useful when a source
@@ -337,6 +381,7 @@ mod tests {
             TileEncoding::Gzip,
             TileEncoding::Zlib,
             TileEncoding::Brotli,
+            #[cfg(feature = "zstd")]
             TileEncoding::Zstd,
         ] {
             let encoded = encode_as(&raw, encoding).unwrap();
@@ -374,6 +419,20 @@ mod tests {
     }
 
     #[test]
+    fn concatenated_gzip_members_share_one_output_limit() {
+        let member = encode_as(b"abc", TileEncoding::Gzip).unwrap();
+        let stream = Bytes::from([member.as_ref(), member.as_ref()].concat());
+        assert_eq!(
+            decode_with_limit(&stream, TileEncoding::Gzip, 6).unwrap(),
+            &b"abcabc"[..]
+        );
+        assert!(matches!(
+            decode_with_limit(&stream, TileEncoding::Gzip, 5),
+            Err(MaptileError::PayloadTooLarge { .. })
+        ));
+    }
+
+    #[test]
     fn roundtrip_zlib() {
         let encoded = encode_as(SAMPLE, TileEncoding::Zlib).unwrap();
         let decoded = decode(&encoded, TileEncoding::Zlib).unwrap();
@@ -387,12 +446,22 @@ mod tests {
         assert_eq!(&decoded[..], SAMPLE);
     }
 
+    #[cfg(feature = "zstd")]
     #[test]
     fn roundtrip_zstd() {
         let encoded = encode_as(SAMPLE, TileEncoding::Zstd).unwrap();
         assert_eq!(sniff_encoding(&encoded), Some(TileEncoding::Zstd));
         let decoded = decode(&encoded, TileEncoding::Zstd).unwrap();
         assert_eq!(&decoded[..], SAMPLE);
+    }
+
+    #[cfg(not(feature = "zstd"))]
+    #[test]
+    fn zstd_is_detected_and_rejected_without_codec() {
+        let frame = Bytes::from_static(&[0x28, 0xb5, 0x2f, 0xfd]);
+        assert_eq!(sniff_encoding(&frame), Some(TileEncoding::Zstd));
+        assert!(decode(&frame, TileEncoding::Zstd).is_err());
+        assert!(encode_as(SAMPLE, TileEncoding::Zstd).is_err());
     }
 
     #[test]
@@ -409,6 +478,7 @@ mod tests {
         assert_eq!(encoded, again);
     }
 
+    #[cfg(feature = "zstd")]
     #[test]
     fn recode_gzip_to_zstd() {
         let gz = encode_as(SAMPLE, TileEncoding::Gzip).unwrap();

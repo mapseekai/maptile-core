@@ -159,16 +159,12 @@ impl TileSource for CompositeSource {
         coords: &[TileCoord],
         query: Option<&TileQuery<'_>>,
     ) -> MaptileResult<Vec<TileResponse>> {
+        super::validate_source_request(self, coords, query)?;
         read_tile_batch_with(coords, self.tile_info(), |coord| async move {
             let mut results = Vec::new();
             let mut remaining = MAX_COMPOSITE_BYTES;
             for child in &self.children {
-                let q = if child.source.supports_url_query() || child.source.supports_filter() {
-                    query
-                } else {
-                    None
-                };
-                let result = match child.source.read_tile_batch(&[coord], q).await {
+                let result = match child.source.read_tile_batch(&[coord], query).await {
                     Ok(mut tiles) if tiles.len() == 1 => Ok(tiles.remove(0)),
                     Ok(_) => Err(MaptileError::InvalidMetadata(
                         "composite child returned an invalid batch length".into(),
@@ -187,11 +183,15 @@ impl TileSource for CompositeSource {
     }
 
     fn supports_url_query(&self) -> bool {
-        self.children.iter().any(|c| c.source.supports_url_query())
+        self.children.iter().all(|c| c.source.supports_url_query())
+    }
+
+    fn supports_bbox(&self) -> bool {
+        self.children.iter().all(|c| c.source.supports_bbox())
     }
 
     fn supports_filter(&self) -> bool {
-        self.children.iter().any(|c| c.source.supports_filter())
+        self.children.iter().all(|c| c.source.supports_filter())
     }
 }
 
@@ -206,14 +206,10 @@ impl CompositeSource {
         F: Fn(Arc<dyn TileSource>, Option<&'a TileQuery<'a>>) -> Fut,
         Fut: std::future::Future<Output = MaptileResult<TileResponse>>,
     {
+        super::validate_source_request(self, &[xyz], query)?;
         let mut reads = stream::iter(0..self.children.len())
             .map(|index| {
                 let child = &self.children[index];
-                let query = if child.source.supports_url_query() || child.source.supports_filter() {
-                    query
-                } else {
-                    None
-                };
                 let tile = read(child.source.clone(), query);
                 async move { (child, tile.await) }
             })

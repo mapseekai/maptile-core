@@ -8,50 +8,84 @@ use super::{
 use crate::cache::ContentVersion;
 use crate::error::{MaptileError, MaptileResult};
 use crate::sources::archive_inspection::ArchiveSourceType;
+use crate::sources::strong_http_etag as strong_etag;
 use crate::sources::{SourceKind, TileCoord, TileInfo, TileQuery, TileResponse, TileSource};
 use async_trait::async_trait;
 use bytes::BytesMut;
 use pmtiles::reqwest::{self, StatusCode, header};
 use pmtiles::{AsyncBackend, BackendResponse, PmtError, PmtResult};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tilejson::TileJSON;
 
 struct HttpBackend {
     client: reqwest::Client,
     url: String,
+    identity: OnceLock<(String, u64, String)>,
 }
 
 impl AsyncBackend for HttpBackend {
     async fn read(&self, offset: usize, length: usize) -> PmtResult<BackendResponse> {
-        let end = offset + length - 1;
-        let mut response = self
+        let end = offset
+            .checked_add(length)
+            .and_then(|end| end.checked_sub(1))
+            .ok_or_else(|| {
+                PmtError::Reading(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "invalid PMTiles range",
+                ))
+            })?;
+        let mut request = self
             .client
             .get(&self.url)
             .header(header::RANGE, format!("bytes={offset}-{end}"))
-            .header(header::ACCEPT_ENCODING, "identity")
-            .send()
-            .await
-            .map_err(reqwest::Error::without_url)?
+            .header(header::ACCEPT_ENCODING, "identity");
+        if let Some((etag, _, _)) = self.identity.get() {
+            request = request.header(header::IF_MATCH, etag);
+        }
+        let response = request.send().await.map_err(reqwest::Error::without_url)?;
+        if response.status() == StatusCode::PRECONDITION_FAILED {
+            return Err(PmtError::SourceModified);
+        }
+        if self.identity.get().is_some() && response.status() == StatusCode::NOT_FOUND {
+            return Err(PmtError::SourceModified);
+        }
+        let mut response = response
             .error_for_status()
             .map_err(reqwest::Error::without_url)?;
         if response.status() != StatusCode::PARTIAL_CONTENT {
             return Err(PmtError::RangeRequestsUnsupported);
         }
-        let (expected, total) = content_range(response.headers(), offset, end)?;
-        let version = response
+        if response
             .headers()
-            .get(header::ETAG)
-            .and_then(|etag| etag.to_str().ok())
-            .filter(|etag| etag.starts_with('"') && etag.ends_with('"'))
-            .map(|etag| format!("etag:{total}:{etag}"))
-            .or_else(|| {
-                response
-                    .headers()
-                    .get(header::LAST_MODIFIED)
-                    .and_then(|value| value.to_str().ok())
-                    .map(|value| format!("modified:{total}:{value}"))
-            })
-            .unwrap_or_else(|| format!("length:{total}"));
+            .get(header::CONTENT_ENCODING)
+            .is_some_and(|value| value != "identity")
+        {
+            return Err(PmtError::RangeRequestsUnsupported);
+        }
+        let (expected, total) = content_range(response.headers(), offset, end)?;
+        let etag = strong_etag(response.headers())
+            .ok_or_else(|| {
+                if self.identity.get().is_some() {
+                    return PmtError::SourceModified;
+                }
+                PmtError::Reading(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "PMTiles requires a strong ETag",
+                ))
+            })?
+            .to_owned();
+        let identity = (etag, total, response.url().as_str().to_owned());
+        if let Some(expected) = self.identity.get() {
+            if expected != &identity {
+                return Err(PmtError::SourceModified);
+            }
+        } else if self.identity.set(identity.clone()).is_err()
+            && self.identity.get() != Some(&identity)
+        {
+            return Err(PmtError::SourceModified);
+        }
+        let resource = blake3::hash(identity.2.as_bytes());
+        let version = format!("etag:{total}:{resource}:{}", identity.0);
         let mut bytes = BytesMut::new();
         while let Some(chunk) = response
             .chunk()
@@ -138,6 +172,7 @@ impl HttpPmtilesSource {
         let reader = Reader::open(HttpBackend {
             client,
             url: cfg.path.clone(),
+            identity: OnceLock::new(),
         })
         .await?;
         let stable = reader
@@ -191,10 +226,10 @@ impl TileSource for HttpPmtilesSource {
     async fn get_tile(
         &self,
         xyz: TileCoord,
-        _query: Option<&TileQuery<'_>>,
+        query: Option<&TileQuery<'_>>,
     ) -> MaptileResult<TileResponse> {
-        let coord = pmtiles::TileCoord::new(xyz.z, xyz.x, xyz.y)
-            .map_err(|_| MaptileError::TileNotFound(xyz.z, xyz.x, xyz.y))?;
+        crate::sources::validate_source_request(self, &[xyz], query)?;
+        let coord = super::checked_coord(xyz)?;
         let bytes = self
             .reader
             .get_tile(coord)
@@ -223,5 +258,58 @@ mod tests {
         headers.insert(CONTENT_RANGE, "bytes 0-199/200".parse().unwrap());
         assert_eq!(content_range(&headers, 0, 16383).unwrap(), (200, 200));
         assert!(content_range(&headers, 1, 16383).is_err());
+    }
+
+    #[test]
+    fn weak_missing_and_malformed_etags_are_rejected() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(strong_etag(&headers), None);
+        for tag in ["W/\"weak\"", "*", "unquoted", "\"bad\"tag\""] {
+            headers.insert(header::ETAG, tag.parse().unwrap());
+            assert_eq!(strong_etag(&headers), None);
+        }
+        headers.insert(header::ETAG, "\"strong\"".parse().unwrap());
+        assert_eq!(strong_etag(&headers), Some("\"strong\""));
+    }
+
+    #[tokio::test]
+    async fn pins_etag_and_rejects_equal_length_replacement() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for index in 0..2 {
+                let (socket, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = socket.into_split();
+                let mut reader = BufReader::new(reader);
+                let mut headers = String::new();
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).await.unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    headers.push_str(&line.to_ascii_lowercase());
+                }
+                if index == 1 {
+                    assert!(headers.contains("if-match: \"one\""));
+                }
+                let etag = if index == 0 { "one" } else { "two" };
+                let body = if index == 0 { "abcd" } else { "wxyz" };
+                writer.write_all(format!("HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\nContent-Range: bytes 0-3/4\r\nETag: \"{etag}\"\r\nConnection: close\r\n\r\n{body}").as_bytes()).await.unwrap();
+            }
+        });
+        let backend = HttpBackend {
+            client: reqwest::Client::new(),
+            url: format!("http://{addr}/tiles"),
+            identity: OnceLock::new(),
+        };
+        assert_eq!(backend.read(0, 4).await.unwrap().bytes, "abcd");
+        assert!(matches!(
+            backend.read(0, 4).await,
+            Err(PmtError::SourceModified)
+        ));
+        server.await.unwrap();
     }
 }

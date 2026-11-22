@@ -4,7 +4,10 @@
 
 use maptile_core::sources::pmtiles::{HttpPmtilesSource, PmtilesConfig};
 use maptile_core::sources::{TileCoord, TileFormat, TileSource};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
@@ -15,7 +18,10 @@ const FIXTURE_PATH: &str = "tests/fixtures/sample.pmtiles";
 /// response with the requested slice.  Requests without a Range header get
 /// the full body with status `200`.  The server shuts down when `shutdown_tx`
 /// is dropped.
-async fn start_range_server(data: Arc<Vec<u8>>) -> (u16, tokio::sync::oneshot::Sender<()>) {
+async fn start_range_server(
+    data: Arc<Vec<u8>>,
+    unavailable: Arc<AtomicBool>,
+) -> (u16, tokio::sync::oneshot::Sender<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -27,7 +33,7 @@ async fn start_range_server(data: Arc<Vec<u8>>) -> (u16, tokio::sync::oneshot::S
                 res = listener.accept() => {
                     let (stream, _) = res.unwrap();
                     let data = data.clone();
-                    tokio::spawn(handle_connection(stream, data));
+                    tokio::spawn(handle_connection(stream, data, unavailable.load(Ordering::Acquire)));
                 }
             }
         }
@@ -36,7 +42,7 @@ async fn start_range_server(data: Arc<Vec<u8>>) -> (u16, tokio::sync::oneshot::S
     (port, shutdown_tx)
 }
 
-async fn handle_connection(stream: tokio::net::TcpStream, data: Arc<Vec<u8>>) {
+async fn handle_connection(stream: tokio::net::TcpStream, data: Arc<Vec<u8>>, unavailable: bool) {
     let (reader, mut writer) = stream.into_split();
     let mut buf_reader = BufReader::new(reader);
 
@@ -55,6 +61,11 @@ async fn handle_connection(stream: tokio::net::TcpStream, data: Arc<Vec<u8>>) {
         if lower.starts_with("range:") {
             range_header = Some(trimmed["range:".len()..].trim().to_string());
         }
+    }
+
+    if unavailable {
+        writer.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+        return;
     }
 
     // Parse optional `bytes=X-Y`.
@@ -81,6 +92,7 @@ async fn handle_connection(stream: tokio::net::TcpStream, data: Arc<Vec<u8>>) {
         "HTTP/1.1 {status}\r\n\
          Content-Type: application/octet-stream\r\n\
          Content-Length: {content_len}\r\n\
+         ETag: \"fixture-v1\"\r\n\
          {content_range}\
          Accept-Ranges: bytes\r\n\
          Connection: close\r\n\
@@ -99,7 +111,8 @@ async fn open_and_get_tile_over_http() {
     let bytes = tokio::fs::read(FIXTURE_PATH).await.unwrap();
     let data = Arc::new(bytes);
 
-    let (port, _shutdown) = start_range_server(data).await;
+    let unavailable = Arc::new(AtomicBool::new(false));
+    let (port, _shutdown) = start_range_server(data, unavailable.clone()).await;
 
     let cfg = PmtilesConfig {
         id: "h".into(),
@@ -117,4 +130,10 @@ async fn open_and_get_tile_over_http() {
         .await
         .unwrap();
     assert!(!resp.data.is_empty(), "tile data should be non-empty");
+    unavailable.store(true, Ordering::Release);
+    let error = src
+        .get_tile(TileCoord { z: 0, x: 0, y: 0 }, None)
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), maptile_core::error::ErrorKind::Unavailable);
 }

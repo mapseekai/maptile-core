@@ -11,7 +11,7 @@ use geo_types::{Coord, Geometry, LineString, Polygon};
 use mlt_core::fast_mvt::{MvtReaderRef, MvtTileBuilder, MvtValue, MvtValueRef};
 use mlt_core::{LendingIterator, ParsedLayer, PropValueRef};
 use prost::encoding::{DecodeContext, WireType, decode_key, decode_varint, skip_field};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 const CONVERSION_WORK_BYTES: usize = 64 * 1024 * 1024;
 
@@ -47,14 +47,15 @@ fn take_frame<'a>(input: &mut &'a [u8]) -> MaptileResult<&'a [u8]> {
 
 fn protobuf_fields(
     mut input: &[u8],
-    mut message: impl FnMut(u32, &[u8]) -> MaptileResult<()>,
+    mut field: impl FnMut(u32, WireType, &[u8]) -> MaptileResult<()>,
 ) -> MaptileResult<()> {
     while !input.is_empty() {
         let (tag, wire) = decode_key(&mut input).map_err(transcode_error)?;
         if wire == WireType::LengthDelimited {
-            message(tag, take_frame(&mut input)?)?;
+            field(tag, wire, take_frame(&mut input)?)?;
         } else {
             skip_field(wire, tag, &mut input, DecodeContext::default()).map_err(transcode_error)?;
+            field(tag, wire, &[])?;
         }
     }
     Ok(())
@@ -63,42 +64,98 @@ fn protobuf_fields(
 fn check_mvt_wire(bytes: &[u8], mut remaining: usize) -> MaptileResult<()> {
     // The borrowed protobuf reader still allocates repeated objects and packed integers.
     charge(&mut remaining, bytes.len().saturating_mul(4))?;
-    protobuf_fields(bytes, |tag, layer| {
-        if tag == 3 {
-            charge(&mut remaining, 256)?;
-            protobuf_fields(layer, |tag, _| match tag {
-                2 => charge(&mut remaining, 256), // feature
-                3 => charge(&mut remaining, 32),  // key
-                4 => charge(&mut remaining, 192), // value
-                _ => Ok(()),
-            })?;
+    use WireType::{LengthDelimited, Varint};
+    protobuf_fields(bytes, |tag, wire, layer| {
+        if (tag, wire) != (3, LengthDelimited) {
+            return Err(unsupported("MVT tile field"));
         }
-        Ok(())
+        charge(&mut remaining, 256)?;
+        protobuf_fields(layer, |tag, wire, data| match (tag, wire) {
+            (1, LengthDelimited) | (5 | 15, Varint) => Ok(()),
+            (2, LengthDelimited) => {
+                charge(&mut remaining, 256)?;
+                protobuf_fields(data, |tag, wire, _| match (tag, wire) {
+                    (1 | 3, Varint) | (2 | 4, Varint | LengthDelimited) => Ok(()),
+                    _ => Err(unsupported("MVT feature field")),
+                })
+            }
+            (3, LengthDelimited) => charge(&mut remaining, 32),
+            (4, LengthDelimited) => {
+                charge(&mut remaining, 192)?;
+                let mut fields = 0;
+                protobuf_fields(data, |tag, wire, _| {
+                    fields += 1;
+                    match (tag, wire) {
+                        (1, LengthDelimited)
+                        | (2, WireType::ThirtyTwoBit)
+                        | (3, WireType::SixtyFourBit)
+                        | (4..=7, Varint)
+                            if fields == 1 =>
+                        {
+                            Ok(())
+                        }
+                        _ => Err(unsupported("MVT property value")),
+                    }
+                })?;
+                if fields != 1 {
+                    return Err(unsupported("empty MVT property value"));
+                }
+                Ok(())
+            }
+            _ => Err(unsupported("MVT layer field")),
+        })
     })
+}
+
+fn unsupported(content: &str) -> MaptileError {
+    MaptileError::Unsupported(format!(
+        "cannot preserve {content} during MVT/MLT conversion"
+    ))
 }
 
 fn check_mvt_work(bytes: &[u8], mut remaining: usize) -> MaptileResult<()> {
     let reader = MvtReaderRef::new(bytes).map_err(transcode_error)?;
+    let mut layers = HashSet::new();
     for layer in reader.layers() {
+        if layer.version() != 2 || !layers.insert(layer.name()) {
+            return Err(unsupported("MVT layer version or duplicate layer name"));
+        }
         let features = layer.feature_count();
+        if features == 0 {
+            return Err(unsupported("empty MVT layer"));
+        }
         charge(
             &mut remaining,
             256usize.saturating_add(features.saturating_mul(128)),
         )?;
-        let mut columns = HashSet::new();
+        let mut columns = HashMap::new();
+        let mut feature_keys = HashSet::new();
         for feature in layer.features() {
+            feature_keys.clear();
             charge(
                 &mut remaining,
                 feature.geometry_commands().len().saturating_mul(16),
             )?;
             for property in feature.properties() {
                 let (key, value) = property.map_err(transcode_error)?;
+                if !feature_keys.insert(key) {
+                    return Err(unsupported("duplicate MVT feature property"));
+                }
+                let column_type = std::mem::discriminant(&match value {
+                    MvtValueRef::Int(n) => MvtValueRef::SInt(n),
+                    MvtValueRef::Null => return Err(unsupported("null MVT property value")),
+                    other => other,
+                });
                 let string_bytes = match value {
                     MvtValueRef::String(text) => text.len(),
                     _ => 0,
                 };
                 charge(&mut remaining, 32usize.saturating_add(string_bytes))?;
-                if columns.insert(key) {
+                if let Some(previous) = columns.insert(key, column_type) {
+                    if previous != column_type {
+                        return Err(unsupported("mixed MVT property types in one column"));
+                    }
+                } else {
                     // mlt-core allocates a typed property slot even for an absent value.
                     charge(
                         &mut remaining,
@@ -120,10 +177,12 @@ pub fn mvt_to_mlt(mvt_bytes: &[u8]) -> MaptileResult<Bytes> {
     check_mvt_work(mvt_bytes, CONVERSION_WORK_BYTES)?;
     let layers = mlt_core::mvt::mvt_to_tile_layers(mvt_bytes).map_err(transcode_error)?;
     let mut output = Vec::new();
+    let config = mlt_core::encoder::EncoderConfig::default()
+        .with_spatial_morton_sort(false)
+        .with_spatial_hilbert_sort(false)
+        .with_id_sort(false);
     for layer in layers {
-        let encoded = layer
-            .encode(mlt_core::encoder::EncoderConfig::default())
-            .map_err(transcode_error)?;
+        let encoded = layer.encode(config).map_err(transcode_error)?;
         check_tile_size(output.len().saturating_add(encoded.len()))?;
         output.extend_from_slice(&encoded);
     }
@@ -138,6 +197,7 @@ pub fn mlt_to_mvt(mlt_bytes: &[u8]) -> MaptileResult<Bytes> {
     let mut remaining = CONVERSION_WORK_BYTES;
     let mut tile = MvtTileBuilder::new();
     let mut input = mlt_bytes;
+    let mut layer_names = HashSet::new();
     while !input.is_empty() {
         let start = input;
         let frame = take_frame(&mut input)?;
@@ -146,7 +206,7 @@ pub fn mlt_to_mvt(mlt_bytes: &[u8]) -> MaptileResult<Bytes> {
             .ok_or_else(|| transcode_error("empty MLT frame"))?;
         charge(&mut remaining, 128)?;
         if tag != 1 {
-            continue;
+            return Err(unsupported("MLT frame version"));
         }
         let layer = parser
             .parse_layers(&start[..start.len() - input.len()])
@@ -155,16 +215,23 @@ pub fn mlt_to_mvt(mlt_bytes: &[u8]) -> MaptileResult<Bytes> {
             .ok_or_else(|| transcode_error("missing MLT layer"))?;
         let ParsedLayer::Tag01(layer) = layer.decode_all(&mut decoder).map_err(transcode_error)?
         else {
-            continue;
+            return Err(unsupported("MLT layer type"));
         };
+        if !layer_names.insert(layer.name().to_owned()) {
+            return Err(unsupported("duplicate MLT layer name"));
+        }
         let count = layer.feature_count();
         let mut names = Vec::new();
+        let mut names_seen = HashSet::new();
         for name in layer.iterate_prop_names() {
             let name = name.to_string();
             charge(
                 &mut remaining,
                 name.len().saturating_add(size_of::<String>()),
             )?;
+            if !names_seen.insert(name.clone()) {
+                return Err(unsupported("duplicate MLT property name"));
+            }
             names.push(name);
         }
         charge(
@@ -302,6 +369,31 @@ mod tests {
         assert!(matches!(
             check_geometry(&unrepresentable),
             Err(MaptileError::Transcode(_))
+        ));
+    }
+
+    #[test]
+    fn unknown_frames_and_properties_with_mixed_types_are_rejected() {
+        let error = mlt_to_mvt(&[1, 2]).unwrap_err();
+        assert!(matches!(error, MaptileError::Unsupported(_)));
+
+        let geometry = Geometry::Point(geo_types::Point::new(1, 1));
+        let layer = MvtTileBuilder::new().layer("roads").unwrap();
+        let mut first = layer.feature(&geometry).unwrap();
+        first.tag("value", MvtValue::SInt(-7)).unwrap();
+        let mut second = first.end().feature(&geometry).unwrap();
+        second.tag("value", MvtValue::UInt(u64::MAX)).unwrap();
+        let err = mvt_to_mlt(&second.end().encode()).unwrap_err();
+        assert!(matches!(err, MaptileError::Unsupported(_)));
+    }
+
+    #[test]
+    fn rejects_empty_layers_and_preserves_empty_tiles() {
+        assert!(mlt_to_mvt(&mvt_to_mlt(&[]).unwrap()).unwrap().is_empty());
+        let mvt = MvtTileBuilder::new().layer("empty").unwrap().encode();
+        assert!(matches!(
+            mvt_to_mlt(&mvt),
+            Err(MaptileError::Unsupported(_))
         ));
     }
 

@@ -10,6 +10,7 @@
 | --- | --- | --- |
 | PostgreSQL 表源查询模板 | Martin 的 `table_to_query` | [本项目](../src/sources/postgres/table.rs) · [上游](https://github.com/maplibre/martin/blob/main/martin/src/config/file/tiles/postgres/resolver/query_tables.rs) |
 | 复合 MVT 瓦片源 | 多源组合方式 | [composite.rs](../src/sources/composite.rs) |
+| 瓦片坐标、格式、编码与 Web Mercator 换算 | `martin-tile-utils` 0.7.8 | [tile_types.rs](../src/sources/tile_types.rs) |
 | 缓存指标 | `martin-core` 指标结构 | [metrics.rs](../src/metrics.rs) |
 
 [Martin](https://github.com/maplibre/martin)采用 MIT 或 Apache-2.0 双许可。仓库保留完整的 [MIT 版权与许可](../third_party/martin/LICENSE-MIT)和 [Apache-2.0 许可](../third_party/martin/LICENSE-APACHE)。

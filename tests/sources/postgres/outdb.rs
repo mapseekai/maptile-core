@@ -63,7 +63,9 @@ async fn quoted_schema_and_function_render_real_raster() {
     pool.get().await.unwrap().batch_execute(&format!(r#"
         CREATE FUNCTION {schema}.{function}(z integer,x integer,y integer,bounds geometry,params jsonb)
         RETURNS TABLE(filepath text) LANGUAGE sql AS $$
-        SELECT {filepath}::text WHERE z=0 AND x=0 AND y=0 AND ST_XMin(bounds)<0 AND params='{{}}'::jsonb;
+        SELECT {filepath}::text WHERE z=0 AND x=0 AND y=0 AND ST_XMin(bounds)<0 AND params='{{}}'::jsonb
+        UNION ALL SELECT repeat('x', 16385) WHERE z=1 AND x=0 AND y=0
+        UNION ALL SELECT {filepath}::text FROM generate_series(1, 65) WHERE z=1 AND x=1 AND y=0;
         $$;
     "#)).await.unwrap();
     let config: PostgresOutDbRasterConfig = serde_json::from_value(serde_json::json!({
@@ -98,6 +100,14 @@ async fn quoted_schema_and_function_render_real_raster() {
         .await
         .unwrap();
     assert_eq!(batch[0].data, tile.data);
+    for x in [0, 1] {
+        assert!(matches!(
+            source
+                .get_tile(TileCoord { z: 1, x, y: 0 }, Some(&query))
+                .await,
+            Err(maptile_core::error::MaptileError::Resource(_))
+        ));
+    }
     common::postgres::assert_invalid_tile_requests(&source, Some(&style)).await;
     for coord in [
         TileCoord {

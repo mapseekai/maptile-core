@@ -1,32 +1,36 @@
 //! On-demand, bounded GeoParquet queries over local files or DuckDB HTTPFS.
 
+use super::duckdb_pool::{DuckDbPoolStatus, QueryPool, SpatialManager};
 use super::duckdb_query::{FinishQuery, QueryControl};
+use super::duckdb_sql::TilePredicates;
 use super::file_stamp::FileStamp;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::Arc;
 use std::time::Duration;
 
-use duckdb::{Connection, named_params};
+#[cfg(test)]
+use duckdb::named_params;
+use duckdb::{Connection, ToSql};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
-use super::TileCoord;
 use super::geoparquet::GeoParquetSourceConfig;
-use super::geoparquet_remote::{
-    QUERY_CANCELLED, RemoteLocation, SPATIAL_UNAVAILABLE, configure_httpfs_connection, remote_error,
-};
+use super::geoparquet_remote::{DuckDbSecret, RemoteLocation, SPATIAL_UNAVAILABLE, remote_error};
+use super::{TileCoord, TileQuery};
 use crate::error::{MaptileError, MaptileResult};
 
-/// Per-source execution budget, shared by all clones. DuckDB's memory limit is
-/// shared by the connections (not multiplied by pool_size); it is not an RSS cap.
+/// Per-source execution budget, shared by all clones. Each independent
+/// connection receives a share of memory_limit_mb and up to threads threads.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct GeoParquetQueryOptions {
     pub pool_size: usize,
     pub threads: usize,
+    /// Total memory allocated by DuckDB across the pool. A conditional HTTP
+    /// snapshot can use up to the same number of MiB separately on disk.
     pub memory_limit_mb: usize,
+    /// Deadline for each query or remote open, including a conditional snapshot download.
     pub timeout_ms: u64,
     pub max_features: usize,
     pub max_tile_bytes: usize,
@@ -50,6 +54,7 @@ impl GeoParquetQueryOptions {
         if !(1..=32).contains(&self.pool_size)
             || !(1..=64).contains(&self.threads)
             || !(32..=65_536).contains(&self.memory_limit_mb)
+            || self.memory_limit_mb / self.pool_size < 16
             || !(1..=300_000).contains(&self.timeout_ms)
             || !(1..=10_000_000).contains(&self.max_features)
             || !(1..=256 * 1024 * 1024).contains(&self.max_tile_bytes)
@@ -60,9 +65,24 @@ impl GeoParquetQueryOptions {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BoundsMode {
+    #[default]
+    Skip,
+    Quick,
+    Calc,
+}
+
+struct SpatialQuery {
+    sql: Arc<str>,
+    bounds_sql: Arc<str>,
+    filter_at: usize,
+    projected: Arc<str>,
+}
+
 pub(super) struct GeometrySource {
     pool: Arc<QueryPool>,
-    sql: Arc<str>,
+    query: SpatialQuery,
     local: Option<(PathBuf, FileStamp)>,
     remote: bool,
     options: GeoParquetQueryOptions,
@@ -73,96 +93,143 @@ pub(super) struct GeometrySource {
 #[derive(Clone, Copy)]
 enum InputKind {
     GeoParquet,
-    #[cfg(feature = "local-vector")]
     FlatGeobuf,
 }
 
 impl GeometrySource {
     pub fn open(cfg: &GeoParquetSourceConfig) -> MaptileResult<Self> {
+        Self::open_local(cfg, InputKind::GeoParquet)
+    }
+
+    pub fn open_flatgeobuf(cfg: &GeoParquetSourceConfig) -> MaptileResult<Self> {
+        Self::open_local(cfg, InputKind::FlatGeobuf)
+    }
+
+    fn open_local(cfg: &GeoParquetSourceConfig, input: InputKind) -> MaptileResult<Self> {
+        cfg.query_options.validate()?;
         let path = single_file_path(&cfg.path)?;
         let stamp = FileStamp::read(&path)?;
         let location = path
             .to_str()
             .ok_or_else(|| config("path must be UTF-8"))?
             .to_owned();
-        Self::open_input(
+        let running = QueryControl::pending();
+        let _finished = FinishQuery(running.clone());
+        let mut source = Self::open_input(
             cfg,
             &location,
             Some((path, stamp)),
             None,
-            InputKind::GeoParquet,
-        )
+            &running,
+            None,
+            input,
+        )?;
+        // Local open is synchronous. Use the same interrupt controller from
+        // a scoped watchdog for the optional display-bounds scan.
+        if source.bounds.is_none() && cfg.bounds_mode != BoundsMode::Skip {
+            let manager = SpatialManager::new(cfg.query_options.clone(), &location, None);
+            let (done, finished) = std::sync::mpsc::channel();
+            source.bounds = std::thread::scope(|threads| {
+                let watchdog = running.clone();
+                threads.spawn(move || {
+                    if matches!(
+                        finished.recv_timeout(Duration::from_millis(cfg.query_options.timeout_ms)),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                    ) {
+                        loop {
+                            watchdog.cancel();
+                            if !matches!(
+                                finished.recv_timeout(Duration::from_millis(10)),
+                                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                            ) {
+                                break;
+                            }
+                        }
+                    }
+                });
+                let bounds = (|| {
+                    let conn = manager.open(&running, None).ok()?;
+                    let _binding = running.bind(conn.interrupt_handle(), None);
+                    scan_bounds(&conn, &source.query.bounds_sql, cfg.bounds_mode)
+                })();
+                let _ = done.send(());
+                if running.cancelled() { None } else { bounds }
+            });
+            check_stamp(&source.local)?;
+        }
+        Ok(source)
     }
 
     pub fn open_remote(
         cfg: &GeoParquetSourceConfig,
-        remote: &RemoteLocation,
+        remote: Arc<RemoteLocation>,
         running: &Arc<QueryControl>,
+        secret: Option<&DuckDbSecret>,
     ) -> MaptileResult<Self> {
+        let url = remote.url.clone();
         let result = Self::open_input(
             cfg,
-            &remote.url,
+            &url,
             None,
-            Some((remote, running)),
+            Some(remote),
+            running,
+            secret,
             InputKind::GeoParquet,
         );
         if running.cancelled() {
-            Err(timeout())
+            Err(MaptileError::Cancelled)
         } else {
             result.map_err(remote_error)
         }
     }
 
-    #[cfg(feature = "local-vector")]
-    pub fn open_flatgeobuf(cfg: &GeoParquetSourceConfig) -> MaptileResult<Self> {
-        let path = single_file_path(&cfg.path)?;
+    pub(super) fn open_snapshot(
+        cfg: &GeoParquetSourceConfig,
+        snapshot: tempfile::TempPath,
+        control: &Arc<QueryControl>,
+    ) -> MaptileResult<Self> {
+        let path = single_file_path(&snapshot)?;
         let stamp = FileStamp::read(&path)?;
-        let location = path
-            .to_str()
-            .ok_or_else(|| config("path must be UTF-8"))?
-            .to_owned();
-        Self::open_input(
+        let location = path.to_str().ok_or_else(|| config("path must be UTF-8"))?;
+        let source = Self::open_input(
             cfg,
-            &location,
-            Some((path, stamp)),
+            location,
+            Some((path.clone(), stamp)),
             None,
-            InputKind::FlatGeobuf,
-        )
+            control,
+            None,
+            InputKind::GeoParquet,
+        )?;
+        source.pool.keep_snapshot_file(snapshot);
+        Ok(source)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn open_input(
         cfg: &GeoParquetSourceConfig,
         location: &str,
         local: Option<(PathBuf, FileStamp)>,
-        remote: Option<(&RemoteLocation, &Arc<QueryControl>)>,
+        remote: Option<Arc<RemoteLocation>>,
+        running: &Arc<QueryControl>,
+        secret: Option<&DuckDbSecret>,
         input: InputKind,
     ) -> MaptileResult<Self> {
-        cfg.query_options.validate()?;
         if cfg.extent == 0 || cfg.extent > 65_536 || cfg.buffer > cfg.extent {
             return Err(config("extent must be 1..=65536 and buffer <= extent"));
         }
         if cfg.layer_name.trim().is_empty() || cfg.layer_name.contains('\0') {
             return Err(config("layer_name must be nonempty and contain no NUL"));
         }
-        if remote.is_some_and(|(_, running)| running.cancelled()) {
-            return Err(timeout());
+        if running.cancelled() {
+            return Err(MaptileError::Cancelled);
         }
-        let conn = spatial_connection(&cfg.query_options)?;
-        let attachment = remote.map(|(_, running)| running.attach(&conn));
-        if let Some((remote, running)) = remote {
-            if running.cancelled() {
-                return Err(timeout());
-            }
-            remote.configure(&conn, cfg.query_options.timeout_ms)?;
-        }
-        if remote.is_some_and(|(_, running)| running.cancelled()) {
-            return Err(timeout());
+        let manager = SpatialManager::new(cfg.query_options.clone(), location, remote.clone());
+        let conn = manager.open(running, secret)?;
+        let attachment = running.bind(conn.interrupt_handle(), None);
+        if running.cancelled() {
+            return Err(MaptileError::Cancelled);
         }
         let path_sql = literal(location);
-        conn.execute_batch(&format!(
-            "SET allowed_paths = [{path_sql}]; SET enable_external_access = false;"
-        ))
-        .map_err(MaptileError::backend)?;
         // These operations read footer/schema metadata, not feature rows. The
         // same path works for local files and bounded remote range requests.
         let geo = match input {
@@ -178,21 +245,24 @@ impl GeometrySource {
                 .map(|value| serde_json::from_slice::<Value>(&value))
                 .transpose()
                 .map_err(|e| config(format!("invalid geo metadata: {e}")))?,
-            #[cfg(feature = "local-vector")]
             InputKind::FlatGeobuf => None,
         };
         let (geometry, vector_srid, from) = match input {
             InputKind::GeoParquet => (
                 cfg.geometry_column
                     .clone()
-                    .ok_or_else(|| config("sources require geometry_column"))?,
+                    .or_else(|| {
+                        geo.as_ref()?
+                            .get("primary_column")?
+                            .as_str()
+                            .map(str::to_owned)
+                    })
+                    .ok_or_else(|| config("no primary geometry column; set geometry_column"))?,
                 None,
                 format!("read_parquet({path_sql})"),
             ),
-            #[cfg(feature = "local-vector")]
             InputKind::FlatGeobuf => {
-                let metadata =
-                    super::local_vector::vector_metadata(&conn, location, "FlatGeobuf", cfg.srid)?;
+                let metadata = super::local_vector::vector_metadata(&conn, location, cfg.srid)?;
                 (
                     metadata.geometry,
                     Some(metadata.srid),
@@ -222,7 +292,7 @@ impl GeometrySource {
             }
         }
         let srid = resolve_srid(vector_srid.or(cfg.srid), column)?;
-        let covering = if matches!(srid, 4326 | 3857) {
+        let covering = if cfg.trust_covering && matches!(srid, 4326 | 3857) {
             column.and_then(|c| covering_paths(c, &conn, &from))
         } else {
             None
@@ -300,54 +370,33 @@ impl GeometrySource {
             let quoted = identifier(id)?;
             // Negative IDs have no MVT representation. Avoid wrapping them.
             properties.push(format!(
-                "CASE WHEN {quoted} >= 0 THEN {quoted}::BIGINT END AS {id_alias}"
+                "CASE WHEN {quoted} >= 0 THEN TRY_CAST({quoted} AS BIGINT) END AS {id_alias}"
             ));
             format!(", {}", literal(&id_alias))
         } else {
             String::new()
         };
-        let sql = build_sql(
+        let query = build_sql(
             cfg,
             &from,
             &projected,
             &geom_alias,
             &id_arg,
             &properties,
+            &fields,
             covering.as_ref(),
             srid,
             match input {
                 InputKind::GeoParquet => false,
-                #[cfg(feature = "local-vector")]
                 InputKind::FlatGeobuf => true,
             },
         );
-        conn.prepare(&sql).map_err(MaptileError::backend)?;
-        if remote.is_some_and(|(_, running)| running.cancelled()) {
-            return Err(timeout());
-        }
-        let mut connections = Vec::with_capacity(cfg.query_options.pool_size);
-        for _ in 1..cfg.query_options.pool_size {
-            let cloned = conn.try_clone().map_err(MaptileError::backend)?;
-            if remote.is_some() {
-                configure_httpfs_connection(&cloned, cfg.query_options.timeout_ms)?;
-            }
-            connections.push(cloned);
-        }
+        conn.prepare(&query.sql).map_err(MaptileError::backend)?;
         drop(attachment);
-        connections.push(conn);
         check_stamp(&local)?;
         Ok(Self {
-            pool: Arc::new(QueryPool {
-                state: Mutex::new(PoolState {
-                    connections,
-                    running: Vec::new(),
-                    active: 0,
-                    closed: false,
-                }),
-                slots: Arc::new(Semaphore::new(cfg.query_options.pool_size)),
-                idle: Notify::new(),
-            }),
-            sql: sql.into(),
+            pool: Arc::new(QueryPool::new(manager)?),
+            query,
             local,
             remote: remote.is_some(),
             options: cfg.query_options.clone(),
@@ -356,91 +405,101 @@ impl GeometrySource {
         })
     }
 
-    pub async fn tile(
+    pub fn with_file_lease(&self, lease: Arc<dyn Send + Sync>) {
+        self.pool.with_file_lease(lease);
+    }
+
+    pub fn pool_status(&self) -> DuckDbPoolStatus {
+        self.pool.status()
+    }
+
+    pub fn start_close(&self) {
+        self.pool.start_close();
+    }
+
+    pub async fn close(&self) -> MaptileResult<()> {
+        self.pool.close().await;
+        Ok(())
+    }
+
+    pub async fn display_bounds(&mut self, mode: BoundsMode, deadline: tokio::time::Instant) {
+        if self.bounds.is_none() && mode != BoundsMode::Skip {
+            let sql = self.query.bounds_sql.clone();
+            self.bounds = self
+                .pool
+                .run(deadline, None, move |conn| {
+                    Ok(scan_bounds(conn, &sql, mode))
+                })
+                .await
+                .ok()
+                .flatten();
+        }
+    }
+
+    #[cfg(test)]
+    async fn tile(
+        &self,
+        xyz: TileCoord,
+        lease: Option<Arc<dyn Send + Sync>>,
+    ) -> MaptileResult<bytes::Bytes> {
+        self.read_tile(xyz, lease, None).await
+    }
+
+    pub async fn read_tile(
         &self,
         xyz: TileCoord,
         file_lease: Option<Arc<dyn Send + Sync>>,
+        query: Option<&TileQuery<'_>>,
     ) -> MaptileResult<bytes::Bytes> {
         let deadline = tokio::time::Instant::now() + Duration::from_millis(self.options.timeout_ms);
-        let permit = tokio::time::timeout_at(deadline, self.pool.slots.clone().acquire_owned())
-            .await
-            .map_err(|_| timeout())?
-            .map_err(|_| config("GeoParquet query pool closed"))?;
-        let (lease, running) = {
-            let mut state = self
-                .pool
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if state.closed {
-                return Err(config("source is closed"));
-            }
-            let conn = state
-                .connections
-                .pop()
-                .ok_or_else(|| config("GeoParquet query pool invariant"))?;
-            let running = QueryControl::pending();
-            state.running.retain(|s| s.strong_count() > 0);
-            state.running.push(Arc::downgrade(&running));
-            state.active += 1;
-            (
-                ConnectionLease {
-                    conn: Some(conn),
-                    pool: self.pool.clone(),
-                    _permit: permit,
-                },
-                running,
-            )
+        let TilePredicates {
+            sql: filter,
+            params,
+        } = TilePredicates::build(xyz, query, &self.fields, &self.query.projected)?;
+        let sql = if filter.is_empty() {
+            self.query.sql.clone()
+        } else {
+            let (start, end) = self.query.sql.split_at(self.query.filter_at);
+            format!("{start}{filter}{end}").into()
         };
-        let cancellation = running.watch(deadline);
-        let sql = self.sql.clone();
         let local = self.local.clone();
         let options = self.options.clone();
-        let task = tokio::task::spawn_blocking(move || {
-            let lease = lease;
-            let _file_lease = file_lease;
-            let _completion = FinishQuery(running.clone());
-            let attachment = running.attach(lease.conn.as_ref().expect("leased connection"));
-            // Drop order matters: finish/disarm before the connection is reused.
-            let result = (|| {
-                if running.cancelled() {
-                    return Err(timeout());
-                }
+        let result = self
+            .pool
+            .run(deadline, file_lease, move |conn| {
                 check_stamp(&local)?;
-                let conn = lease.conn.as_ref().expect("leased connection");
-                let (data, count) = conn.prepare_cached(&sql)
-                    .and_then(|mut s| s.query_row(named_params! { "z": i32::from(xyz.z), "x": i64::from(xyz.x), "y": i64::from(xyz.y) }, |r| Ok((r.get::<_, Option<Vec<u8>>>(0)?, r.get::<_, i64>(1)?))))
-                    .map_err(MaptileError::backend)?;
-                if count as usize > options.max_features {
-                    return Err(config(
-                        "GeoParquet tile exceeds max_features; no truncated tile was returned",
+                let params = params
+                    .iter()
+                    .map(|(name, value)| (name.as_str(), value as &dyn ToSql))
+                    .collect::<Vec<_>>();
+                let result = conn
+                    .prepare_cached(&sql)
+                    .and_then(|mut s| {
+                        s.query_row(params.as_slice(), |r| {
+                            Ok((r.get::<_, Option<Vec<u8>>>(0)?, r.get::<_, i64>(1)?))
+                        })
+                    })
+                    .map_err(MaptileError::backend);
+                check_stamp(&local)?;
+                let (data, outcome) = result?;
+                if outcome > options.max_features as i64 {
+                    return Err(MaptileError::Resource(
+                        "tile exceeds configured feature count".into(),
                     ));
                 }
-                let data = data.unwrap_or_default();
-                if data.len() > options.max_tile_bytes {
+                if outcome == -1 {
                     return Err(MaptileError::PayloadTooLarge {
                         limit: options.max_tile_bytes,
                     });
                 }
-                check_stamp(&local)?;
-                Ok(bytes::Bytes::from(data))
-            })();
-            let result = if running.cancelled() {
-                Err(timeout())
-            } else {
-                result
-            };
-            drop(attachment);
-            drop(_completion);
-            drop(_file_lease);
-            drop(lease);
-            result
-        });
-        let result = tokio::time::timeout_at(deadline, task)
-            .await
-            .map_err(|_| timeout())?
-            .map_err(|e| MaptileError::BackendMsg(format!("GeoParquet query task: {e}")))?;
-        drop(cancellation);
+                if outcome == -2 {
+                    return Err(MaptileError::Resource(
+                        "tile exceeds query input byte budget".into(),
+                    ));
+                }
+                Ok(bytes::Bytes::from(data.unwrap_or_default()))
+            })
+            .await;
         if self.remote {
             result.map_err(remote_error)
         } else {
@@ -449,98 +508,61 @@ impl GeometrySource {
     }
 }
 
-impl GeometrySource {
-    pub fn start_close(&self) {
-        self.pool.start_close();
-    }
-    pub async fn close(&self) -> MaptileResult<()> {
-        self.pool.start_close();
-        loop {
-            let idle = self.pool.idle.notified();
-            if self
-                .pool
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .active
-                == 0
-            {
-                break;
-            }
-            idle.await;
-        }
-        Ok(())
-    }
-}
-struct PoolState {
-    connections: Vec<Connection>,
-    running: Vec<Weak<QueryControl>>,
-    active: usize,
-    closed: bool,
-}
-struct QueryPool {
-    state: Mutex<PoolState>,
-    slots: Arc<Semaphore>,
-    idle: Notify,
-}
-impl QueryPool {
-    fn start_close(&self) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.closed = true;
-        self.slots.close();
-        for running in state.running.iter().filter_map(Weak::upgrade) {
-            running.cancel();
-        }
-        state.connections.clear();
-    }
-}
-struct ConnectionLease {
-    conn: Option<Connection>,
-    pool: Arc<QueryPool>,
-    _permit: OwnedSemaphorePermit,
-}
-impl Drop for ConnectionLease {
-    fn drop(&mut self) {
-        let mut state = self
-            .pool
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(conn) = self.conn.take()
-            && !state.closed
-        {
-            state.connections.push(conn);
-        }
-        // Otherwise the connection is destroyed before active reaches zero.
-        state.active -= 1;
-        drop(state);
-        self.pool.idle.notify_waiters();
+fn scan_bounds(conn: &Connection, from: &str, mode: BoundsMode) -> Option<[f64; 4]> {
+    let scan = |limit| {
+        let sql = format!(
+            "SELECT ST_XMin(b), ST_YMin(b), ST_XMax(b), ST_YMax(b)
+             FROM (SELECT ST_Extent_Agg(ST_Transform(geom, 'EPSG:3857', 'OGC:CRS84', always_xy := true)) AS b
+                   FROM ({from}{limit}))"
+        );
+        let bounds = conn
+            .query_row(&sql, [], |r| {
+                Ok([r.get::<_, f64>(0)?, r.get(1)?, r.get(2)?, r.get(3)?])
+            })
+            .ok()?;
+        display_bounds_wgs84(bounds)
+    };
+    match mode {
+        BoundsMode::Skip => None,
+        BoundsMode::Quick => scan(" LIMIT 4096").or_else(|| scan("")),
+        BoundsMode::Calc => scan(""),
     }
 }
 
+#[cfg(test)]
 pub(super) fn spatial_connection(options: &GeoParquetQueryOptions) -> MaptileResult<Connection> {
+    let conn = spatial_database(options)?;
+    load_spatial(&conn)?;
+    Ok(conn)
+}
+
+pub(super) fn spatial_database(options: &GeoParquetQueryOptions) -> MaptileResult<Connection> {
     options.validate()?;
     let db_config = duckdb::Config::default()
         .enable_autoload_extension(false)
         .and_then(|c| c.with("allow_persistent_secrets", "false"))
         .and_then(|c| c.threads(options.threads as i64))
-        .and_then(|c| c.max_memory(&format!("{}MB", options.memory_limit_mb)))
+        .and_then(|c| {
+            c.max_memory(&format!(
+                "{}MB",
+                options.memory_limit_mb / options.pool_size
+            ))
+        })
         .and_then(|c| c.with("max_temp_directory_size", "0B"))
         .map_err(MaptileError::backend)?;
-    let conn = Connection::open_in_memory_with_flags(db_config).map_err(MaptileError::backend)?;
+    Connection::open_in_memory_with_flags(db_config).map_err(MaptileError::backend)
+}
+
+pub(super) fn load_spatial(conn: &Connection) -> MaptileResult<()> {
     conn.execute_batch("LOAD parquet; LOAD spatial")
-        .map_err(|_| MaptileError::BackendMsg(SPATIAL_UNAVAILABLE.into()))?;
-    Ok(conn)
+        .map_err(|_| MaptileError::BackendMsg(SPATIAL_UNAVAILABLE.into()))
 }
 
 fn check_stamp(local: &Option<(PathBuf, FileStamp)>) -> MaptileResult<()> {
     if let Some((path, stamp)) = local
-        && FileStamp::read(path)? != *stamp
+        && !matches!(FileStamp::read(path), Ok(current) if current == *stamp)
     {
-        return Err(config("GeoParquet file changed; reopen the source"));
+        return Err(MaptileError::VersionChanged("local geometry file".into()));
     }
     Ok(())
 }
@@ -561,13 +583,30 @@ pub(super) fn validate_single_file_path(path: &Path) -> MaptileResult<()> {
 
 pub(super) fn single_file_path(path: &Path) -> MaptileResult<PathBuf> {
     validate_single_file_path(path)?;
-    let path = path.canonicalize().map_err(MaptileError::backend)?;
+    let path = normalized_local_path(path.canonicalize()?)?;
     if !path.is_file() {
         return Err(config("GeoParquet input must be a regular file"));
     }
     Ok(path)
 }
 
+// Rust's Windows canonicalizer adds a verbatim prefix; expose ordinary absolute
+// paths so the same lexical validation can be used when reopening an import.
+pub(super) fn normalized_local_path(path: PathBuf) -> MaptileResult<PathBuf> {
+    #[cfg(windows)]
+    let path = {
+        let text = path.to_str().ok_or_else(|| config("path must be UTF-8"))?;
+        if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+            PathBuf::from(format!(r"\\{rest}"))
+        } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+            PathBuf::from(rest)
+        } else {
+            path
+        }
+    };
+    validate_single_file_path(&path)?;
+    Ok(path)
+}
 fn resolve_srid(explicit: Option<i32>, column: Option<&Value>) -> MaptileResult<i32> {
     if let Some(srid) = explicit {
         return if srid > 0 {
@@ -634,7 +673,20 @@ fn metadata_bounds(column: Option<&Value>, srid: i32) -> Option<[f64; 4]> {
     } else if srid != 4326 {
         return None;
     }
-    valid_bounds(bounds).then_some(bounds)
+    display_bounds_wgs84(bounds)
+}
+
+fn display_bounds_wgs84(mut bounds: [f64; 4]) -> Option<[f64; 4]> {
+    if !valid_bounds(bounds) {
+        return None;
+    }
+    for (min, max, limit) in [(0, 2, 180.0), (1, 3, 90.0)] {
+        if bounds[min] == bounds[max] {
+            bounds[min] = (bounds[min] - 1e-6).max(-limit);
+            bounds[max] = (bounds[max] + 1e-6).min(limit);
+        }
+    }
+    Some(bounds)
 }
 
 pub(super) fn valid_bounds(b: [f64; 4]) -> bool {
@@ -687,10 +739,11 @@ fn build_sql(
     geom_alias: &str,
     id_arg: &str,
     properties: &[String],
+    fields: &BTreeMap<String, String>,
     covering: Option<&[String; 4]>,
     srid: i32,
     flatgeobuf: bool,
-) -> String {
+) -> SpatialQuery {
     // Keep all tile expressions constant at plan time. A CROSS JOIN to a
     // one-row bounds CTE can disable Parquet predicate pushdown.
     let tile = "ST_TileEnvelope($z::INTEGER, $x::INTEGER, $y::INTEGER)";
@@ -718,9 +771,16 @@ fn build_sql(
                 format!("degrees(atan(sinh(ST_YMax({buffered}) / {RADIUS})))"),
             ]
         };
-        for (i, op, j) in [(0, "<=", 2), (1, "<=", 3), (2, ">=", 0), (3, ">=", 1)] {
-            filters.push(format!("{} {op} {}", paths[i], bounds[j]));
-        }
+        let overlap = [(0, "<=", 2), (1, "<=", 3), (2, ">=", 0), (3, ">=", 1)]
+            .map(|(i, op, j)| format!("{} {op} {}", paths[i], bounds[j]))
+            .join(" AND ");
+        // World-edge tiles can intersect pieces across the wrap. Use
+        // exact projected geometry whenever the buffered bounds reach it.
+        filters.push(if srid == 4326 {
+            format!("(ST_XMin({buffered}) <= -{RADIUS} * pi() OR ST_XMax({buffered}) >= {RADIUS} * pi() OR ({overlap}))")
+        } else {
+            overlap
+        });
     }
     let intersects = format!("ST_Intersects({geom}, {buffered})");
     // shortcut: Spatial 1.5.6 corrupts empty FGB index batches and prunes projected chords; scan until a verified extension upgrade.
@@ -734,16 +794,56 @@ fn build_sql(
     } else {
         format!(", {}", properties.join(", "))
     };
-    format!(
-        "SELECT ST_AsMVT(tile, {}, {}, '{}'{id_arg}), count(*) FROM (SELECT ST_AsMVTGeom({geom}, ST_Extent({tile}), {}::BIGINT, {}::BIGINT, true) AS {geom_alias}{properties} FROM {from} WHERE {} LIMIT {}) AS tile",
-        literal(&cfg.layer_name),
-        cfg.extent,
-        geom_alias,
+    let fields = fields
+        .keys()
+        .map(|name| {
+            format!(
+                " + coalesce(octet_length(encode(\"{}\"::VARCHAR)), 0)",
+                name.replace('"', "\"\"")
+            )
+        })
+        .collect::<String>();
+    let input_limit =
+        cfg.query_options.memory_limit_mb * 1024 * 1024 / cfg.query_options.pool_size / 2;
+    let limit = cfg.query_options.max_features;
+    let blob_limit = cfg.query_options.max_tile_bytes;
+    let head = format!(
+        "WITH tile AS MATERIALIZED (
+           SELECT ST_AsMVTGeom({geom}, ST_Extent({tile}), {}::BIGINT, {}::BIGINT, true)
+                  AS {geom_alias}{properties}
+           FROM {from} WHERE {}",
         cfg.extent,
         cfg.buffer,
-        filters.join(" AND "),
-        cfg.query_options.max_features + 1
-    )
+        filters.join(" AND ")
+    );
+    let filter_at = head.len();
+    let sql = format!(
+        "{head} LIMIT {}
+         ), stats AS (
+           SELECT count(*) AS feature_count,
+                  coalesce(sum(32 + coalesce(octet_length(ST_AsWKB({geom_alias})), 0){fields}), 0) AS input_bytes
+           FROM tile
+         ), encoded AS MATERIALIZED (
+           SELECT ST_AsMVT(tile, {}, {}, '{geom_alias}'{id_arg}) AS data
+           FROM tile
+           WHERE (SELECT feature_count <= {limit} AND input_bytes <= {input_limit} FROM stats)
+         )
+         SELECT CASE WHEN octet_length(data) <= {blob_limit} THEN data END,
+                CASE WHEN feature_count > {limit} THEN feature_count
+                     WHEN input_bytes > {input_limit} THEN -2
+                     WHEN octet_length(data) > {blob_limit} THEN -1
+                     ELSE feature_count END
+         FROM stats, encoded",
+        limit + 1,
+        literal(&cfg.layer_name),
+        cfg.extent,
+    );
+    SpatialQuery {
+        sql: sql.into(),
+        bounds_sql: format!("SELECT {geom} AS geom FROM {from}").into(),
+        filter_at,
+        projected: geom.into(),
+    }
 }
 
 fn property_type(ty: &str) -> Option<(&'static str, &'static str)> {
@@ -793,10 +893,6 @@ pub(super) fn literal(value: &str) -> String {
 fn config(message: impl Into<String>) -> MaptileError {
     MaptileError::Config(format!("geoparquet: {}", message.into()))
 }
-fn timeout() -> MaptileError {
-    MaptileError::BackendMsg(QUERY_CANCELLED.into())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -810,10 +906,11 @@ mod tests {
     use parquet::arrow::ArrowWriter;
     use parquet::file::metadata::KeyValue;
     use parquet::file::properties::WriterProperties;
+    use std::sync::Mutex;
+    use tokio::sync::{Notify, Semaphore};
 
     const TILE: TileCoord = TileCoord { z: 2, x: 2, y: 1 };
 
-    #[cfg(feature = "local-vector")]
     #[tokio::test]
     async fn flatgeobuf_scan_keeps_a_projected_chord_and_empty_tiles() {
         let dir = tempfile::tempdir().unwrap();
@@ -831,8 +928,8 @@ mod tests {
             ..Default::default()
         };
         let source = GeometrySource::open_flatgeobuf(&cfg).unwrap();
-        let plan: String = source.pool.state.lock().unwrap().connections[0]
-            .prepare(&format!("EXPLAIN {}", source.sql))
+        let plan: String = conn
+            .prepare(&format!("EXPLAIN {}", source.query.sql))
             .unwrap()
             .query_row(named_params! { "z": 4, "x": 9, "y": 6 }, |row| row.get(1))
             .unwrap();
@@ -1011,7 +1108,7 @@ mod tests {
             ] {
                 assert!(matches!(
                     src.get_tile(xyz, None).await,
-                    Err(MaptileError::TileNotFound(..))
+                    Err(MaptileError::InvalidRequest(_))
                 ));
             }
         }
@@ -1029,15 +1126,13 @@ mod tests {
         assert_eq!(tile.layers[0].keys, vec!["name"]);
         let mut cfg = f.config();
         cfg.query_options.max_features = 1;
-        assert!(
+        assert!(matches!(
             GeoParquetSource::open(cfg)
                 .unwrap()
                 .get_tile(TILE, None)
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("max_features")
-        );
+                .await,
+            Err(MaptileError::Resource(_))
+        ));
         let mut cfg = f.config();
         cfg.query_options.max_tile_bytes = 1;
         assert!(
@@ -1075,13 +1170,11 @@ mod tests {
         let without = GeometrySource::open(&without_fixture.config()).unwrap();
         let tile = with.tile(TILE, None).await.unwrap();
         assert_eq!(tile, without.tile(TILE, None).await.unwrap());
+        let conn = spatial_connection(&f.config().query_options).unwrap();
         let explain = |source: &GeometrySource| {
-            let state = source.pool.state.lock().unwrap();
-            let connections = &state.connections;
-            connections[0]
-                .prepare(&format!("EXPLAIN {}", source.sql))
+            conn.prepare(&format!("EXPLAIN {}", source.query.sql))
                 .unwrap()
-                .query_row(named_params! {"z":2,"x":0,"y":3}, |r| r.get::<_, String>(1))
+                .query_row(named_params! {"z":2,"x":1,"y":3}, |r| r.get::<_, String>(1))
                 .unwrap()
         };
         let optimized = explain(&with);
@@ -1094,6 +1187,60 @@ mod tests {
             control.contains("READ_PARQUET"),
             "control must scan: {control}"
         );
+    }
+
+    #[tokio::test]
+    async fn polar_buffer_matches_exact_geometry() {
+        let fixture = fixture_points(&[(30.0, 85.1), (30.0, -85.1)], true);
+        let covering = GeoParquetSource::open(fixture.config()).unwrap();
+        let mut config = fixture.config();
+        config.trust_covering = false;
+        let exact = GeoParquetSource::open(config).unwrap();
+        for (y, point) in [(0, (1365, -26)), (3, (1365, 4122))] {
+            let xyz = TileCoord { z: 2, x: 2, y };
+            let data = covering.get_tile(xyz, None).await.unwrap().data;
+            assert_eq!(data, exact.get_tile(xyz, None).await.unwrap().data);
+            let tile = mvt::decode(&data).unwrap();
+            let layer = &tile.layers[0];
+            assert_eq!(layer.features.len(), 1);
+            assert_eq!(coordinates(&layer.features[0].geometry), vec![point]);
+        }
+    }
+
+    #[tokio::test]
+    async fn bbox_and_cql2_parameters_filter_geometry_before_encoding() {
+        let fixture = fixture_points(&[(10.0, 60.0), (20.0, 62.0)], true);
+        let source = GeoParquetSource::open(fixture.config()).unwrap();
+        let filter =
+            crate::filter::parse_cql2("name IN ('row-0', 'row-1') AND NOT (name IS NULL)").unwrap();
+        let query = TileQuery {
+            filter: Some(&filter),
+            bbox: Some([15.0, 55.0, 25.0, 65.0]),
+            ..Default::default()
+        };
+        let data = source.get_tile(TILE, Some(&query)).await.unwrap().data;
+        let tile = mvt::decode(&data).unwrap();
+        assert_eq!(tile.layers[0].features.len(), 1);
+        assert_eq!(tile.layers[0].features[0].id, Some(2));
+        let unknown = crate::filter::parse_cql2("private = 'p2'").unwrap();
+        let query = TileQuery {
+            filter: Some(&unknown),
+            ..Default::default()
+        };
+        assert!(source.get_tile(TILE, Some(&query)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn opening_uses_primary_column_and_calculates_point_bounds() {
+        let fixture = fixture_points(&[(10.0, 60.0)], false);
+        let mut config = fixture.config();
+        config.geometry_column = None;
+        config.bounds_mode = BoundsMode::Calc;
+        let source = GeoParquetSource::open(config).unwrap();
+        let bounds = source.tilejson().bounds.unwrap();
+        assert!(bounds.left < 10.0 && bounds.right > 10.0);
+        assert!(bounds.bottom < 60.0 && bounds.top > 60.0);
+        assert!(!source.get_tile(TILE, None).await.unwrap().data.is_empty());
     }
 
     #[tokio::test]
@@ -1121,10 +1268,11 @@ mod tests {
         let f = fixture_points(&[(10.0, 60.0)], true);
         let mut cfg = f.config();
         cfg.query_options.pool_size = 1;
-        cfg.query_options.timeout_ms = 50;
         let mut source = GeometrySource::open(&cfg).unwrap();
-        let normal = source.sql.clone();
-        source.sql="SELECT NULL::BLOB, sum(i)::BIGINT FROM range(1000000000) t(i) WHERE i % ($z::INTEGER + 2) = $x::INTEGER AND i > $y::INTEGER".into();
+        assert!(!source.tile(TILE, None).await.unwrap().is_empty());
+        source.options.timeout_ms = 50;
+        let normal = source.query.sql.clone();
+        source.query.sql="SELECT NULL::BLOB, sum(i)::BIGINT FROM range(1000000000) t(i) WHERE i % ($z::INTEGER + 2) = $x::INTEGER AND i > $y::INTEGER".into();
         let source = Arc::new(source);
         assert!(source.tile(TILE, None).await.is_err());
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -1153,8 +1301,8 @@ mod tests {
         .await
         .unwrap();
         let mut source = Arc::try_unwrap(source).ok().unwrap();
-        source.sql = normal;
-        source.options.timeout_ms = 1_000;
+        source.query.sql = normal;
+        source.options.timeout_ms = 10_000;
         for _ in 0..5 {
             assert!(!source.tile(TILE, None).await.unwrap().is_empty());
         }
@@ -1192,10 +1340,13 @@ mod tests {
     fn query_connections_cannot_read_another_file() {
         let allowed = fixture_points(&[(10.0, 60.0)], true);
         let other = fixture_points(&[(20.0, 60.0)], true);
-        let source = GeometrySource::open(&allowed.config()).unwrap();
-        let state = source.pool.state.lock().unwrap();
-        let connections = &state.connections;
-        for conn in connections.iter() {
+        let manager = SpatialManager::new(
+            allowed.config().query_options,
+            allowed.path.to_str().unwrap(),
+            None,
+        );
+        let conn = manager.open(&QueryControl::pending(), None).unwrap();
+        {
             let err = conn
                 .query_row(
                     &format!(
@@ -1225,7 +1376,7 @@ mod tests {
         }
         let fixture = fixture_points(&[(10.0, 60.0)], true);
         let mut source = GeometrySource::open(&fixture.config()).unwrap();
-        source.sql = "SELECT NULL::BLOB, sum(i)::BIGINT FROM range(1000000000) t(i) WHERE i % ($z::INTEGER + 2) = $x::INTEGER AND i > $y::INTEGER".into();
+        source.query.sql = "SELECT NULL::BLOB, sum(i)::BIGINT FROM range(1000000000) t(i) WHERE i % ($z::INTEGER + 2) = $x::INTEGER AND i > $y::INTEGER".into();
         let pool = source.pool.clone();
         let dropped = Arc::new(AtomicUsize::new(0));
         let lease = Arc::new(Lease(dropped.clone()));
@@ -1302,40 +1453,39 @@ mod tests {
         let cancellation = running.watch(deadline);
         let source = tokio::task::spawn_blocking(move || {
             let _completion = FinishQuery(running.clone());
-            GeometrySource::open_remote(&cfg, &remote, &running)
+            GeometrySource::open_remote(&cfg, Arc::new(remote), &running, None)
         })
         .await
         .unwrap()
         .unwrap();
         drop(cancellation);
         assert!(
-            source.sql.contains(&original_url),
+            source.query.sql.contains(&original_url),
             "DuckDB must query the original URL"
         );
-        {
-            let mut state = source.pool.state.lock().unwrap();
-            for conn in &state.connections {
+        source
+            .pool
+            .run(deadline, None, |conn| {
                 assert!(
                     conn.query_row(
                         "SELECT current_setting('http_timeout') = 10
-                        AND current_setting('http_retries') = 0
-                        AND NOT current_setting('force_download')
-                        AND current_setting('force_download_threshold') = 0
-                        AND NOT current_setting('auto_fallback_to_full_download')
-                        AND NOT current_setting('unsafe_disable_etag_checks')
-                        AND NOT current_setting('enable_http_logging')
-                        AND current_setting('enable_server_cert_verification')
-                        AND current_setting('enable_curl_server_cert_verification')",
+                 AND current_setting('http_retries') = 0
+                 AND NOT current_setting('force_download')
+                 AND current_setting('force_download_threshold') = 0
+                 AND NOT current_setting('auto_fallback_to_full_download')
+                 AND NOT current_setting('unsafe_disable_etag_checks')
+                 AND NOT current_setting('enable_http_logging')
+                 AND current_setting('enable_server_cert_verification')
+                 AND current_setting('enable_curl_server_cert_verification')",
                         [],
-                        |r| r.get::<_, bool>(0),
+                        |r| r.get::<_, bool>(0)
                     )
-                    .unwrap(),
-                    "every pooled connection must enforce remote read settings"
+                    .unwrap()
                 );
-            }
-            // Exercise the cloned connection, not just the one used to open.
-            state.connections.reverse();
-        }
+                Ok(())
+            })
+            .await
+            .unwrap();
         let opening = http
             .stats
             .transferred
@@ -1372,7 +1522,7 @@ mod tests {
         );
         source.close().await.unwrap();
         source.close().await.unwrap();
-        assert!(source.pool.state.lock().unwrap().connections.is_empty());
+        assert!(source.pool_status().connections == 0);
         assert!(source.tile(TILE, None).await.is_err());
     }
 
@@ -1383,12 +1533,12 @@ mod tests {
         let http = TestHttp::start(std::fs::read(&fixture.path).unwrap()).await;
         http.stats.mode.store(6, Ordering::SeqCst);
         let signed_url = format!("{}?signature=private-signature", http.url);
-        let error = GeoParquetSource::open_http(fixture.config(), &signed_url)
+        let error = GeoParquetSource::open_immutable_http(fixture.config(), &signed_url)
             .await
             .unwrap_err();
         assert!(!format!("{error:?}").contains("private-signature"));
         let headers = BTreeMap::from([("Authorization".into(), "Bearer test-'token".into())]);
-        let source = GeoParquetSource::open_http_with_headers(
+        let source = GeoParquetSource::open_immutable_http_with_headers(
             fixture.config(),
             &signed_url,
             headers.clone(),
@@ -1397,13 +1547,16 @@ mod tests {
         .unwrap();
         let clone = source.clone();
         assert!(!source.get_tile(TILE, None).await.unwrap().data.is_empty());
-        let reopened =
-            GeoParquetSource::open_http_with_headers(fixture.config(), &signed_url, headers)
-                .await
-                .unwrap();
+        let reopened = GeoParquetSource::open_immutable_http_with_headers(
+            fixture.config(),
+            &signed_url,
+            headers,
+        )
+        .await
+        .unwrap();
         assert_ne!(source.content_version(), reopened.content_version());
         assert!(
-            GeoParquetSource::open_http(fixture.config(), &signed_url)
+            GeoParquetSource::open_immutable_http(fixture.config(), &signed_url)
                 .await
                 .is_err(),
             "secrets must not escape the source session"
@@ -1438,10 +1591,13 @@ mod tests {
             path_style: true,
             ..Default::default()
         };
-        let source =
-            GeoParquetSource::open_s3(fixture.config(), "s3://bucket/data.parquet", options)
-                .await
-                .unwrap();
+        let source = GeoParquetSource::open_immutable_s3(
+            fixture.config(),
+            "s3://bucket/data.parquet",
+            options,
+        )
+        .await
+        .unwrap();
         let actual = source.get_tile(TILE, None).await.unwrap();
         let local = GeoParquetSource::open(fixture.config()).unwrap();
         assert_eq!(actual.data, local.get_tile(TILE, None).await.unwrap().data);
@@ -1457,21 +1613,145 @@ mod tests {
         let http = TestHttp::start(std::fs::read(&fixture.path).unwrap()).await;
         http.stats.mode.store(2, Ordering::SeqCst);
         assert!(
-            GeoParquetSource::open_http(fixture.config(), &http.url)
+            GeoParquetSource::open_immutable_http(fixture.config(), &http.url)
                 .await
                 .is_err(),
             "200 must not become a whole-file fallback"
         );
         http.stats.mode.store(0, Ordering::SeqCst);
-        let source = GeoParquetSource::open_http(fixture.config(), &http.url)
+        let source = GeoParquetSource::open_http_at_etag(
+            fixture.config(),
+            &http.url,
+            "\"v1\"",
+            BTreeMap::new(),
+        )
+        .await
+        .unwrap();
+        http.stats.mode.store(3, Ordering::SeqCst);
+        let requests = http.stats.requests.load(Ordering::SeqCst);
+        let source = source.with_file_lease("application-owned lease");
+        assert!(!source.get_tile(TILE, None).await.unwrap().data.is_empty());
+        assert_eq!(http.stats.requests.load(Ordering::SeqCst), requests);
+        source.close().await.unwrap();
+        for mode in [3, 8, 9, 10] {
+            http.stats.mode.store(mode, Ordering::SeqCst);
+            assert!(
+                matches!(
+                    GeoParquetSource::open_http_at_etag(
+                        fixture.config(),
+                        &http.url,
+                        "\"v1\"",
+                        BTreeMap::new()
+                    )
+                    .await,
+                    Err(MaptileError::VersionChanged(_))
+                ),
+                "HTTP fixture mode {mode}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_replacement_during_ranges_fails_the_opened_revision() {
+        use std::sync::atomic::Ordering;
+        let fixture = fixture_points(&vec![(10.0, 60.0); 100_000], true);
+        let http = TestHttp::start(std::fs::read(&fixture.path).unwrap()).await;
+        assert!(http.stats.bytes.len() > 1024 * 1024);
+        http.stats.mode.store(5, Ordering::SeqCst);
+        let read = tokio::spawn({
+            let url = http.url.clone();
+            let cfg = fixture.config();
+            async move {
+                GeoParquetSource::open_http_at_etag(cfg, &url, "\"v1\"", BTreeMap::new()).await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), http.stats.blocked.notified())
             .await
             .unwrap();
         http.stats.mode.store(3, Ordering::SeqCst);
-        assert!(
-            source.get_tile(TILE, None).await.is_err(),
-            "ETag changes must not mix file versions"
-        );
+        http.stats.resume.close();
+        assert!(matches!(
+            read.await.unwrap(),
+            Err(MaptileError::VersionChanged(_))
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn conditional_snapshot_caps_disk_and_unlinks_after_close() {
+        use super::super::geoparquet_remote::capture_http_at_etag;
+        let fixture = fixture_points(&[(10., 60.)], true);
+        let http = TestHttp::start(std::fs::read(&fixture.path).unwrap()).await;
+        let headers = BTreeMap::new();
+        assert!(matches!(
+            capture_http_at_etag(&http.url, "\"v1\"", &headers, 256).await,
+            Err(MaptileError::PayloadTooLarge { limit: 256 })
+        ));
+        let file = capture_http_at_etag(&http.url, "\"v1\"", &headers, http.stats.bytes.len())
+            .await
+            .unwrap();
+        let path = file.to_path_buf();
+        assert_eq!(std::fs::read(&path).unwrap(), &http.stats.bytes[..]);
+        let source =
+            GeometrySource::open_snapshot(&fixture.config(), file, &QueryControl::pending())
+                .unwrap();
+        source.with_file_lease(Arc::new("caller lease"));
+        assert!(path.is_file());
         source.close().await.unwrap();
+        assert!(!path.exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn conditional_http_validates_ranges_credentials_redirects_and_deadline() {
+        use std::sync::atomic::Ordering;
+        let fixture = fixture_points(&[(10., 60.)], true);
+        let http = TestHttp::start(std::fs::read(&fixture.path).unwrap()).await;
+        let signed = format!("{}?signature=private-signature", http.url);
+        let headers = BTreeMap::from([("Authorization".into(), "Bearer test-'token".into())]);
+        http.stats.mode.store(6, Ordering::SeqCst);
+        let error = GeoParquetSource::open_http_at_etag(
+            fixture.config(),
+            &signed,
+            "\"v1\"",
+            BTreeMap::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(!format!("{error:?}").contains("private-signature"));
+        let source = GeoParquetSource::open_http_at_etag(
+            fixture.config(),
+            &signed,
+            "\"v1\"",
+            headers.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(!source.get_tile(TILE, None).await.unwrap().data.is_empty());
+        source.close().await.unwrap();
+        for mode in [11, 12, 13] {
+            http.stats.mode.store(mode, Ordering::SeqCst);
+            let before = http.stats.requests.load(Ordering::SeqCst);
+            let error = GeoParquetSource::open_http_at_etag(
+                fixture.config(),
+                &signed,
+                "\"v1\"",
+                headers.clone(),
+            )
+            .await
+            .unwrap_err();
+            if mode == 11 {
+                assert!(matches!(error, MaptileError::BackendMsg(_)));
+            } else {
+                assert!(matches!(error, MaptileError::InvalidMetadata(_)));
+            }
+            assert_eq!(http.stats.requests.load(Ordering::SeqCst), before + 1);
+        }
+        http.stats.mode.store(5, Ordering::SeqCst);
+        let mut config = fixture.config();
+        config.query_options.timeout_ms = 300;
+        assert!(matches!(
+            GeoParquetSource::open_http_at_etag(config, &signed, "\"v1\"", headers).await,
+            Err(MaptileError::Deadline)
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1481,7 +1761,7 @@ mod tests {
         http.stats
             .mode
             .store(4, std::sync::atomic::Ordering::SeqCst);
-        let source = GeoParquetSource::open_http(
+        let source = GeoParquetSource::open_immutable_http(
             fixture.config(),
             &format!(
                 "{}?signature=get-only",
@@ -1498,12 +1778,12 @@ mod tests {
     async fn close_interrupts_active_queries_and_rejects_waiters() {
         let fixture = fixture_points(&[(10.0, 60.0)], true);
         let mut source = GeometrySource::open(&fixture.config()).unwrap();
-        source.sql = "SELECT NULL::BLOB, sum(i)::BIGINT FROM range(1000000000) t(i) WHERE i % ($z::INTEGER + 2) = $x::INTEGER AND i > $y::INTEGER".into();
+        source.query.sql = "SELECT NULL::BLOB, sum(i)::BIGINT FROM range(1000000000) t(i) WHERE i % ($z::INTEGER + 2) = $x::INTEGER AND i > $y::INTEGER".into();
         let source = Arc::new(source);
         let query_source = source.clone();
         let query = tokio::spawn(async move { query_source.tile(TILE, None).await });
         tokio::time::timeout(Duration::from_secs(2), async {
-            while source.pool.state.lock().unwrap().active == 0 {
+            while source.pool_status().active_requests == 0 {
                 tokio::task::yield_now().await;
             }
         })
@@ -1514,8 +1794,8 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(query.await.unwrap().is_err());
-        assert!(source.pool.state.lock().unwrap().connections.is_empty());
-        assert_eq!(source.pool.state.lock().unwrap().active, 0);
+        assert!(source.pool_status().connections == 0);
+        assert_eq!(source.pool_status().active_requests, 0);
         assert!(source.tile(TILE, None).await.is_err());
     }
 
@@ -1531,7 +1811,7 @@ mod tests {
         };
         let result = tokio::task::spawn_blocking({
             let running = running.clone();
-            move || GeometrySource::open_remote(&cfg, &remote, &running)
+            move || GeometrySource::open_remote(&cfg, Arc::new(remote), &running, None)
         })
         .await
         .unwrap();
@@ -1555,7 +1835,7 @@ mod tests {
             let running = running.clone();
             move || {
                 let _completion = FinishQuery(running.clone());
-                let result = GeometrySource::open_remote(&config, &remote, &running);
+                let result = GeometrySource::open_remote(&config, Arc::new(remote), &running, None);
                 running.assert_detached();
                 result
             }
@@ -1570,9 +1850,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(
-            matches!(result, Err(MaptileError::BackendMsg(message)) if message == QUERY_CANCELLED)
-        );
+        assert!(matches!(result, Err(MaptileError::Cancelled)));
     }
 
     #[test]
@@ -1593,8 +1871,10 @@ mod tests {
                     let _ = wait.recv();
                 });
                 ready.await.unwrap();
-                let mut opening =
-                    Box::pin(GeoParquetSource::open_http(fixture.config(), &http.url));
+                let mut opening = Box::pin(GeoParquetSource::open_immutable_http(
+                    fixture.config(),
+                    &http.url,
+                ));
                 assert!(futures_util::poll!(&mut opening).is_pending());
                 drop(opening);
                 release.send(()).unwrap();
@@ -1613,7 +1893,7 @@ mod tests {
         let fixture = fixture_points(&vec![(10.0, 60.0); 100_000], true);
         let http = TestHttp::start(std::fs::read(&fixture.path).unwrap()).await;
         let source = Arc::new(
-            GeoParquetSource::open_http(fixture.config(), &http.url)
+            GeoParquetSource::open_immutable_http(fixture.config(), &http.url)
                 .await
                 .unwrap(),
         );
@@ -1722,8 +2002,39 @@ mod tests {
                 .body(Body::empty())
                 .unwrap();
         }
-        let response =
-            Response::builder().header(header::ETAG, if mode == 3 { "\"v2\"" } else { "\"v1\"" });
+        if mode == 9 {
+            return Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Body::empty())
+                .unwrap();
+        }
+        if mode == 11 {
+            return Response::builder()
+                .status(StatusCode::TEMPORARY_REDIRECT)
+                .header(header::LOCATION, "/bucket/data.parquet")
+                .body(Body::empty())
+                .unwrap();
+        }
+        let etag = if matches!(mode, 3 | 8) {
+            "\"v2\""
+        } else {
+            "\"v1\""
+        };
+        if mode != 8
+            && headers
+                .get(header::IF_MATCH)
+                .and_then(|tag| tag.to_str().ok())
+                .is_some_and(|tag| tag != etag)
+        {
+            return Response::builder()
+                .status(StatusCode::PRECONDITION_FAILED)
+                .body(Body::empty())
+                .unwrap();
+        }
+        let mut response = Response::builder();
+        if mode != 10 {
+            response = response.header(header::ETAG, etag);
+        }
         if method == axum::http::Method::HEAD {
             return response
                 .header(header::CONTENT_LENGTH, stats.bytes.len())
@@ -1746,20 +2057,25 @@ mod tests {
         stats
             .transferred
             .fetch_add(range.end - range.start, Ordering::SeqCst);
+        let body_end = if mode == 13 { range.end - 1 } else { range.end };
         response
             .status(StatusCode::PARTIAL_CONTENT)
             .header(
                 header::CONTENT_RANGE,
                 format!(
                     "bytes {}-{}/{}",
-                    range.start,
+                    if mode == 12 {
+                        range.start + 1
+                    } else {
+                        range.start
+                    },
                     range.end - 1,
                     stats.bytes.len()
                 ),
             )
-            .header(header::CONTENT_LENGTH, range.end - range.start)
+            .header(header::CONTENT_LENGTH, body_end - range.start)
             .body(Body::from(
-                stats.bytes.slice(range.start as usize..range.end as usize),
+                stats.bytes.slice(range.start as usize..body_end as usize),
             ))
             .unwrap()
     }
@@ -1787,6 +2103,7 @@ mod tests {
             GeoParquetSourceConfig {
                 path: self.path.clone(),
                 geometry_column: Some("geometry".into()),
+                trust_covering: true,
                 id_column: Some("id".into()),
                 layer_name: "places".into(),
                 ..Default::default()

@@ -51,6 +51,11 @@ pub(crate) fn render_error(error: async_geotiff::error::AgError) -> MaptileError
         AgError::Query { .. } | AgError::UnknownColormap(_) | AgError::ColorFormula(_) => {
             MaptileError::InvalidStyle(error.to_string())
         }
+        AgError::ResourceLimit(message) => MaptileError::Resource(message),
+        AgError::Overloaded => MaptileError::CapacityExhausted,
+        AgError::DeadlineExceeded => MaptileError::Deadline,
+        AgError::Cancelled => MaptileError::Cancelled,
+        AgError::UnsupportedPixel(message) => MaptileError::Unsupported(message),
         _ => MaptileError::backend(error),
     }
 }

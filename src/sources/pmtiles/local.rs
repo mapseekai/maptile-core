@@ -14,15 +14,34 @@ use crate::sources::pmtiles::{
 };
 use crate::sources::{SourceKind, TileCoord, TileInfo, TileQuery, TileResponse, TileSource};
 use async_trait::async_trait;
-use std::io::SeekFrom;
 use std::sync::Arc;
 use std::time::SystemTime;
 use tilejson::TileJSON;
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
-use tokio::sync::Mutex;
 
 struct FileBackend {
-    file: Mutex<tokio::fs::File>,
+    file: Arc<std::fs::File>,
+    stamp: FileIdentity,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FileIdentity {
+    len: u64,
+    modified: SystemTime,
+    #[cfg(unix)]
+    device_inode: (u64, u64),
+}
+impl FileIdentity {
+    fn read(file: &std::fs::File) -> std::io::Result<Self> {
+        let meta = file.metadata()?;
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Ok(Self {
+            len: meta.len(),
+            modified: meta.modified()?,
+            #[cfg(unix)]
+            device_inode: (meta.dev(), meta.ino()),
+        })
+    }
 }
 
 impl pmtiles::AsyncBackend for FileBackend {
@@ -38,20 +57,42 @@ impl pmtiles::AsyncBackend for FileBackend {
                 "PMTiles read exceeds tile byte limit",
             )));
         }
-        // ponytail: file seek/read is serialized per source; use positional reads
-        // if this is a measured bottleneck. CPU work
-        // and responses hold no lock and own their bytes, even after truncation.
-        let mut file = self.file.lock().await;
-        file.seek(SeekFrom::Start(offset as u64))
-            .await
-            .map_err(pmtiles::PmtError::Reading)?;
-        let mut data = Vec::new();
-        (&mut *file)
-            .take(length as u64)
-            .read_to_end(&mut data)
-            .await
-            .map_err(pmtiles::PmtError::Reading)?;
-        Ok(pmtiles::BackendResponse::new(bytes::Bytes::from(data)))
+        let file = self.file.clone();
+        let stamp = self.stamp.clone();
+        let bytes = crate::transport::run_blocking(move || {
+            if FileIdentity::read(&file)? != stamp {
+                return Err(MaptileError::VersionChanged("local PMTiles changed".into()));
+            }
+            let mut data = vec![0; length];
+            let mut read = 0;
+            while read < length {
+                #[cfg(unix)]
+                let count = {
+                    use std::os::unix::fs::FileExt;
+                    file.read_at(&mut data[read..], (offset + read) as u64)?
+                };
+                #[cfg(windows)]
+                let count = {
+                    use std::os::windows::fs::FileExt;
+                    file.seek_read(&mut data[read..], (offset + read) as u64)?
+                };
+                if count == 0 {
+                    break;
+                }
+                read += count;
+            }
+            if FileIdentity::read(&file)? != stamp {
+                return Err(MaptileError::VersionChanged("local PMTiles changed".into()));
+            }
+            data.truncate(read);
+            Ok(bytes::Bytes::from(data))
+        })
+        .await
+        .map_err(|error| match error {
+            MaptileError::VersionChanged(_) => pmtiles::PmtError::SourceModified,
+            other => pmtiles::PmtError::Reading(std::io::Error::other(other)),
+        })?;
+        Ok(pmtiles::BackendResponse::new(bytes))
     }
 }
 
@@ -76,20 +117,19 @@ impl std::fmt::Debug for LocalPmtilesSource {
 
 impl LocalPmtilesSource {
     pub async fn open(cfg: PmtilesConfig) -> MaptileResult<Self> {
-        let file = tokio::fs::File::open(&cfg.path).await?;
-        // Read metadata from the same open handle used by the reader, so an
-        // atomic path replacement cannot identify the wrong archive.
-        let metadata = file.metadata().await.ok();
-        let last_modified = metadata.as_ref().and_then(|m| m.modified().ok());
-        let validator = metadata
-            .as_ref()
-            .and_then(|meta| FileStamp::from_metadata(meta).ok())
-            .map(|stamp| format!("{stamp:?}"));
-        let content_version = archive_content_version(&cfg.path, validator.as_deref());
-        let reader = Reader::open(FileBackend {
-            file: Mutex::new(file),
+        let path = cfg.path.clone();
+        let (file, stamp, validator) = crate::transport::run_blocking(move || {
+            let file = Arc::new(std::fs::File::open(path)?);
+            let stamp = FileIdentity::read(&file)?;
+            let validator = FileStamp::from_file(&file)
+                .ok()
+                .map(|stamp| format!("{stamp:?}"));
+            Ok((file, stamp, validator))
         })
         .await?;
+        let last_modified = Some(stamp.modified);
+        let content_version = archive_content_version(&cfg.path, validator.as_deref());
+        let reader = Reader::open(FileBackend { file, stamp }).await?;
 
         let header = &reader.header;
         let native_format = pmt_tile_type_to_format(header.tile_type)?;
@@ -156,10 +196,10 @@ impl TileSource for LocalPmtilesSource {
     async fn get_tile(
         &self,
         xyz: TileCoord,
-        _query: Option<&TileQuery<'_>>,
+        query: Option<&TileQuery<'_>>,
     ) -> MaptileResult<TileResponse> {
-        let coord = pmtiles::TileCoord::new(xyz.z, xyz.x, xyz.y)
-            .map_err(|_| MaptileError::TileNotFound(xyz.z, xyz.x, xyz.y))?;
+        crate::sources::validate_source_request(self, &[xyz], query)?;
+        let coord = super::checked_coord(xyz)?;
         let bytes = self
             .reader
             .get_tile(coord)
@@ -196,6 +236,14 @@ mod tests {
                 .add_tile(pmtiles::TileCoord::new(0, 0, 0).unwrap(), payload)
                 .unwrap();
             writer.finalize().unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(
+                    SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+                )
+                .unwrap();
         }
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tiles.pmtiles");
@@ -207,8 +255,19 @@ mod tests {
             description: None,
         };
         let first = LocalPmtilesSource::open(cfg.clone()).await.unwrap();
+        let reopened = LocalPmtilesSource::open(cfg.clone()).await.unwrap();
+        assert_eq!(first.content_version(), reopened.content_version());
+        drop(reopened);
         let replacement = dir.path().join("replacement.pmtiles");
-        write_archive(&replacement, b"after update");
+        write_archive(&replacement, b"after!");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            std::fs::metadata(&replacement).unwrap().len()
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            std::fs::metadata(&replacement).unwrap().modified().unwrap(),
+        );
         std::fs::rename(replacement, path).unwrap();
         let second = LocalPmtilesSource::open(cfg).await.unwrap();
         assert_eq!(first.tilejson().bounds, second.tilejson().bounds);
@@ -218,10 +277,18 @@ mod tests {
             first.clone_source().content_version()
         );
         let xyz = TileCoord { z: 0, x: 0, y: 0 };
+        assert!(matches!(
+            first.get_tile(TileCoord { z: 0, x: 1, y: 0 }, None).await,
+            Err(MaptileError::InvalidRequest(_))
+        ));
+        assert!(matches!(
+            first.get_tile(TileCoord { z: 31, x: 0, y: 0 }, None).await,
+            Err(MaptileError::InvalidRequest(_))
+        ));
         let old = first.get_tile(xyz, None).await.unwrap();
         let new = second.get_tile(xyz, None).await.unwrap();
         assert_eq!(old.data.as_ref(), b"before");
-        assert_eq!(new.data.as_ref(), b"after update");
+        assert_eq!(new.data.as_ref(), b"after!");
         assert_ne!(first.tile_etag(&old), second.tile_etag(&new));
         assert_ne!(first.tile_etag(&old), first.tile_etag(&new));
     }
@@ -232,8 +299,10 @@ mod tests {
         tokio::fs::write(tempfile.path(), b"archive payload")
             .await
             .unwrap();
+        let file = Arc::new(std::fs::File::open(tempfile.path()).unwrap());
         let backend = FileBackend {
-            file: Mutex::new(tokio::fs::File::open(tempfile.path()).await.unwrap()),
+            stamp: FileIdentity::read(&file).unwrap(),
+            file,
         };
         let response = backend.read_exact(0, 15).await.unwrap();
         std::fs::OpenOptions::new()
@@ -245,7 +314,7 @@ mod tests {
         assert_eq!(response.bytes.as_ref(), b"archive payload");
         assert!(matches!(
             backend.read_exact(0, 15).await,
-            Err(pmtiles::PmtError::UnexpectedNumberOfBytesReturned(15, 0))
+            Err(pmtiles::PmtError::SourceModified)
         ));
         assert!(
             backend

@@ -2,15 +2,26 @@
 
 pub mod archive_inspection;
 pub mod composite;
+#[cfg(any(
+    feature = "mbtiles",
+    feature = "pmtiles",
+    feature = "duckdb",
+    feature = "agtiff",
+    feature = "parquet-archive"
+))]
 mod file_stamp;
 pub mod lazy_composite;
 pub mod manager;
+#[cfg(feature = "mbtiles")]
 pub mod mbtiles;
 pub mod mvt;
+#[cfg(feature = "pmtiles")]
 pub mod pmtiles;
+#[cfg(feature = "postgres")]
 pub mod postgres;
 pub mod raster_coverage;
 pub mod tile_math;
+mod tile_types;
 
 pub use composite::{CompositeChild, CompositeSource};
 pub use lazy_composite::LazyCompositeSource;
@@ -21,11 +32,30 @@ pub mod dataset_cache;
 #[cfg(feature = "agtiff")]
 mod agtiff_cog;
 #[cfg(feature = "agtiff")]
+mod agtiff_request;
+#[cfg(feature = "agtiff")]
+mod agtiff_snapshot;
+#[cfg(feature = "agtiff")]
 pub use agtiff_cog::{AsyncCogSource, AsyncCogSourceConfig, CogObjectSource};
 
-#[cfg(all(feature = "agtiff", feature = "raster"))]
+#[cfg(any(feature = "pmtiles", feature = "agtiff"))]
+fn strong_http_etag(headers: &reqwest::header::HeaderMap) -> Option<&str> {
+    use reqwest::header::ETAG;
+    let mut values = headers.get_all(ETAG).iter();
+    let etag = values.next()?.to_str().ok()?;
+    (values.next().is_none()
+        && etag.len() >= 2
+        && etag.starts_with('"')
+        && etag.ends_with('"')
+        && etag[1..etag.len() - 1]
+            .bytes()
+            .all(|byte| byte >= 0x21 && byte != b'"' && byte != 0x7f))
+    .then_some(etag)
+}
+
+#[cfg(feature = "agtiff")]
 pub mod mosaic_source;
-#[cfg(all(feature = "agtiff", feature = "raster"))]
+#[cfg(feature = "agtiff")]
 pub use mosaic_source::{MosaicMember, MosaicSource, MosaicSourceConfig, pixel_selection_from_str};
 
 /// Decoded-block cache shared by COG readers.
@@ -44,29 +74,36 @@ pub fn new_shared_block_cache() -> std::sync::Arc<BlockCache> {
 }
 
 #[cfg(feature = "duckdb")]
-pub mod duckdb;
-#[cfg(any(feature = "duckdb", feature = "geoparquet"))]
+mod duckdb_pool;
+#[cfg(feature = "duckdb")]
 mod duckdb_query;
 #[cfg(feature = "duckdb")]
-pub use self::duckdb::{DuckDbSource, DuckDbSourceConfig};
-
-#[cfg(feature = "geoparquet")]
+mod duckdb_sql;
+#[cfg(feature = "duckdb")]
 pub mod geoparquet;
-#[cfg(feature = "geoparquet")]
+#[cfg(feature = "duckdb")]
 mod geoparquet_geometry;
-#[cfg(feature = "geoparquet")]
+#[cfg(feature = "duckdb")]
 mod geoparquet_remote;
-#[cfg(feature = "geoparquet")]
+#[cfg(feature = "duckdb")]
 pub use geoparquet::{
-    GeoParquetColumns, GeoParquetS3Options, GeoParquetSource, GeoParquetSourceConfig,
+    BoundsMode, DuckDbPoolStatus, GeoParquetCredentialProvider, GeoParquetQueryOptions,
+    GeoParquetS3Credentials, GeoParquetS3Options, GeoParquetSource, GeoParquetSourceConfig,
 };
 
-#[cfg(feature = "local-vector")]
+#[cfg(feature = "duckdb")]
 pub mod local_vector;
-#[cfg(feature = "local-vector")]
+#[cfg(feature = "duckdb")]
 pub use local_vector::{
-    FlatGeobufSource, FlatGeobufSourceConfig, ImportedGeoParquet, VectorImportFormat,
-    VectorImportOptions, import_to_geoparquet,
+    FlatGeobufSource, FlatGeobufSourceConfig, ImportedGeoParquet, VectorImportOptions,
+    import_to_geoparquet,
+};
+
+#[cfg(feature = "parquet-archive")]
+pub mod parquet_archive;
+#[cfg(feature = "parquet-archive")]
+pub use parquet_archive::{
+    ParquetArchiveColumns, ParquetArchiveSource, ParquetArchiveSourceConfig,
 };
 
 #[cfg(feature = "stac")]
@@ -81,7 +118,7 @@ use crate::cache::CacheZoomRange;
 use crate::error::MaptileResult;
 use crate::filter::{Cql2Expr, UrlQuery};
 
-pub use martin_tile_utils::{Encoding as TileEncoding, Format as TileFormat, TileCoord, TileInfo};
+pub use tile_types::{Encoding as TileEncoding, Format as TileFormat, TileCoord, TileInfo};
 
 pub const MAX_TILE_BATCH_COORDS: usize = 128;
 pub const MAX_TILE_BATCH_BYTES: usize = 8 * 1024 * 1024;
@@ -94,6 +131,15 @@ pub const MAX_TILE_BATCH_BYTES: usize = 8 * 1024 * 1024;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SourceKind {
     NativeArchive(archive_inspection::ArchiveSourceType),
+    PostgresTable,
+    PostgresFunction,
+    GeoParquet,
+    FlatGeobuf,
+    ParquetArchive,
+    Cog,
+    Mosaic,
+    Stac,
+    Composite,
     Other,
 }
 
@@ -170,6 +216,20 @@ pub trait TileSource: Send + Sync + 'static {
         read_tile_batch_sequential(self, coords, query).await
     }
 
+    /// Accelerated drivers with missing rows preserve them as empty slots.
+    async fn read_tile_batch_slots(
+        &self,
+        coords: &[TileCoord],
+        query: Option<&TileQuery<'_>>,
+    ) -> MaptileResult<Vec<Option<TileResponse>>> {
+        Ok(self
+            .read_tile_batch(coords, query)
+            .await?
+            .into_iter()
+            .map(Some)
+            .collect())
+    }
+
     fn supports_raster_coverage(&self) -> bool {
         false
     }
@@ -215,6 +275,7 @@ pub trait TileSource: Send + Sync + 'static {
         query: Option<&TileQuery<'_>>,
         if_none_match: Option<&str>,
     ) -> MaptileResult<TileEtagResponse> {
+        validate_source_request(self, &[xyz], query)?;
         let resp = self.get_tile(xyz, query).await?;
         let etag = self.tile_etag(&resp);
         if Some(etag.as_str()) == if_none_match {
@@ -230,6 +291,24 @@ pub trait TileSource: Send + Sync + 'static {
 
     /// Whether the source consumes `TileQuery.filter` (CQL2).
     fn supports_filter(&self) -> bool {
+        false
+    }
+
+    fn supports_bbox(&self) -> bool {
+        false
+    }
+
+    /// The source declares every MVT layer name. Composition checks each actual tile.
+    fn strict_mvt(&self) -> bool {
+        false
+    }
+
+    /// All reads use the opened revision or report a version change.
+    fn consistent_export(&self) -> bool {
+        matches!(self.source_kind(), SourceKind::NativeArchive(_))
+    }
+
+    fn native_batch(&self) -> bool {
         false
     }
 
@@ -383,6 +462,19 @@ pub enum TileEtagResponse {
     NotModified,
 }
 
+pub(crate) fn validate_source_request<S: TileSource + ?Sized>(
+    source: &S,
+    coords: &[TileCoord],
+    query: Option<&TileQuery<'_>>,
+) -> MaptileResult<()> {
+    tile_math::validate_tile_request(coords, query)?;
+    if query.is_some() {
+        crate::control::SourceCapabilities::from_source(source)
+            .validate_query(source.id(), query)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_tile_batch(coords: &[TileCoord]) -> MaptileResult<()> {
     if coords.len() > MAX_TILE_BATCH_COORDS {
         return Err(crate::error::MaptileError::InvalidRequest(format!(
@@ -397,6 +489,7 @@ pub(crate) async fn read_tile_batch_sequential<S: TileSource + ?Sized>(
     coords: &[TileCoord],
     query: Option<&TileQuery<'_>>,
 ) -> MaptileResult<Vec<TileResponse>> {
+    validate_source_request(source, coords, query)?;
     read_tile_batch_with(coords, source.tile_info(), |coord| {
         source.get_tile(coord, query)
     })

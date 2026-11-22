@@ -60,6 +60,56 @@ mod mbtiles {
     }
 
     #[tokio::test]
+    async fn shutdown_waits_for_cancelled_archive_inspection() {
+        use maptile_core::{
+            cache::{ContentVersion, TileCache},
+            control::{CatalogService, DiscoveredDataset, Inventory, TileDriver},
+        };
+        use std::sync::Arc;
+        use tokio::time::{Duration, Instant};
+
+        let fixture = fixture();
+        let writer = rusqlite::Connection::open(fixture.path()).unwrap();
+        writer.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let service = CatalogService::new(TileCache::new(4, None, None).unwrap());
+        let cfg = MbtilesConfig {
+            id: "locked".into(),
+            path: fixture.path().into(),
+            serve_as: None,
+            description: None,
+        };
+        let inventory = [DiscoveredDataset {
+            id: "locked".into(),
+            dataset: "locked.mbtiles".into(),
+            revision: ContentVersion::from_input(b"test"),
+        }];
+        let mut reconcile = Box::pin(service.catalog().reconcile(
+            0,
+            "files",
+            Inventory::Complete(&inventory),
+            |_| {
+                let cfg = cfg.clone();
+                async move { Ok(Arc::new(MbtilesSource::open(cfg).await?) as Arc<dyn TileDriver>) }
+            },
+        ));
+        assert!(futures_util::poll!(reconcile.as_mut()).is_pending());
+        drop(reconcile);
+        assert!(matches!(
+            service
+                .catalog()
+                .shutdown(Instant::now() + Duration::from_millis(100))
+                .await,
+            Err(MaptileError::Deadline)
+        ));
+        writer.execute_batch("ROLLBACK").unwrap();
+        service
+            .catalog()
+            .shutdown(Instant::now() + Duration::from_secs(3))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn open_fails_on_missing_file() {
         let cfg = MbtilesConfig {
             id: "x".into(),
@@ -229,7 +279,7 @@ mod mbtiles {
         let uncached = TileCoord { z: 1, x: 0, y: 1 };
         assert!(matches!(
             manager.get_tile("stable", uncached, None).await,
-            Err(MaptileError::SourceUnavailable(_))
+            Err(MaptileError::VersionChanged(_))
         ));
         let new = Arc::new(MbtilesSource::open(cfg).await.unwrap());
         assert_ne!(new.content_version(), version);
@@ -300,7 +350,7 @@ mod mbtiles {
             .unwrap();
         assert!(matches!(
             source.get_tile(coord, None).await,
-            Err(MaptileError::SourceUnavailable(_))
+            Err(MaptileError::VersionChanged(_))
         ));
     }
 
@@ -326,7 +376,7 @@ mod mbtiles {
         std::fs::rename(replacement, alias).unwrap();
         assert!(matches!(
             old.get_tile(coord, None).await,
-            Err(MaptileError::SourceUnavailable(_))
+            Err(MaptileError::VersionChanged(_))
         ));
         let new = MbtilesSource::open(cfg).await.unwrap();
         assert_ne!(new.get_tile(coord, None).await.unwrap().data, before);
@@ -361,7 +411,7 @@ mod mbtiles {
             .unwrap();
         assert!(matches!(
             before.get_tile(coord, None).await,
-            Err(MaptileError::SourceUnavailable(_))
+            Err(MaptileError::VersionChanged(_))
         ));
         let after = MbtilesSource::open(cfg).await.unwrap();
         assert_ne!(before.content_version(), after.content_version());
@@ -538,6 +588,126 @@ mod mbtiles {
             assert_eq!(source.tile_info().format, TileFormat::Mvt);
             assert_eq!(source.tile_info().encoding, TileEncoding::Gzip);
             assert!(!source.tilejson().other.contains_key("format"));
+        }
+
+        #[tokio::test]
+        async fn mixed_encodings_and_empty_tiles_survive_catalog_cache_hits() {
+            use maptile_core::{
+                cache::TileCache,
+                control::CatalogService,
+                service::{ReadTarget, TileOutcome, TileStack},
+            };
+            use std::sync::Arc;
+
+            let mvt = b"\x1a\x0c\x0a\x05roads\x28\x80\x20\x78\x02";
+            let gzip = maptile_core::transport::encode_as(mvt, TileEncoding::Gzip).unwrap();
+            let file = fixture(
+                &metadata_with("pbf"),
+                &gzip,
+                Some(r#"[{"id":"roads","fields":{}}]"#),
+            );
+            {
+                let conn = rusqlite::Connection::open(file.path()).unwrap();
+                conn.execute("INSERT INTO tiles VALUES (1, 0, 1, ?1)", [&mvt[..]])
+                    .unwrap();
+                conn.execute("INSERT INTO tiles VALUES (1, 0, 0, X'')", [])
+                    .unwrap();
+            }
+            let source = Arc::new(open_fixture(&file).await.unwrap());
+            let engine = Arc::new(CatalogService::new(TileCache::new(32, None, None).unwrap()));
+            let mut update = engine.catalog().update();
+            update.put(source.clone()).unwrap();
+            engine.catalog().publish(update).unwrap();
+            let stack = TileStack::builder(engine).build();
+            let target = ReadTarget::new("strict", "public");
+
+            for (coord, encoding, bytes) in [
+                (
+                    TileCoord { z: 0, x: 0, y: 0 },
+                    TileEncoding::Gzip,
+                    gzip.as_ref(),
+                ),
+                (
+                    TileCoord { z: 1, x: 0, y: 0 },
+                    TileEncoding::Uncompressed,
+                    &mvt[..],
+                ),
+                (
+                    TileCoord { z: 1, x: 0, y: 1 },
+                    TileEncoding::Uncompressed,
+                    &[][..],
+                ),
+            ] {
+                let direct = source.get_tile(coord, None).await.unwrap();
+                assert_eq!(direct.data, bytes);
+                assert_eq!(direct.info.encoding, encoding);
+                for _ in 0..2 {
+                    let outcome = stack.read(target.at(coord)).await.unwrap();
+                    let cached = outcome.tile().unwrap();
+                    assert_eq!(cached.data, direct.data);
+                    assert_eq!(cached.info, direct.info);
+                }
+            }
+            assert!(matches!(
+                stack
+                    .read(target.at(TileCoord { z: 1, x: 1, y: 1 }))
+                    .await
+                    .unwrap(),
+                TileOutcome::NoTile
+            ));
+        }
+
+        #[tokio::test]
+        async fn decoded_and_stored_payloads_obey_the_tile_limit() {
+            use maptile_core::transport::MAX_DECODED_TILE_BYTES;
+            use std::io::Read;
+
+            let file = fixture(
+                &metadata_with("pbf"),
+                &[],
+                Some(r#"[{"id":"roads","fields":{}}]"#),
+            );
+            {
+                let conn = rusqlite::Connection::open(file.path()).unwrap();
+                let length = MAX_DECODED_TILE_BYTES + 1;
+                conn.execute("INSERT INTO tiles VALUES (1, 0, 1, zeroblob(?1))", [length])
+                    .unwrap();
+                let mut encoder =
+                    flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+                std::io::copy(&mut std::io::repeat(0).take(length as u64), &mut encoder).unwrap();
+                conn.execute(
+                    "INSERT INTO tiles VALUES (1, 0, 0, ?1)",
+                    [encoder.finish().unwrap()],
+                )
+                .unwrap();
+                conn.execute("INSERT INTO tiles VALUES (1, 1, 0, 'not a BLOB')", [])
+                    .unwrap();
+            }
+            let source = open_fixture(&file).await.unwrap();
+            assert!(
+                source
+                    .get_tile(TileCoord { z: 0, x: 0, y: 0 }, None)
+                    .await
+                    .unwrap()
+                    .data
+                    .is_empty()
+            );
+            for y in [0, 1] {
+                let error = source
+                    .get_tile(TileCoord { z: 1, x: 0, y }, None)
+                    .await
+                    .unwrap_err();
+                assert!(matches!(
+                    error,
+                    MaptileError::PayloadTooLarge {
+                        limit: MAX_DECODED_TILE_BYTES
+                    }
+                ));
+            }
+            assert!(matches!(
+                source.get_tile(TileCoord { z: 1, x: 1, y: 1 }, None).await,
+                Err(MaptileError::InvalidMetadata(_))
+            ));
         }
 
         #[tokio::test]

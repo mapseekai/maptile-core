@@ -4,6 +4,44 @@ use maptile_core::sources::{TileCoord, TileEtagResponse, TileFormat, TileSource}
 
 const FIXTURE_PATH: &str = "tests/fixtures/sample.pmtiles";
 
+#[tokio::test]
+async fn republishing_serve_as_changes_warm_cache_metadata_for_the_same_file() {
+    use maptile_core::{
+        cache::TileCache,
+        control::CatalogService,
+        service::{ReadTarget, TileStack},
+    };
+    use std::sync::Arc;
+    ensure_fixture().await;
+    let service = Arc::new(CatalogService::new(TileCache::new(1, None, None).unwrap()));
+    let stack = TileStack::builder(service.clone()).build();
+    let coord = TileCoord { z: 0, x: 0, y: 0 };
+    for format in [TileFormat::Mvt, TileFormat::Mlt] {
+        let opened = Arc::new(
+            LocalPmtilesSource::open(PmtilesConfig {
+                id: "archive".into(),
+                path: FIXTURE_PATH.into(),
+                serve_as: Some(format),
+                description: None,
+            })
+            .await
+            .unwrap(),
+        );
+        let direct = opened.get_tile(coord, None).await.unwrap();
+        let mut update = service.catalog().update();
+        update.put(opened).unwrap();
+        service.catalog().publish(update).unwrap();
+        for _ in 0..2 {
+            let result = stack
+                .read(ReadTarget::new("archive", "public").at(coord))
+                .await
+                .unwrap();
+            assert_eq!(result.tile().unwrap().info, direct.info);
+            assert_eq!(result.tile().unwrap().data, direct.data);
+        }
+    }
+}
+
 /// Generate the fixture if it doesn't exist.
 async fn ensure_fixture() {
     let path = std::path::Path::new(FIXTURE_PATH);

@@ -10,8 +10,11 @@ repository = "https://github.com/mapseekai/maptile-core"
 publish = false
 
 [dependencies]
+arc-swap = "1.9"
+composite-mvt = { version = "=0.3.0", default-features = false }
+tokio-util = { version = "0.7", features = ["rt"] }
 async-trait = "0.1"
-async-geotiff = { version = "=0.13.0", default-features = false, features = ["proj", "mosaic", "stac", "webp"], optional = true }
+async-geotiff = { version = "=0.13.0", default-features = false, features = ["proj", "mosaic", "webp", "jpeg"], optional = true }
 base64 = "0.23"
 blake3 = "1.8"
 brotli = { version = "9", default-features = false, features = ["std"] }
@@ -24,17 +27,19 @@ hex = "0.4"
 indexmap = "2"
 walkdir = "2"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
-zstd = { version = "0.14", default-features = false }
-mbtiles = { version = "0.19.1", default-features = false }
-martin-tile-utils = "0.7"
+zstd = { version = "0.14", default-features = false, optional = true }
+mbtiles = { version = "0.19.1", default-features = false, optional = true }
 # Keep the shared store type aligned with async-geotiff and PMTiles.
 object_store = { version = "0.14.2", optional = true }
-pmtiles = { version = "0.24.1", default-features = false, features = ["mmap-async-tokio", "iter-async", "moka", "tilejson", "write", "http-async", "reqwest-rustls", "brotli", "zstd"] }
+pmtiles = { version = "0.24.1", default-features = false, features = ["mmap-async-tokio", "iter-async", "moka", "tilejson", "write", "http-async", "reqwest-rustls", "brotli"], optional = true }
+proj = { version = "0.31", optional = true }
 prost = "0.14"
+strum = { version = "0.28", features = ["derive"] }
 quick-xml = "0.42"
 regex = "1.13"
 raster-style = "=0.4.0"
-deadpool-postgres = { version = "0.14", features = ["rt_tokio_1"] }
+deadpool = { version = "=0.13.1", default-features = false, features = ["managed", "rt_tokio_1"], optional = true }
+deadpool-postgres = { version = "0.14", features = ["rt_tokio_1"], optional = true }
 duckdb = { version = "~1.10506.1", features = ["bundled"], optional = true }
 gdal = { version = "0.19", optional = true }
 gdal-sys = { version = "0.12", optional = true }
@@ -51,13 +56,14 @@ notify = { version = "8", default-features = false, features = ["macos_kqueue"] 
 parquet = { version = "59", default-features = false, features = ["arrow", "async"], optional = true }
 arrow-array = { version = "59", optional = true }
 arrow-schema = { version = "59", optional = true }
-pg_escape = "0.1"
+pg_escape = { version = "0.1", optional = true }
+reqwest = { version = "0.13", default-features = false, features = ["rustls"], optional = true }
 prometheus = { version = "0.14", optional = true }
-rustls = { version = "0.23.45", default-features = false, features = ["ring"] }
-rustls-native-certs = "0.8"
-semver = "1"
-tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
-tokio-postgres-rustls = "0.14"
+rustls = { version = "0.23.45", default-features = false, features = ["ring"], optional = true }
+rustls-native-certs = { version = "0.8", optional = true }
+semver = { version = "1", optional = true }
+tokio-postgres = { version = "0.7", features = ["with-serde_json-1"], optional = true }
+tokio-postgres-rustls = { version = "0.14", optional = true }
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 sha1 = "0.11"
@@ -68,39 +74,51 @@ tracing = "0.1"
 url = { version = "2", optional = true }
 uuid = { version = "1", features = ["v4"] }
 tempfile = { version = "3", optional = true }
-zip = { version = "9.5.1", default-features = false, features = ["deflate-flate2"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
 [features]
 default = []
-cloud = ["dep:object_store", "dep:url", "pmtiles/object-store"]
-duckdb = ["dep:duckdb"]
-geoparquet = ["dep:parquet", "dep:arrow-array", "dep:arrow-schema", "dep:duckdb", "duckdb/parquet", "dep:url"]
-local-vector = ["geoparquet", "dep:tempfile", "dep:zip"]
+pmtiles = ["dep:pmtiles", "dep:reqwest"]
+mbtiles = ["dep:mbtiles", "zstd"]
+postgres = ["dep:deadpool-postgres", "dep:pg_escape", "dep:rustls", "dep:rustls-native-certs", "dep:semver", "dep:tokio-postgres", "dep:tokio-postgres-rustls"]
+zstd = ["dep:zstd", "pmtiles?/zstd"]
+cloud = ["dep:object_store", "dep:url", "pmtiles?/object-store"]
+duckdb = ["dep:duckdb", "dep:deadpool", "duckdb/parquet", "dep:url", "dep:tempfile", "dep:reqwest"]
+geoparquet = ["duckdb"]
+parquet-archive = ["dep:parquet", "dep:arrow-array", "dep:arrow-schema"]
+local-vector = ["duckdb"]
 metrics    = ["dep:prometheus"]
 mlt        = ["dep:mlt-core", "dep:geo-types"]
 raster = ["dep:gdal", "dep:gdal-sys", "agtiff"]
 # Pure-Rust COG/STAC dynamic tiling via async-geotiff (no GDAL). cog/stac
 # sources move onto this; outdb stays on `raster` (gdal). ObjectReader is
 # re-exported from async_geotiff::io since v0.0.6.
-agtiff = ["dep:async-geotiff", "dep:object_store"]
+agtiff = ["dep:async-geotiff", "dep:object_store", "dep:proj", "dep:reqwest"]
 render = ["dep:flume", "dep:maplibre_native", "maplibre_native/tokio"]
 # Benchmark-only renderer lifecycle instrumentation. Non-default so normal
 # render builds contain neither counters nor their API.
 render-bench = ["render"]
 render-opengl = ["render", "maplibre_native/opengl"]
 # STAC discovery and native Raster Style mosaic rendering.
-stac = ["agtiff"]
+stac = ["agtiff", "dep:reqwest"]
 
 [dev-dependencies]
+tower = {version = "0.5", features = ["util"]}
+arrow-array = "59"
+arrow-schema = "59"
+parquet = { version = "59", default-features = false, features = ["arrow", "async"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 criterion = { version = "0.8", default-features = false, features = ["plotters", "cargo_bench_support"] }
 futures = "0.3"
 # PROJ currently links libsqlite3-sys <0.36; rusqlite 0.40 conflicts.
 rusqlite = { version = "0.37", features = ["bundled"] }
 tempfile = "3"
+tiff = { version = "0.11", default-features = false }
 tokio = { version = "1.53.1", features = ["full", "macros", "test-util"] }
 
 [[bench]]
@@ -121,20 +139,34 @@ perf = "warn"
 undocumented_unsafe_blocks = "warn"
 
 [[example]]
+name = "archive_http"
+required-features = ["pmtiles"]
+test = true
+
+[[example]]
+name = "read_pmtiles"
+required-features = ["pmtiles"]
+
+[[example]]
+name = "catalog_stack_benchmark"
+required-features = ["pmtiles"]
+
+[[example]]
 name = "geoparquet_extensions"
-required-features = ["geoparquet"]
+required-features = ["duckdb"]
 
 [[example]]
 name = "geoparquet_remote"
-required-features = ["geoparquet"]
+required-features = ["duckdb"]
 
 [[example]]
 name = "local_vector"
-required-features = ["local-vector"]
+required-features = ["duckdb"]
 
 [[test]]
 name = "postgres_function"
 path = "tests/sources/postgres/function.rs"
+required-features = ["postgres"]
 
 [[test]]
 name = "wmts_golden"
@@ -143,14 +175,17 @@ path = "tests/render/wmts.rs"
 [[test]]
 name = "pmtiles_local"
 path = "tests/sources/pmtiles/local.rs"
+required-features = ["pmtiles"]
 
 [[test]]
 name = "mbtiles"
 path = "tests/sources/mbtiles.rs"
+required-features = ["mbtiles"]
 
 [[test]]
 name = "archive_inspection"
 path = "tests/sources/archive_inspection.rs"
+required-features = ["mbtiles", "pmtiles"]
 
 [[test]]
 name = "composite"
@@ -163,10 +198,12 @@ path = "tests/styles/catalog.rs"
 [[test]]
 name = "mosaic_source_smoke"
 path = "tests/sources/mosaic_source.rs"
+required-features = ["agtiff"]
 
 [[test]]
 name = "pmtiles_cloud"
 path = "tests/sources/pmtiles/cloud.rs"
+required-features = ["pmtiles", "cloud"]
 
 [[test]]
 name = "manager"
@@ -175,10 +212,12 @@ path = "tests/sources/manager.rs"
 [[test]]
 name = "pmtiles_http"
 path = "tests/sources/pmtiles/http.rs"
+required-features = ["pmtiles"]
 
 [[test]]
 name = "postgres_pool"
 path = "tests/sources/postgres/pool.rs"
+required-features = ["postgres"]
 
 [[test]]
 name = "source_default_etag"
@@ -187,10 +226,12 @@ path = "tests/sources/mod.rs"
 [[test]]
 name = "postgres_table"
 path = "tests/sources/postgres/table.rs"
+required-features = ["postgres"]
 
 [[test]]
 name = "agtiff_cog"
 path = "tests/sources/agtiff_cog.rs"
+required-features = ["agtiff"]
 
 [[test]]
 name = "render_native"
