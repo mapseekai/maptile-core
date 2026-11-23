@@ -8,12 +8,15 @@ use crate::error::{MaptileError, MaptileResult};
 use crate::transport::MAX_DECODED_TILE_BYTES;
 use bytes::Bytes;
 use geo_types::{Coord, Geometry, LineString, Polygon};
-use mlt_core::fast_mvt::{MvtReaderRef, MvtTileBuilder, MvtValue, MvtValueRef};
+use mlt_core::encoder::{EncoderConfig, Network, Profile, Tessellation};
+use mlt_core::fast_mvt::{MvtReaderRef, MvtTileBuilder, MvtValueRef};
 use mlt_core::{LendingIterator, ParsedLayer, PropValueRef};
 use prost::encoding::{DecodeContext, WireType, decode_key, decode_varint, skip_field};
 use std::collections::{HashMap, HashSet};
 
 const CONVERSION_WORK_BYTES: usize = 64 * 1024 * 1024;
+// Preserve the original limit for each stage independently of mlt-core defaults.
+const MLT_STAGE_BYTES: u32 = 20 * 1024 * 1024;
 
 fn check_tile_size(size: usize) -> MaptileResult<()> {
     if size > MAX_DECODED_TILE_BYTES {
@@ -174,26 +177,30 @@ fn check_mvt_work(bytes: &[u8], mut remaining: usize) -> MaptileResult<()> {
 pub fn mvt_to_mlt(mvt_bytes: &[u8]) -> MaptileResult<Bytes> {
     check_tile_size(mvt_bytes.len())?;
     check_mvt_wire(mvt_bytes, CONVERSION_WORK_BYTES)?;
-    check_mvt_work(mvt_bytes, CONVERSION_WORK_BYTES)?;
-    let layers = mlt_core::mvt::mvt_to_tile_layers(mvt_bytes).map_err(transcode_error)?;
-    let mut output = Vec::new();
-    let config = mlt_core::encoder::EncoderConfig::default()
-        .with_spatial_morton_sort(false)
-        .with_spatial_hilbert_sort(false)
-        .with_id_sort(false);
-    for layer in layers {
-        let encoded = layer.encode(config).map_err(transcode_error)?;
-        check_tile_size(output.len().saturating_add(encoded.len()))?;
-        output.extend_from_slice(&encoded);
-    }
-    Ok(Bytes::from(output))
+    std::panic::catch_unwind(|| {
+        check_mvt_work(mvt_bytes, CONVERSION_WORK_BYTES)?;
+        let layers = mlt_core::mvt::mvt_to_tile_layers(mvt_bytes).map_err(transcode_error)?;
+        let config = EncoderConfig::from_profile(Profile::Native(Network::Cellular4G))
+            .with_tessellation(Tessellation::Off)
+            .with_spatial_morton_sort(false)
+            .with_spatial_hilbert_sort(false)
+            .with_id_sort(false);
+        let mut output = Vec::new();
+        for layer in layers {
+            let encoded = layer.encode(config).map_err(transcode_error)?;
+            check_tile_size(output.len().saturating_add(encoded.len()))?;
+            output.extend_from_slice(&encoded);
+        }
+        Ok(Bytes::from(output))
+    })
+    .map_err(|_| transcode_error("mlt-core panicked during MVT to MLT conversion"))?
 }
 
 /// Decode an MLT tile to MVT (protobuf) bytes.
 pub fn mlt_to_mvt(mlt_bytes: &[u8]) -> MaptileResult<Bytes> {
     check_tile_size(mlt_bytes.len())?;
-    let mut parser = mlt_core::Parser::default();
-    let mut decoder = mlt_core::Decoder::default();
+    let mut parser = mlt_core::Parser::with_max_size(MLT_STAGE_BYTES);
+    let mut decoder = mlt_core::Decoder::with_max_size(MLT_STAGE_BYTES);
     let mut remaining = CONVERSION_WORK_BYTES;
     let mut tile = MvtTileBuilder::new();
     let mut input = mlt_bytes;
@@ -238,9 +245,7 @@ pub fn mlt_to_mvt(mlt_bytes: &[u8]) -> MaptileResult<Bytes> {
             &mut remaining,
             count.saturating_mul(128usize.saturating_add(names.len().saturating_mul(8))),
         )?;
-        let mut output = tile
-            .layer_with_capacity(layer.name(), count)
-            .map_err(transcode_error)?;
+        let mut output = tile.layer(layer.name()).map_err(transcode_error)?;
         output.extent(layer.extent().into());
         let mut features = layer.iter_features();
         while let Some(feature) = features.next() {
@@ -262,14 +267,14 @@ pub fn mlt_to_mvt(mlt_bytes: &[u8]) -> MaptileResult<Bytes> {
                     64usize.saturating_add(key.len()).saturating_add(text_len),
                 )?;
                 builder
-                    .tag(key, mvt_value(value))
+                    .tag_ref(key, value.into())
                     .map_err(transcode_error)?;
             }
             output = builder.end();
         }
         tile = output.end();
+        check_tile_size(tile.encoded_len())?;
     }
-    check_tile_size(tile.encoded_len())?;
     Ok(Bytes::from(tile.encode()))
 }
 
@@ -341,25 +346,13 @@ fn check_polygon(
     Ok(())
 }
 
-fn mvt_value(value: PropValueRef<'_>) -> MvtValue {
-    match value {
-        PropValueRef::Bool(value) => MvtValue::Bool(value),
-        PropValueRef::I8(value) => MvtValue::SInt(value.into()),
-        PropValueRef::I32(value) => MvtValue::SInt(value.into()),
-        PropValueRef::I64(value) => MvtValue::SInt(value),
-        PropValueRef::U8(value) => MvtValue::UInt(value.into()),
-        PropValueRef::U32(value) => MvtValue::UInt(value.into()),
-        PropValueRef::U64(value) => MvtValue::UInt(value),
-        PropValueRef::F32(value) => MvtValue::Float(value),
-        PropValueRef::F64(value) => MvtValue::Double(value),
-        PropValueRef::Str(value) => MvtValue::String(value.to_owned()),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sources::{TileFormat, mvt};
+    use crate::transcode::transcode_async;
     use geo_types::{LineString, MultiLineString};
+    use mlt_core::fast_mvt::MvtValue;
 
     #[test]
     fn validates_consecutive_mvt_deltas_instead_of_the_total_extent() {
@@ -398,7 +391,27 @@ mod tests {
     }
 
     #[test]
-    fn multipart_geometry_and_typed_properties_round_trip() {
+    fn truncated_mvt_geometry_returns_an_error() {
+        let input = mvt::encode(&mvt::proto::Tile {
+            layers: vec![mvt::proto::Layer {
+                name: "points".into(),
+                version: 2,
+                features: vec![mvt::proto::Feature {
+                    r#type: Some(mvt::proto::GeomType::Point as i32),
+                    geometry: vec![9, 2], // MoveTo with only one coordinate.
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        });
+        assert!(matches!(
+            mvt_to_mlt(&input),
+            Err(MaptileError::Transcode(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn multipart_geometry_and_typed_properties_round_trip_in_source_order() {
         let geometry = Geometry::MultiLineString(MultiLineString(vec![
             LineString::from(vec![(10, 20), (12, 20)]),
             LineString::from(vec![(30, 40), (32, 42)]),
@@ -411,13 +424,21 @@ mod tests {
             .tag("_road", MvtValue::String("north".into()))
             .unwrap();
         feature.tag("speed", MvtValue::UInt(45)).unwrap();
-        let original = feature.end().encode();
-        let mlt = mvt_to_mlt(&original).unwrap();
-        let encoded = mlt_to_mvt(&mlt).unwrap();
+        let point = Geometry::Point(geo_types::Point::new(1, 2));
+        let mut second = feature.end().feature(&point).unwrap();
+        second.id(Some(2));
+        let original = Bytes::from(second.end().encode());
+        let mlt = transcode_async(original.clone(), TileFormat::Mvt, TileFormat::Mlt)
+            .await
+            .unwrap();
+        let encoded = transcode_async(mlt, TileFormat::Mlt, TileFormat::Mvt)
+            .await
+            .unwrap();
         let reader = MvtReaderRef::new(&encoded).unwrap();
         let layer = reader.layers().next().unwrap();
         assert_eq!(layer.extent(), 1024);
-        let feature = layer.features().next().unwrap();
+        let mut features = layer.features();
+        let feature = features.next().unwrap();
         assert_eq!(feature.id(), Some(7));
         assert_eq!(feature.geometry().unwrap(), geometry);
         assert_eq!(
@@ -427,6 +448,11 @@ mod tests {
                 ("speed", MvtValueRef::UInt(45)),
             ]
         );
+        let feature = features.next().unwrap();
+        assert_eq!(feature.id(), Some(2));
+        assert_eq!(feature.geometry().unwrap(), point);
+        assert!(feature.properties().next().is_none());
+        assert!(features.next().is_none());
         assert!(matches!(
             check_mvt_work(&original, 256),
             Err(MaptileError::Resource(_))

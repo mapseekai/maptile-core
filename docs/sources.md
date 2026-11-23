@@ -227,7 +227,7 @@ fn register_city_layers(catalog: &CatalogService) -> MaptileResult<()> {
 
 `TileResponse.info.format` 描述数据格式，`info.encoding` 描述本次响应字节的压缩方式。将两者与载荷一起传递，可以让客户端、转码器和组合源使用正确的解码路径。
 
-[`transport`](../src/transport.rs)提供显式 gzip、zlib、brotli、zstd 编解码，以及异步包装。启用 `mlt` 后，[`transcode`](../src/transcode/mod.rs)提供 MVT 与 MLT 转换。`transcode_with_gzip` 可自动识别 gzip、zstd、zlib；Brotli 载荷先通过已知编码调用 `transport::decode`，再传入转码器。
+[`transport`](../src/transport.rs)提供显式 gzip、zlib、brotli、zstd 编解码，以及异步包装。启用 `mlt` 后，[`transcode`](../src/transcode/mod.rs)提供 MVT 与 MLT 转换。Tokio 中可先用 `transport::decode_async` 解压，再调用 `transcode::transcode_async` 在有界阻塞线程池上转换。同步入口 `transcode_with_gzip` 可自动识别 gzip、zstd、zlib。Brotli 载荷先通过已知编码调用 `transport::decode`，再传入转码器。
 
 DuckDB 几何切片与预编码 Parquet 归档的边界和预算见 [GeoParquet 指南](geoparquet.md)。
 

@@ -40,6 +40,20 @@ pub fn transcode(data: &[u8], from: TileFormat, to: TileFormat) -> MaptileResult
     }
 }
 
+/// Transcode uncompressed tile bytes on a bounded blocking worker in Tokio.
+/// Requests for the existing format return the input bytes directly.
+/// Decode compressed input first with [`crate::transport::decode_async`].
+pub async fn transcode_async(
+    data: Bytes,
+    from: TileFormat,
+    to: TileFormat,
+) -> MaptileResult<Bytes> {
+    if from == to {
+        return Ok(data);
+    }
+    crate::transport::run_blocking(move || transcode(&data, from, to)).await
+}
+
 /// Detect gzip, zstd, or zlib input and decode it before calling [`transcode`].
 /// Uncompressed input passes directly to the format converter. For Brotli,
 /// decode explicitly with [`crate::transport::decode`] and
